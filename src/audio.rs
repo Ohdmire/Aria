@@ -234,15 +234,16 @@ impl AudioOut {
         self.hits_volume = v.clamp(0.0, 1.0);
     }
 
-    /// BGM 时间线(音乐时间)上的当前位置(毫秒)。Paused 返回冻结位置
-    /// (锚),播完/停止返回 None,调用方回退自由计时。
+    /// BGM 时间线(音乐时间)上的当前位置(毫秒)。Paused/WaitingToResume
+    /// 返回冻结位置(锚),播完(Stopped,不可再恢复)返回 None,调用方
+    /// 回退自由计时。补间中(Pausing/Resuming/Stopping)仍在出声,必须
+    /// 算活 —— 漏掉 Resuming 会把刚 resume/重建的流误判为死,曲终门
+    /// 一帧瞬杀(表现为"seek 进结尾无 note 段立刻跳下一首")。
     pub fn position_ms(&self) -> Option<f64> {
         let h = self.bgm.as_ref()?;
         match h.state() {
-            PlaybackState::Playing | PlaybackState::Paused => {
-                Some(h.position() * 1000.0 * self.timeline_scale)
-            }
-            _ => None,
+            PlaybackState::Stopped => None,
+            _ => Some(h.position() * 1000.0 * self.timeline_scale),
         }
     }
 }

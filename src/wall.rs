@@ -987,6 +987,36 @@ impl WallApp {
         win::trim_working_set();
     }
 
+    /// 曲终(BGM 流已终结)后的 seek 重建:按当前会话形态重启流式声 ——
+    /// 直通/升调 = 原文件 × 有效速率;变速不变调 = 预处理临时文件
+    /// (素材时间换算),预处理不可用回退原文件变调。与
+    /// [`Self::apply_load`] 的起播分支同构。
+    fn revive_bgm_at(&mut self, ms: f32) {
+        if self.audio_pending {
+            return;
+        }
+        let eff = self.clock.speed;
+        let fade = self.fade_in_ms();
+        let Some(out) = &mut self.audio else { return };
+        let played = if self.pitch_preserve && (eff - 1.0).abs() > 1e-3 {
+            match self.last_stretch.clone() {
+                Some(tmp) => out.play(&tmp, ms, 1.0, eff as f64, fade),
+                None => match self.audio_path.clone() {
+                    Some(src) => out.play(&src, ms, eff, 1.0, fade),
+                    None => false,
+                },
+            }
+        } else {
+            match self.audio_path.clone() {
+                Some(src) => out.play(&src, ms, eff, 1.0, fade),
+                None => false,
+            }
+        };
+        if !played {
+            log::warn!("曲终重播失败:无法在 {:.0}ms 重建 BGM 流", ms);
+        }
+    }
+
     /// 旧渲染会话退场:先渲染一帧清屏色(不留上一曲残影),再拆 GPU 会话。
     /// 窗口/桌面挂接保留复用。
     fn clear_old_render(&mut self) {
@@ -2122,7 +2152,22 @@ impl WallApp {
                 self.sb_sample_cursor =
                     self.sb_samples.partition_point(|(t0, _, _)| *t0 as f64 <= t);
                 self.stop_loops();
-                if let Some(out) = &mut self.audio {
+                // 曲终后 BGM 流已死(Stopped):对死流 seek 无效、后续
+                // resume 也救不回 kira 句柄 —— 按当前会话形态原位重建
+                // 流式声、从 seek 点续播(拖回重听)。不重建的话下一帧
+                // `t >= limit && !audio_alive` 立即再判曲终:BGM 一个音
+                // 都不放就跳下一首。
+                let stream_dead = self
+                    .audio
+                    .as_ref()
+                    .is_some_and(|a| a.position_ms().is_none());
+                if stream_dead {
+                    self.revive_bgm_at(ms);
+                    // seek = 新的播放意图(镜像 apply_load;UI 的 seek 后
+                    // 总跟 resume,这里先行置位让无 resume 的调用方也成立)
+                    self.clock.playing = true;
+                    self.user_paused = false;
+                } else if let Some(out) = &mut self.audio {
                     out.seek(ms);
                 }
             }
