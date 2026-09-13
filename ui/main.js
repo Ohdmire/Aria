@@ -1560,7 +1560,7 @@ window.__TAURI__.app?.getVersion?.()
     const csz = s.cursor_size ?? 1;
     $('cursor-size').value = String(csz);
     $('cursor-size-val').textContent = `${Math.round(csz * 100)}%`;
-    $('render-mode').value = ['always', 'autopause', 'fs_pause', 'fs_sleep', 'off'].includes(s.render_mode) ? s.render_mode : 'autopause';
+    $('render-mode').value = ['always', 'autopause', 'fs_pause', 'fs_sleep', 'off'].includes(s.render_mode) ? s.render_mode : 'always';
     $('bg-opacity').value = String(s.bg_opacity ?? 0.7);
     $('bg-opacity-val').textContent = `${Math.round((s.bg_opacity ?? 0.7) * 100)}%`;
     $('hidden').checked = !!s.hidden;

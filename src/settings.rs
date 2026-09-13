@@ -181,7 +181,7 @@ fn default_auto_pause() -> bool {
 }
 
 fn default_render_mode() -> String {
-    "autopause".to_string()
+    "always".to_string()
 }
 
 fn default_bg_opacity() -> f32 {
