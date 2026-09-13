@@ -107,6 +107,9 @@ pub struct Settings {
     /// "Beatmap skins" 关闭时的行为)。加载期生效。
     #[serde(default)]
     pub force_skin_colours: bool,
+    /// 超分模式(off / fsr / anime4k):视频帧实时生效,BG 载入期放大。
+    #[serde(default = "default_upscale")]
+    pub upscale: String,
     /// 帧率上限(0 = 跟随屏幕刷新率;30/60/120/240/360)。
     #[serde(default)]
     pub fps: u32,
@@ -192,6 +195,10 @@ fn default_on() -> bool {
     true
 }
 
+fn default_upscale() -> String {
+    "off".into()
+}
+
 fn default_hits_volume() -> f32 {
     0.8
 }
@@ -246,6 +253,7 @@ impl Default for Settings {
             storyboard: default_on(),
             skin: None,
             force_skin_colours: false,
+            upscale: default_upscale(),
             fps: 0,
             target_star: None,
             star_min: 0.0,

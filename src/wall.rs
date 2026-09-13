@@ -240,6 +240,8 @@ struct LoadParams {
     /// 谱面自带音效(lazer "Beatmap hitsounds",默认开):谱面集内的
     /// 采样文件按槽位优先于皮肤。加载期生效。
     beatmap_hitsounds: bool,
+    /// 超分模式(off / fsr / anime4k):视频帧实时,BG 载入期。
+    upscale: String,
 }
 
 /// 一次加载的谱面来源:普通路径(.osz 解包 / stable 目录)或 lazer 虚拟
@@ -546,6 +548,8 @@ struct WallApp {
     fade_audio: bool,
     /// HD(Hidden)视觉(实时;场景渲染旗标)= 用户开关 | 曲目 HD mod。
     hd_on: bool,
+    /// 超分模式(off / fsr / anime4k):视频实时热切,BG 下次载入。
+    upscale: osu_replay_render::UpscaleMode,
     /// 曲目自带 HD mod 位(加载期;与用户 HD 开关取或得到 hd_on)。
     track_hd: bool,
     /// 用户倍速(播放条变速按钮;实际速度 = track_rate × user_speed)。
@@ -669,6 +673,7 @@ impl WallApp {
             video_enabled: true,
             fade_audio: true,
             hd_on: false,
+            upscale: osu_replay_render::UpscaleMode::Off,
             track_hd: false,
             user_speed: 1.0,
             track_rate: 1.0,
@@ -1200,6 +1205,7 @@ impl WallApp {
             self.hd_on,
             self.ffmpeg_bin.as_deref(),
             self.ffprobe_bin.as_deref(),
+            self.upscale,
         )
     }
 
@@ -1853,6 +1859,7 @@ fn prep_render_session(
     hd_on: bool,
     ffmpeg_bin: Option<&std::path::Path>,
     ffprobe_bin: Option<&std::path::Path>,
+    upscale: osu_replay_render::UpscaleMode,
 ) -> Result<RenderSession, String> {
     // 相对名解析(背景/storyboard 素材;来自保留的谱面来源)
     let resolve = |name: &str| -> Option<PathBuf> {
@@ -1931,9 +1938,30 @@ fn prep_render_session(
             })
     };
     let has_bg = bg_image.is_some();
+    // BG 载入期一次性超分(静态图,放大后进图集,零每帧成本);
+    // 超分只作用于视频与 BG —— gameplay/HUD/普通精灵不走此链
+    let bg_image = if upscale != osu_replay_render::UpscaleMode::Off {
+        let t0 = std::time::Instant::now();
+        let before = bg_image.as_ref().map(|i| (i.width, i.height));
+        let up = osu_replay_render::upscale_bg(bg_image, upscale, (w, h));
+        let after = up.as_ref().map(|i| (i.width, i.height));
+        if before != after {
+            log::info!(
+                "[load] BG 超分 {:?}: {:?} → {:?}({:.2}s)",
+                upscale,
+                before,
+                after,
+                t0.elapsed().as_secs_f32()
+            );
+        }
+        up
+    } else {
+        bg_image
+    };
 
-    // storyboard 合成槽位:封顶 1080p(场景线性上采样)
-    let sb_slot = (w.min(1920).max(1) & !1, h.min(1080).max(1) & !1);
+    // storyboard 合成槽位:场景分辨率(超分后的视频以该分辨率进入合成;
+    // >1080p 片源也不再经 1080p 中转,槽位成本 +13MB@2K)
+    let sb_slot = (w.max(1) & !1, h.max(1) & !1);
     let slots = sb_parsed
         .as_ref()
         .map(|p| StoryboardSlots { width: sb_slot.0, height: sb_slot.1, foreground: p.has_foreground() });
@@ -1992,6 +2020,8 @@ fn prep_render_session(
         // 手动指定的 bin 路径优先于 PATH。
         l.set_video_bins(ffmpeg_bin);
         l.set_video_enabled(video);
+        // 视频通道超分:原帧 → FSR/Anime4K 链 → 槽位分辨率纹理
+        l.set_video_upscale(upscale, sb_slot);
         l.set_dim(bg_opacity.clamp(0.0, 1.0));
         // 贴图预取(至多 2s,按起播时刻序):帧动画式 SB 单拍激活数百张
         // 新贴图,惰性加载会让那一帧同步解码整批(首播卡一下、回看不
@@ -2048,10 +2078,11 @@ impl WallApp {
                 }
                 Err(e) => self.out.send(&Event::Error { message: format!("{e:#}") }),
             },
-            Command::Load { path, diff, speed, start, loop_playback, manifest, skin, force_colours, hidden, mods, storyboard, video, beatmap_hitsounds, .. } => {
+            Command::Load { path, diff, speed, start, loop_playback, manifest, skin, force_colours, hidden, mods, storyboard, video, beatmap_hitsounds, upscale, .. } => {
+                self.upscale = osu_replay_render::UpscaleMode::parse(&upscale);
                 self.apply_load(
                     event_loop,
-                    LoadParams { path, diff, speed, start, loop_playback, manifest, skin, force_colours, hidden, mods, storyboard, video, beatmap_hitsounds },
+                    LoadParams { path, diff, speed, start, loop_playback, manifest, skin, force_colours, hidden, mods, storyboard, video, beatmap_hitsounds, upscale },
                 );
             }
             Command::Reload => {
@@ -2300,6 +2331,15 @@ impl WallApp {
                 self.video_enabled = on;
                 if let Some(sb) = &mut self.sb_layer {
                     sb.set_video_enabled(on);
+                }
+            }
+            Command::SetUpscale { mode } => {
+                // 热切换:视频链即时重建;BG 已烘进图集,下次载入生效
+                let m = osu_replay_render::UpscaleMode::parse(&mode);
+                self.upscale = m;
+                if let Some(sb) = &mut self.sb_layer {
+                    let (w, h) = self.scene_size;
+                    sb.set_video_upscale(m, (w, h));
                 }
             }
             // 无缝切换:不重载、不打断音频,仅拆/建渲染会话与暂停/恢复播放

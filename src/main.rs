@@ -128,6 +128,7 @@ fn main() {
             set_bg_opacity,
             set_hidden,
             set_storyboard,
+            set_upscale,
             set_beatmap_hitsounds,
             dir_status,
             pick_data_dir,
@@ -1540,6 +1541,22 @@ fn set_storyboard(app: AppHandle, on: bool) -> Result<(), String> {
     }
     reload_current_track(&app);
     Ok(())
+}
+
+/// 超分模式(off / fsr / anime4k):视频帧实时热切换;BG 为载入期
+/// 一次性放大,切换后下次载入曲目对 BG 生效。
+#[tauri::command]
+fn set_upscale(app: AppHandle, mode: String) -> Result<(), String> {
+    if !matches!(mode.as_str(), "off" | "fsr" | "anime4k") {
+        return Err(format!("未知超分模式:{mode}"));
+    }
+    {
+        let state = app.state::<ctl::WallState>();
+        let mut s = state.settings.lock().unwrap();
+        s.upscale = mode.clone();
+        settings::save(&app, &s);
+    }
+    ctl::send_cmd(&app, Command::SetUpscale { mode })
 }
 
 /// 谱面自带音效开关(lazer "Beatmap hitsounds",默认开):谱面集内的

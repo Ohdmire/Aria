@@ -1566,6 +1566,7 @@ window.__TAURI__.app?.getVersion?.()
     $('hidden').checked = !!s.hidden;
     $('gameplay-hidden').checked = !!s.gameplayHidden;
     $('sb').checked = s.storyboard ?? true;
+    $('upscale').value = ['off', 'fsr', 'anime4k'].includes(s.upscale) ? s.upscale : 'off';
     $('bm-hits').checked = s.beatmap_hitsounds ?? true;
     $('force-colours').checked = !!s.force_skin_colours;
     $('fps').value = String(s.fps ?? 0);
@@ -2127,6 +2128,10 @@ $('gameplay-hidden').addEventListener('change', () => {
 // storyboard / 视频:加载期生效,切换会重播当前曲目
 $('sb').addEventListener('change', () => {
   invoke('set_storyboard', { on: $('sb').checked }).catch((e) => toast(`${e}`));
+});
+// 超分(视频/BG):视频实时热切换,BG 下次载入生效
+$('upscale').addEventListener('change', () => {
+  invoke('set_upscale', { mode: $('upscale').value }).catch((e) => toast(`${e}`));
 });
 // 谱面自带音效(lazer "Beatmap hitsounds"):谱面集采样文件优先于皮肤,
 // 加载期生效,切换会重播当前曲目

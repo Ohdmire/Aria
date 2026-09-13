@@ -368,7 +368,7 @@ fn dispatch_load(
     start: f32,
 ) -> Result<(), String> {
     // 视频/故事板单一开关(lazer ShowStoryboard:关 = 精灵与视频一起关)
-    let (fail, speed, loop_playback, skin_stored, force_colours, hidden, storyboard, beatmap_hitsounds) = {
+    let (fail, speed, loop_playback, skin_stored, force_colours, hidden, storyboard, beatmap_hitsounds, upscale) = {
         let state = app.state::<WallState>();
         let s = state.settings.lock().unwrap();
         (
@@ -380,6 +380,7 @@ fn dispatch_load(
             s.hidden,
             s.storyboard,
             s.beatmap_hitsounds,
+            s.upscale.clone(),
         )
     };
     // 皮肤身份值 → 实际目录(realm 挂载/缓存定位;失效回默认皮肤)
@@ -419,6 +420,7 @@ fn dispatch_load(
             storyboard,
             video: storyboard,
             beatmap_hitsounds,
+            upscale,
         },
     )?;
     // 广播**已解析**难度(前端难度选择器/标题据此刷新)
@@ -637,6 +639,7 @@ pub fn reload_saved(app: &AppHandle) -> Result<(), String> {
                 storyboard: s.storyboard,
                 video: s.storyboard,
                 beatmap_hitsounds: s.beatmap_hitsounds,
+                upscale: s.upscale.clone(),
             },
         )?;
     }
