@@ -550,6 +550,8 @@ struct WallApp {
     hd_on: bool,
     /// 超分模式(off / fsr / anime4k):视频实时热切,BG 下次载入。
     upscale: osu_replay_render::UpscaleMode,
+    /// 目标显示器 bounds(None = 铺满桌面层,双屏即 span;Some = 指定屏)。
+    monitor: Option<win::MonitorBounds>,
     /// 曲目自带 HD mod 位(加载期;与用户 HD 开关取或得到 hd_on)。
     track_hd: bool,
     /// 用户倍速(播放条变速按钮;实际速度 = track_rate × user_speed)。
@@ -674,6 +676,7 @@ impl WallApp {
             fade_audio: true,
             hd_on: false,
             upscale: osu_replay_render::UpscaleMode::Off,
+            monitor: None,
             track_hd: false,
             user_speed: 1.0,
             track_rate: 1.0,
@@ -1237,7 +1240,7 @@ impl WallApp {
             .map_err(|e| format!("创建壁纸窗口失败: {e}"))?;
         let window = Arc::new(window);
         let hwnd = win::window_hwnd(&window).map_err(|e| format!("{e}"))?;
-        let host = win::attach(hwnd);
+        let host = win::attach(hwnd, self.monitor);
         if host.width == 0 || host.height == 0 {
             self.out.send(&Event::Error { message: "桌面壁纸层不可用".into() });
             return Err(String::new());
@@ -2078,8 +2081,12 @@ impl WallApp {
                 }
                 Err(e) => self.out.send(&Event::Error { message: format!("{e:#}") }),
             },
-            Command::Load { path, diff, speed, start, loop_playback, manifest, skin, force_colours, hidden, mods, storyboard, video, beatmap_hitsounds, upscale, .. } => {
+            Command::Load { path, diff, speed, start, loop_playback, manifest, skin, force_colours, hidden, mods, storyboard, video, beatmap_hitsounds, upscale, monitor, .. } => {
                 self.upscale = osu_replay_render::UpscaleMode::parse(&upscale);
+                self.monitor = monitor.and_then(|v| match v.as_slice() {
+                    [x, y, w, h] if *w > 0 && *h > 0 => Some((*x, *y, *w as u32, *h as u32)),
+                    _ => None,
+                });
                 self.apply_load(
                     event_loop,
                     LoadParams { path, diff, speed, start, loop_playback, manifest, skin, force_colours, hidden, mods, storyboard, video, beatmap_hitsounds, upscale },
@@ -2425,7 +2432,7 @@ impl ApplicationHandler<Command> for WallApp {
                 let (w, h) = win::client_size(host.parent);
                 if w > 0 && h > 0 && (w, h) != self.desk {
                     log::info!("桌面尺寸变化: {}×{} → {}×{}", self.desk.0, self.desk.1, w, h);
-                    let (w, h) = win::fill_parent(host.child, host.parent);
+                    let (w, h) = win::fill_parent(host.child, host.parent, self.monitor);
                     self.desk = (w.max(1), h.max(1));
                     if let Some(surf) = &mut self.surf {
                         surf.resize(self.desk.0, self.desk.1);

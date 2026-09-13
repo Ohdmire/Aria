@@ -129,6 +129,8 @@ fn main() {
             set_hidden,
             set_storyboard,
             set_upscale,
+            monitors,
+            set_monitor,
             set_beatmap_hitsounds,
             dir_status,
             pick_data_dir,
@@ -1537,6 +1539,50 @@ fn set_storyboard(app: AppHandle, on: bool) -> Result<(), String> {
         let state = app.state::<ctl::WallState>();
         let mut s = state.settings.lock().unwrap();
         s.storyboard = on;
+        settings::save(&app, &s);
+    }
+    reload_current_track(&app);
+    Ok(())
+}
+
+/// 显示器列表(设备名/bounds/主屏标记),设置界面"屏幕"下拉用。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MonitorChoice {
+    pub device: String,
+    pub label: String,
+    pub primary: bool,
+}
+
+#[tauri::command]
+fn monitors() -> Vec<MonitorChoice> {
+    let mut out: Vec<MonitorChoice> = win::list_monitors()
+        .into_iter()
+        .enumerate()
+        .map(|(i, m)| MonitorChoice {
+            label: format!(
+                "显示器 {}({}×{}{})",
+                i + 1,
+                m.w,
+                m.h,
+                if m.primary { ",主屏" } else { "" }
+            ),
+            device: m.device,
+            primary: m.primary,
+        })
+        .collect();
+    // 主屏排最前(默认项直读)
+    out.sort_by_key(|m| !m.primary);
+    out
+}
+
+/// 壁纸渲染目标显示器(None = 主屏)。更改后重载当前曲目生效。
+#[tauri::command]
+fn set_monitor(app: AppHandle, device: Option<String>) -> Result<(), String> {
+    {
+        let state = app.state::<ctl::WallState>();
+        let mut s = state.settings.lock().unwrap();
+        s.monitor = device;
         settings::save(&app, &s);
     }
     reload_current_track(&app);

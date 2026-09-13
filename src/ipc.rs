@@ -81,6 +81,10 @@ pub enum Command {
             /// 超分模式(off / fsr / anime4k):视频帧与 BG(载入期)。
             #[serde(default = "default_upscale")]
             upscale: String,
+            /// 目标显示器 bounds [x,y,w,h](虚拟屏绝对坐标;缺省 = 铺满
+            /// 桌面层)。窗口创建时生效。
+            #[serde(default)]
+            monitor: Option<Vec<i32>>,
         },
     /// 卸载内容并销毁壁纸窗口,恢复桌面原壁纸。
     Unload,

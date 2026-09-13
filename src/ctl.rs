@@ -353,6 +353,18 @@ pub fn load_track(app: &AppHandle, track: &Track) -> Result<(), String> {
     load_track_at(app, track, 0.0)
 }
 
+/// 设置里保存的显示器设备名 → 目标屏 bounds(None = 主屏;枚举失败 =
+/// None,退回铺满桌面层的旧行为)。
+fn monitor_bounds_of(stored: &Option<String>) -> Option<Vec<i32>> {
+    let monitors = crate::win::list_monitors();
+    let pick = stored
+        .as_deref()
+        .and_then(|d| monitors.iter().find(|m| m.device == d))
+        .or_else(|| monitors.iter().find(|m| m.primary))
+        .or_else(|| monitors.first())?;
+    Some(vec![pick.x, pick.y, pick.w, pick.h])
+}
+
 /// 统一的 Load 派发尾部:设置快照 + 记住当前曲目 + 回填显示快照 +
 /// 下发命令 + 广播。快/慢路径共用。
 #[allow(clippy::too_many_arguments)]
@@ -368,7 +380,7 @@ fn dispatch_load(
     start: f32,
 ) -> Result<(), String> {
     // 视频/故事板单一开关(lazer ShowStoryboard:关 = 精灵与视频一起关)
-    let (fail, speed, loop_playback, skin_stored, force_colours, hidden, storyboard, beatmap_hitsounds, upscale) = {
+    let (fail, speed, loop_playback, skin_stored, force_colours, hidden, storyboard, beatmap_hitsounds, upscale, monitor) = {
         let state = app.state::<WallState>();
         let s = state.settings.lock().unwrap();
         (
@@ -381,6 +393,7 @@ fn dispatch_load(
             s.storyboard,
             s.beatmap_hitsounds,
             s.upscale.clone(),
+            monitor_bounds_of(&s.monitor),
         )
     };
     // 皮肤身份值 → 实际目录(realm 挂载/缓存定位;失效回默认皮肤)
@@ -421,6 +434,7 @@ fn dispatch_load(
             video: storyboard,
             beatmap_hitsounds,
             upscale,
+            monitor,
         },
     )?;
     // 广播**已解析**难度(前端难度选择器/标题据此刷新)
@@ -640,6 +654,7 @@ pub fn reload_saved(app: &AppHandle) -> Result<(), String> {
                 video: s.storyboard,
                 beatmap_hitsounds: s.beatmap_hitsounds,
                 upscale: s.upscale.clone(),
+                monitor: monitor_bounds_of(&s.monitor),
             },
         )?;
     }

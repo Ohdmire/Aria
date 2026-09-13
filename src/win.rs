@@ -17,14 +17,72 @@ use anyhow::{bail, Result};
 use windows::core::{w, PCWSTR};
 use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, RECT, LPARAM, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, MapWindowPoints, HMONITOR, HDC, MONITORINFOEXW,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowExW, FindWindowW, GetAncestor, GetClientRect,
     GetWindowLongPtrW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
     SendMessageTimeoutW, SetLayeredWindowAttributes, SetParent, SetWindowLongPtrW,
     SetWindowPos, GA_PARENT, GWL_EXSTYLE, GWL_STYLE, HWND_BOTTOM, LWA_ALPHA,
-    SMTO_NORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, WS_CAPTION, WS_CHILD,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+    MONITORINFOF_PRIMARY, SMTO_NORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
+    WS_CAPTION, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
+
+/// 一台显示器的描述(虚拟屏绝对坐标;device 如 `\\.\DISPLAY2`,跨会话
+/// 稳定,持久化选择用)。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Monitor {
+    pub device: String,
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub primary: bool,
+}
+
+/// 枚举当前桌面显示器(Lively DisplayManager 同款:EnumDisplayMonitors +
+/// MONITORINFOEXW)。失败/空表时返回空。
+pub fn list_monitors() -> Vec<Monitor> {
+    unsafe {
+        unsafe extern "system" fn mon_enum(
+            hmon: HMONITOR,
+            _hdc: HDC,
+            _rect: *mut RECT,
+            lparam: LPARAM,
+        ) -> BOOL {
+            let out = &mut *(lparam.0 as *mut Vec<Monitor>);
+            unsafe {
+                let mut mi = MONITORINFOEXW::default();
+                mi.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+                if GetMonitorInfoW(hmon, &mut mi as *mut MONITORINFOEXW as *mut windows::Win32::Graphics::Gdi::MONITORINFO).as_bool() {
+                    let device = String::from_utf16_lossy(
+                        &mi.szDevice[..mi.szDevice.iter().position(|&c| c == 0).unwrap_or(mi.szDevice.len())],
+                    );
+                    let r = mi.monitorInfo.rcMonitor;
+                    out.push(Monitor {
+                        device,
+                        x: r.left,
+                        y: r.top,
+                        w: r.right - r.left,
+                        h: r.bottom - r.top,
+                        primary: (mi.monitorInfo.dwFlags & MONITORINFOF_PRIMARY) != 0,
+                    });
+                }
+            }
+            true.into()
+        }
+        let mut out: Vec<Monitor> = Vec::new();
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(mon_enum),
+            LPARAM(&mut out as *mut Vec<Monitor> as isize),
+        );
+        out
+    }
+}
 
 /// 未公开的 Progman 消息:让 shell 整理桌面层(生成 WorkerW)。
 const SPAWN_WORKER: u32 = 0x052C;
@@ -248,10 +306,29 @@ unsafe fn reparent(child: HWND, parent: HWND) -> bool {
     GetAncestor(child, GA_PARENT) == parent
 }
 
+/// 目标显示器 bounds(虚拟屏绝对坐标 x/y/w/h):None = 铺满宿主客户区
+/// (旧行为,双屏下即"span"效果)。
+pub type MonitorBounds = (i32, i32, u32, u32);
+
 /// 把已创建(仍隐藏)的窗口附加为壁纸(Lively TryAttachToDesktop 移植)。
-/// 显示交给调用方。
-pub fn attach(child: HWND) -> WallpaperHost {
+/// `bounds` 指定只占某一显示器(Lively TrySetWallpaperPerScreen 两步坐标
+/// 法:重定父前按屏幕绝对坐标定位,挂靠后 MapWindowPoints 换算父客户区
+/// 坐标再落位)。显示交给调用方。
+pub fn attach(child: HWND, bounds: Option<MonitorBounds>) -> WallpaperHost {
     unsafe {
+        // 重定父前先按屏幕绝对坐标就位(SetParent 保留视觉位置,挂靠后
+        // 再按换算出的父相对坐标精确定位)
+        if let Some((x, y, w, h)) = bounds {
+            let _ = SetWindowPos(
+                child,
+                None,
+                x,
+                y,
+                w as i32,
+                h as i32,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            );
+        }
         let progman = FindWindowW(w!("Progman"), PCWSTR::null()).unwrap_or_default();
         if progman.is_invalid() {
             log::error!("未找到 Progman");
@@ -306,14 +383,26 @@ pub fn attach(child: HWND) -> WallpaperHost {
                 log::error!("附加失败:窗口无法挂到 Progman(父级操作被拒)");
                 return WallpaperHost::invalid();
             }
-            let (w, h) = client_size(progman);
+            let (w, h) = match bounds {
+                Some(b) => (b.2, b.3),
+                None => client_size(progman),
+            };
             if w > 0 && h > 0 {
-                // insertAfter = DefView:紧贴图标层之下
+                // insertAfter = DefView:紧贴图标层之下;坐标 = 目标屏在
+                // 父客户区的映射(bounds 时)或 (0,0) 铺满
+                let (px, py) = match bounds {
+                    Some((x, y, _, _)) => {
+                        let mut pt = [windows::Win32::Foundation::POINT { x, y }];
+                        MapWindowPoints(None, Some(progman), &mut pt);
+                        (pt[0].x, pt[0].y)
+                    }
+                    None => (0, 0),
+                };
                 let _ = SetWindowPos(
                     child,
                     Some(defview),
-                    0,
-                    0,
+                    px,
+                    py,
                     w as i32,
                     h as i32,
                     SWP_FRAMECHANGED | SWP_NOACTIVATE,
@@ -420,13 +509,24 @@ pub fn attach(child: HWND) -> WallpaperHost {
             log::error!("附加失败:窗口无法挂到 WorkerW/Progman(父级操作被拒)");
             return WallpaperHost::invalid();
         }
-        let (w, h) = client_size(parent);
+        let (w, h) = match bounds {
+            Some(b) => (b.2, b.3),
+            None => client_size(parent),
+        };
         if w > 0 && h > 0 {
+            let (px, py) = match bounds {
+                Some((x, y, _, _)) => {
+                    let mut pt = [windows::Win32::Foundation::POINT { x, y }];
+                    MapWindowPoints(None, Some(parent), &mut pt);
+                    (pt[0].x, pt[0].y)
+                }
+                None => (0, 0),
+            };
             let _ = SetWindowPos(
                 child,
                 Some(HWND_BOTTOM),
-                0,
-                0,
+                px,
+                py,
                 w as i32,
                 h as i32,
                 SWP_FRAMECHANGED | SWP_NOACTIVATE,
@@ -443,16 +543,28 @@ pub fn attach(child: HWND) -> WallpaperHost {
     }
 }
 
-/// 子窗口铺满宿主客户区,保持既有 z 序(分辨率轮询跟随尺寸用)。
-pub fn fill_parent(child: HWND, parent: HWND) -> (u32, u32) {
+/// 子窗口铺满宿主客户区(或指定显示器 bounds),保持既有 z 序
+/// (分辨率轮询跟随尺寸用)。
+pub fn fill_parent(child: HWND, parent: HWND, bounds: Option<MonitorBounds>) -> (u32, u32) {
     unsafe {
-        let (w, h) = client_size(parent);
+        let (w, h) = match bounds {
+            Some(b) => (b.2, b.3),
+            None => client_size(parent),
+        };
         if w > 0 && h > 0 {
+            let (px, py) = match bounds {
+                Some((x, y, _, _)) => {
+                    let mut pt = [windows::Win32::Foundation::POINT { x, y }];
+                    MapWindowPoints(None, Some(parent), &mut pt);
+                    (pt[0].x, pt[0].y)
+                }
+                None => (0, 0),
+            };
             let _ = SetWindowPos(
                 child,
                 None,
-                0,
-                0,
+                px,
+                py,
                 w as i32,
                 h as i32,
                 SWP_NOZORDER | SWP_FRAMECHANGED,

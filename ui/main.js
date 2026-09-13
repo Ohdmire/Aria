@@ -1567,6 +1567,19 @@ window.__TAURI__.app?.getVersion?.()
     $('gameplay-hidden').checked = !!s.gameplayHidden;
     $('sb').checked = s.storyboard ?? true;
     $('upscale').value = ['off', 'fsr', 'anime4k'].includes(s.upscale) ? s.upscale : 'off';
+    // 屏幕下拉:列表异步拉取,当前值优先用已存设备名
+    const savedMonitor = s.monitor ?? '';
+    invoke('monitors').then((list) => {
+      const sel = $('monitor');
+      sel.innerHTML = '';
+      for (const m of list) {
+        const opt = document.createElement('option');
+        opt.value = m.device;
+        opt.textContent = m.label;
+        sel.appendChild(opt);
+      }
+      sel.value = list.some((m) => m.device === savedMonitor) ? savedMonitor : (list.find((m) => m.primary)?.device ?? '');
+    }).catch(() => {});
     $('bm-hits').checked = s.beatmap_hitsounds ?? true;
     $('force-colours').checked = !!s.force_skin_colours;
     $('fps').value = String(s.fps ?? 0);
@@ -2132,6 +2145,10 @@ $('sb').addEventListener('change', () => {
 // 超分(视频/BG):视频实时热切换,BG 下次载入生效
 $('upscale').addEventListener('change', () => {
   invoke('set_upscale', { mode: $('upscale').value }).catch((e) => toast(`${e}`));
+});
+// 目标显示器:更改后重载当前曲目
+$('monitor').addEventListener('change', () => {
+  invoke('set_monitor', { device: $('monitor').value || null }).catch((e) => toast(`${e}`));
 });
 // 谱面自带音效(lazer "Beatmap hitsounds"):谱面集采样文件优先于皮肤,
 // 加载期生效,切换会重播当前曲目

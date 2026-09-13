@@ -110,6 +110,10 @@ pub struct Settings {
     /// 超分模式(off / fsr / anime4k):视频帧实时生效,BG 载入期放大。
     #[serde(default = "default_upscale")]
     pub upscale: String,
+    /// 壁纸渲染目标显示器(设备名如 `\.\DISPLAY2`;None = 主屏)。
+    /// 更改后重载当前曲目生效。
+    #[serde(default)]
+    pub monitor: Option<String>,
     /// 帧率上限(0 = 跟随屏幕刷新率;30/60/120/240/360)。
     #[serde(default)]
     pub fps: u32,
@@ -254,6 +258,7 @@ impl Default for Settings {
             skin: None,
             force_skin_colours: false,
             upscale: default_upscale(),
+            monitor: None,
             fps: 0,
             target_star: None,
             star_min: 0.0,
