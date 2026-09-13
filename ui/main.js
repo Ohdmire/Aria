@@ -1568,8 +1568,9 @@ window.__TAURI__.app?.getVersion?.()
     $('sb').checked = s.storyboard ?? true;
     // 旧值兼容:裸 "anime4k" 归一到 A
     const up = s.upscale === 'anime4k' ? 'anime4k-a' : s.upscale;
-    $('upscale').value = ['off', 'fsr', 'anime4k-a', 'anime4k-b', 'anime4k-c'].includes(up) ? up : 'off';
+    $('upscale').value = ['off', 'fsr', 'anime4k-a', 'anime4k-aa', 'anime4k-b', 'anime4k-bb', 'anime4k-c', 'anime4k-ca'].includes(up) ? up : 'off';
     $('upscale-quality').value = ['s', 'm', 'l', 'vl', 'ul'].includes(s.upscaleQuality) ? s.upscaleQuality : 'm';
+    updateUpscaleQualityVisibility();
     // 屏幕下拉:列表异步拉取,当前值优先用已存设备名
     const savedMonitor = s.monitor ?? '';
     invoke('monitors').then((list) => {
@@ -2147,12 +2148,18 @@ $('sb').addEventListener('change', () => {
 });
 // 超分(视频/BG):视频实时热切换,BG 下次载入生效
 $('upscale').addEventListener('change', () => {
+  updateUpscaleQualityVisibility();
   invoke('set_upscale', { mode: $('upscale').value, quality: $('upscale-quality').value }).catch((e) => toast(`${e}`));
 });
 // 目标显示器:更改后重载当前曲目
 $('monitor').addEventListener('change', () => {
   invoke('set_monitor', { device: $('monitor').value || null }).catch((e) => toast(`${e}`));
 });
+// 质量档只在 Anime4K 模式下显示(关/FSR 无档位概念)
+function updateUpscaleQualityVisibility() {
+  $('upscale-quality').hidden = !$('upscale').value.startsWith('anime4k');
+}
+updateUpscaleQualityVisibility();
 // Anime4K 质量档:实时热切换(与滤镜共用 set_upscale)
 $('upscale-quality').addEventListener('change', () => {
   invoke('set_upscale', { mode: $('upscale').value, quality: $('upscale-quality').value }).catch((e) => toast(`${e}`));

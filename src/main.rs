@@ -1593,7 +1593,10 @@ fn set_monitor(app: AppHandle, device: Option<String>) -> Result<(), String> {
 /// 重建,BG 重解码放大后图集热换,不重载不打断音频。
 #[tauri::command]
 fn set_upscale(app: AppHandle, mode: String, quality: Option<String>) -> Result<(), String> {
-    if !matches!(mode.as_str(), "off" | "fsr" | "anime4k" | "anime4k-a" | "anime4k-b" | "anime4k-c") {
+    if !matches!(
+        mode.as_str(),
+        "off" | "fsr" | "anime4k" | "anime4k-a" | "anime4k-aa" | "anime4k-b" | "anime4k-bb" | "anime4k-c" | "anime4k-ca"
+    ) {
         return Err(format!("未知超分模式:{mode}"));
     }
     let quality = quality.unwrap_or_else(|| "m".into());
