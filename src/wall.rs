@@ -1478,7 +1478,7 @@ impl WallApp {
         // GPU 会话存在:重打包图集并热换。
         if let Some(surf) = &mut self.surf {
             let (w, h) = self.scene_size;
-            let sb_slot = (w.min(1920).max(1) & !1, h.min(1080).max(1) & !1);
+            let sb_slot = (w.max(1) & !1, h.max(1) & !1);
             let slots = self.sb_layer.is_some().then(|| StoryboardSlots {
                 width: sb_slot.0,
                 height: sb_slot.1,
@@ -1511,6 +1511,65 @@ impl WallApp {
     /// 的时间轴与开关无关。在播的一次性采样自然放完(<几百 ms);循环音
     /// 停掉,下一 tick(≤1 帧)用新采样原参数重启。两种开关状态的解析
     /// 结果各占一份缓存项,来回切换零重解。
+    /// 超分模式热切换的 BG 部分:重新解码背景 → 新模式放大 → 重打包
+    /// 图集热换(视频链由调用方先行热切)。无渲染会话、故事板接管背景
+    /// 或解码失败时静默跳过 —— 音频/时钟/判定全程不动。
+    fn hot_swap_bg_upscale(&mut self, mode: osu_replay_render::UpscaleMode) {
+        let Some(surf) = &mut self.surf else { return };
+        if self.scene.as_ref().is_some_and(|s| s.sb_replaces_bg) {
+            return;
+        }
+        let Some(bg_name) = self.game.as_ref().and_then(|g| g.map_background.clone()) else {
+            return;
+        };
+        let source = self.source.clone();
+        let cand = match source.as_ref() {
+            Some(MapSource::Path { map_path }) => map_path
+                .parent()
+                .map(|d| d.join(&bg_name))
+                .unwrap_or_else(|| PathBuf::from(&bg_name)),
+            Some(MapSource::Virtual { files, .. }) => match files.resolve(&bg_name) {
+                Some(p) => p,
+                None => return,
+            },
+            None => return,
+        };
+        let Some(img) = osu_replay_render::decode_image_file(&cand)
+            .ok()
+            .and_then(|i| osu_replay_render::upscale_bg(Some(i), mode, self.scene_size))
+        else {
+            return;
+        };
+        let (w, h) = self.scene_size;
+        let sb_slot = (w.max(1) & !1, h.max(1) & !1);
+        let slots = self.sb_layer.is_some().then(|| StoryboardSlots {
+            width: sb_slot.0,
+            height: sb_slot.1,
+            foreground: self.scene.as_ref().is_some_and(|s| s.storyboard_fg),
+        });
+        let max_dim = osu_replay_render::render::Renderer::probe_max_texture_dimension_2d();
+        if let Some(skin) = self.skin.as_mut() {
+            let (mut atlas, fonts) = build_atlas(
+                Some(img),
+                Some(w as f32 / h.max(1) as f32),
+                None,
+                skin,
+                max_dim,
+                slots,
+            );
+            log::info!(
+                "超分热换({:?}): 图集重打包 {}x{}",
+                mode,
+                atlas.width,
+                atlas.height
+            );
+            surf.set_atlas(&atlas);
+            atlas.release_cpu_copy();
+            self.atlas = Some(atlas);
+            self.fonts = Some(fonts);
+        }
+    }
+
     fn reswap_hitsounds(&mut self) {
         if self.hs_slots.is_empty() {
             return;
@@ -2341,13 +2400,18 @@ impl WallApp {
                 }
             }
             Command::SetUpscale { mode } => {
-                // 热切换:视频链即时重建;BG 已烘进图集,下次载入生效
+                // 热切换:视频链即时重建;BG 重解码→重放大→图集热换
+                // (音乐/时钟/判定全保留,与皮肤热换同款机制)
                 let m = osu_replay_render::UpscaleMode::parse(&mode);
                 self.upscale = m;
+                if let Some(load) = &mut self.last_load {
+                    load.upscale = mode;
+                }
                 if let Some(sb) = &mut self.sb_layer {
                     let (w, h) = self.scene_size;
                     sb.set_video_upscale(m, (w, h));
                 }
+                self.hot_swap_bg_upscale(m);
             }
             // 无缝切换:不重载、不打断音频,仅拆/建渲染会话与暂停/恢复播放
             Command::SetRenderMode { mode } => {

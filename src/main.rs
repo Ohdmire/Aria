@@ -1589,11 +1589,11 @@ fn set_monitor(app: AppHandle, device: Option<String>) -> Result<(), String> {
     Ok(())
 }
 
-/// 超分模式(off / fsr / anime4k):视频帧实时热切换;BG 为载入期
-/// 一次性放大,切换后下次载入曲目对 BG 生效。
+/// 超分模式(off / fsr / anime4k-a|b|c):实时热切换 —— 视频链即时
+/// 重建,BG 重解码放大后图集热换,不重载不打断音频。
 #[tauri::command]
 fn set_upscale(app: AppHandle, mode: String) -> Result<(), String> {
-    if !matches!(mode.as_str(), "off" | "fsr" | "anime4k") {
+    if !matches!(mode.as_str(), "off" | "fsr" | "anime4k" | "anime4k-a" | "anime4k-b" | "anime4k-c") {
         return Err(format!("未知超分模式:{mode}"));
     }
     {

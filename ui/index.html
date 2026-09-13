@@ -124,12 +124,14 @@
           </div>
           <div class="row wrap">
             <span class="dim">超分</span>
-            <select id="upscale" class="w-auto" title="视频与背景放大算法(FSR 锐利、Anime4K 动漫线条重建;仅作用于视频/BG,游戏元素不受影响)">
+            <select id="upscale" class="w-auto" title="视频与背景放大/增强算法(仅作用于视频/BG,游戏元素不受影响;切换实时生效)">
               <option value="off">关</option>
               <option value="fsr">FSR</option>
-              <option value="anime4k">Anime4K</option>
+              <option value="anime4k-a">Anime4K A(锐利)</option>
+              <option value="anime4k-b">Anime4K B(柔和)</option>
+              <option value="anime4k-c">Anime4K C(降噪)</option>
             </select>
-            <span class="dim" style="font-size:.85em">视频实时生效;背景下次载入生效</span>
+            <span class="dim" style="font-size:.85em">实时生效,不打断播放</span>
           </div>
           <div class="row wrap">
             <label class="check-inline" title="谱面故事板与视频层"><input type="checkbox" id="sb" checked /> 故事板(含视频)</label>

@@ -1566,7 +1566,9 @@ window.__TAURI__.app?.getVersion?.()
     $('hidden').checked = !!s.hidden;
     $('gameplay-hidden').checked = !!s.gameplayHidden;
     $('sb').checked = s.storyboard ?? true;
-    $('upscale').value = ['off', 'fsr', 'anime4k'].includes(s.upscale) ? s.upscale : 'off';
+    // 旧值兼容:裸 "anime4k" 归一到 A
+    const up = s.upscale === 'anime4k' ? 'anime4k-a' : s.upscale;
+    $('upscale').value = ['off', 'fsr', 'anime4k-a', 'anime4k-b', 'anime4k-c'].includes(up) ? up : 'off';
     // 屏幕下拉:列表异步拉取,当前值优先用已存设备名
     const savedMonitor = s.monitor ?? '';
     invoke('monitors').then((list) => {
