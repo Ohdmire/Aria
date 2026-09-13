@@ -242,6 +242,8 @@ struct LoadParams {
     beatmap_hitsounds: bool,
     /// 超分模式(off / fsr / anime4k):视频帧实时,BG 载入期。
     upscale: String,
+    /// Anime4K 质量档(s/m/l/vl/ul)。
+    upscale_quality: String,
 }
 
 /// 一次加载的谱面来源:普通路径(.osz 解包 / stable 目录)或 lazer 虚拟
@@ -552,6 +554,8 @@ struct WallApp {
     upscale: osu_replay_render::UpscaleMode,
     /// 目标显示器 bounds(None = 铺满桌面层,双屏即 span;Some = 指定屏)。
     monitor: Option<win::MonitorBounds>,
+    /// Anime4K 质量档(s/m/l/vl/ul)。
+    upscale_quality: String,
     /// 曲目自带 HD mod 位(加载期;与用户 HD 开关取或得到 hd_on)。
     track_hd: bool,
     /// 用户倍速(播放条变速按钮;实际速度 = track_rate × user_speed)。
@@ -677,6 +681,7 @@ impl WallApp {
             hd_on: false,
             upscale: osu_replay_render::UpscaleMode::Off,
             monitor: None,
+            upscale_quality: "m".into(),
             track_hd: false,
             user_speed: 1.0,
             track_rate: 1.0,
@@ -2140,7 +2145,8 @@ impl WallApp {
                 }
                 Err(e) => self.out.send(&Event::Error { message: format!("{e:#}") }),
             },
-            Command::Load { path, diff, speed, start, loop_playback, manifest, skin, force_colours, hidden, mods, storyboard, video, beatmap_hitsounds, upscale, monitor, .. } => {
+            Command::Load { path, diff, speed, start, loop_playback, manifest, skin, force_colours, hidden, mods, storyboard, video, beatmap_hitsounds, upscale, upscale_quality, monitor, .. } => {
+                self.upscale_quality = upscale_quality.clone();
                 self.upscale = osu_replay_render::UpscaleMode::parse(&upscale);
                 self.monitor = monitor.and_then(|v| match v.as_slice() {
                     [x, y, w, h] if *w > 0 && *h > 0 => Some((*x, *y, *w as u32, *h as u32)),
@@ -2148,7 +2154,7 @@ impl WallApp {
                 });
                 self.apply_load(
                     event_loop,
-                    LoadParams { path, diff, speed, start, loop_playback, manifest, skin, force_colours, hidden, mods, storyboard, video, beatmap_hitsounds, upscale },
+                    LoadParams { path, diff, speed, start, loop_playback, manifest, skin, force_colours, hidden, mods, storyboard, video, beatmap_hitsounds, upscale, upscale_quality },
                 );
             }
             Command::Reload => {
@@ -2399,13 +2405,20 @@ impl WallApp {
                     sb.set_video_enabled(on);
                 }
             }
-            Command::SetUpscale { mode } => {
+            Command::SetUpscale { mode, quality } => {
                 // 热切换:视频链即时重建;BG 重解码→重放大→图集热换
                 // (音乐/时钟/判定全保留,与皮肤热换同款机制)
-                let m = osu_replay_render::UpscaleMode::parse(&mode);
+                self.upscale_quality = quality.clone();
+                let full = if mode.starts_with("anime4k") && matches!(quality.as_str(), "s" | "l" | "vl" | "ul") {
+                    format!("{mode}-{quality}")
+                } else {
+                    mode.clone()
+                };
+                let m = osu_replay_render::UpscaleMode::parse(&full);
                 self.upscale = m;
                 if let Some(load) = &mut self.last_load {
-                    load.upscale = mode;
+                    load.upscale = full;
+                    load.upscale_quality = quality;
                 }
                 if let Some(sb) = &mut self.sb_layer {
                     let (w, h) = self.scene_size;

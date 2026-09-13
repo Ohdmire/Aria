@@ -52,3 +52,9 @@ opt-level = 1
 
 [profile.release]
 lto = "thin"
+# 本地 sibling 开发接管(勿提交):wgpu 25 + FSR/Anime4K 开发期间未推送。
+[patch."https://github.com/Ohdmire/osu-replay-render.git"]
+osu_replay_render = { path = "../osu-replay-render" }
+
+[patch."https://github.com/Ohdmire/osu-storyboard-render.git"]
+osu-storyboard-render = { path = "../osu-storyboard-render", default-features = false }

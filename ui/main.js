@@ -1569,6 +1569,7 @@ window.__TAURI__.app?.getVersion?.()
     // 旧值兼容:裸 "anime4k" 归一到 A
     const up = s.upscale === 'anime4k' ? 'anime4k-a' : s.upscale;
     $('upscale').value = ['off', 'fsr', 'anime4k-a', 'anime4k-b', 'anime4k-c'].includes(up) ? up : 'off';
+    $('upscale-quality').value = ['s', 'm', 'l', 'vl', 'ul'].includes(s.upscaleQuality) ? s.upscaleQuality : 'm';
     // 屏幕下拉:列表异步拉取,当前值优先用已存设备名
     const savedMonitor = s.monitor ?? '';
     invoke('monitors').then((list) => {
@@ -2146,11 +2147,15 @@ $('sb').addEventListener('change', () => {
 });
 // 超分(视频/BG):视频实时热切换,BG 下次载入生效
 $('upscale').addEventListener('change', () => {
-  invoke('set_upscale', { mode: $('upscale').value }).catch((e) => toast(`${e}`));
+  invoke('set_upscale', { mode: $('upscale').value, quality: $('upscale-quality').value }).catch((e) => toast(`${e}`));
 });
 // 目标显示器:更改后重载当前曲目
 $('monitor').addEventListener('change', () => {
   invoke('set_monitor', { device: $('monitor').value || null }).catch((e) => toast(`${e}`));
+});
+// Anime4K 质量档:实时热切换(与滤镜共用 set_upscale)
+$('upscale-quality').addEventListener('change', () => {
+  invoke('set_upscale', { mode: $('upscale').value, quality: $('upscale-quality').value }).catch((e) => toast(`${e}`));
 });
 // 谱面自带音效(lazer "Beatmap hitsounds"):谱面集采样文件优先于皮肤,
 // 加载期生效,切换会重播当前曲目

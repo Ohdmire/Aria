@@ -110,6 +110,9 @@ pub struct Settings {
     /// 超分模式(off / fsr / anime4k):视频帧实时生效,BG 载入期放大。
     #[serde(default = "default_upscale")]
     pub upscale: String,
+    /// Anime4K 质量档(s/m/l/vl/ul,缺省 m;仅 Anime4K 滤镜生效)。
+    #[serde(default = "default_upscale_quality")]
+    pub upscale_quality: String,
     /// 壁纸渲染目标显示器(设备名如 `\.\DISPLAY2`;None = 主屏)。
     /// 更改后重载当前曲目生效。
     #[serde(default)]
@@ -203,6 +206,10 @@ fn default_upscale() -> String {
     "off".into()
 }
 
+fn default_upscale_quality() -> String {
+    "m".into()
+}
+
 fn default_hits_volume() -> f32 {
     0.8
 }
@@ -258,6 +265,7 @@ impl Default for Settings {
             skin: None,
             force_skin_colours: false,
             upscale: default_upscale(),
+            upscale_quality: default_upscale_quality(),
             monitor: None,
             fps: 0,
             target_star: None,

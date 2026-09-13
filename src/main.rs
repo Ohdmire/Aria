@@ -1592,17 +1592,22 @@ fn set_monitor(app: AppHandle, device: Option<String>) -> Result<(), String> {
 /// 超分模式(off / fsr / anime4k-a|b|c):实时热切换 —— 视频链即时
 /// 重建,BG 重解码放大后图集热换,不重载不打断音频。
 #[tauri::command]
-fn set_upscale(app: AppHandle, mode: String) -> Result<(), String> {
+fn set_upscale(app: AppHandle, mode: String, quality: Option<String>) -> Result<(), String> {
     if !matches!(mode.as_str(), "off" | "fsr" | "anime4k" | "anime4k-a" | "anime4k-b" | "anime4k-c") {
         return Err(format!("未知超分模式:{mode}"));
+    }
+    let quality = quality.unwrap_or_else(|| "m".into());
+    if !matches!(quality.as_str(), "s" | "m" | "l" | "vl" | "ul") {
+        return Err(format!("未知质量档:{quality}"));
     }
     {
         let state = app.state::<ctl::WallState>();
         let mut s = state.settings.lock().unwrap();
         s.upscale = mode.clone();
+        s.upscale_quality = quality.clone();
         settings::save(&app, &s);
     }
-    ctl::send_cmd(&app, Command::SetUpscale { mode })
+    ctl::send_cmd(&app, Command::SetUpscale { mode, quality })
 }
 
 /// 谱面自带音效开关(lazer "Beatmap hitsounds",默认开):谱面集内的

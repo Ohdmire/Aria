@@ -353,6 +353,17 @@ pub fn load_track(app: &AppHandle, track: &Track) -> Result<(), String> {
     load_track_at(app, track, 0.0)
 }
 
+/// anime4k 模式 + 质量档 → 完整模式串(anime4k-a-l);非 anime4k 原样。
+fn effective_upscale(mode: &str, quality: &str) -> String {
+    if mode.starts_with("anime4k") && !matches!(quality, "s" | "m" | "l" | "vl" | "ul") {
+        return mode.to_string();
+    }
+    if mode.starts_with("anime4k") && quality != "m" {
+        return format!("{mode}-{quality}");
+    }
+    mode.to_string()
+}
+
 /// 设置里保存的显示器设备名 → 目标屏 bounds(None = 主屏;枚举失败 =
 /// None,退回铺满桌面层的旧行为)。
 fn monitor_bounds_of(stored: &Option<String>) -> Option<Vec<i32>> {
@@ -380,7 +391,7 @@ fn dispatch_load(
     start: f32,
 ) -> Result<(), String> {
     // 视频/故事板单一开关(lazer ShowStoryboard:关 = 精灵与视频一起关)
-    let (fail, speed, loop_playback, skin_stored, force_colours, hidden, storyboard, beatmap_hitsounds, upscale, monitor) = {
+    let (fail, speed, loop_playback, skin_stored, force_colours, hidden, storyboard, beatmap_hitsounds, upscale, upscale_quality, monitor) = {
         let state = app.state::<WallState>();
         let s = state.settings.lock().unwrap();
         (
@@ -392,7 +403,8 @@ fn dispatch_load(
             s.hidden,
             s.storyboard,
             s.beatmap_hitsounds,
-            s.upscale.clone(),
+            effective_upscale(&s.upscale, &s.upscale_quality),
+            s.upscale_quality.clone(),
             monitor_bounds_of(&s.monitor),
         )
     };
@@ -434,6 +446,7 @@ fn dispatch_load(
             video: storyboard,
             beatmap_hitsounds,
             upscale,
+            upscale_quality,
             monitor,
         },
     )?;
@@ -653,7 +666,8 @@ pub fn reload_saved(app: &AppHandle) -> Result<(), String> {
                 storyboard: s.storyboard,
                 video: s.storyboard,
                 beatmap_hitsounds: s.beatmap_hitsounds,
-                upscale: s.upscale.clone(),
+                upscale: effective_upscale(&s.upscale, &s.upscale_quality),
+                upscale_quality: s.upscale_quality.clone(),
                 monitor: monitor_bounds_of(&s.monitor),
             },
         )?;

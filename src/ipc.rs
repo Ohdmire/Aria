@@ -18,6 +18,10 @@ fn default_upscale() -> String {
     "off".into()
 }
 
+fn default_quality() -> String {
+    "m".into()
+}
+
 fn one() -> f32 {
     1.0
 }
@@ -85,6 +89,9 @@ pub enum Command {
             /// 桌面层)。窗口创建时生效。
             #[serde(default)]
             monitor: Option<Vec<i32>>,
+            /// Anime4K 质量档(s/m/l/vl/ul,缺省 m)。
+            #[serde(default = "default_quality")]
+            upscale_quality: String,
         },
     /// 卸载内容并销毁壁纸窗口,恢复桌面原壁纸。
     Unload,
@@ -139,9 +146,10 @@ pub enum Command {
     SetHidden { on: bool },
     /// storyboard 视频层,实时生效(不解码不画;不重载)。
     SetVideo { on: bool },
-    /// 超分模式(off / fsr / anime4k):视频帧实时热切换(放大链重建);
-    /// BG 为载入期一次性放大,热切换只对视频生效,BG 下次载入生效。
-    SetUpscale { mode: String },
+    /// 超分模式(off / fsr / anime4k-a|b|c)+ Anime4K 质量档
+    /// (s/m/l/vl/ul):全实时热切换(视频链重建 + BG 图集热换)。
+    #[serde(rename_all = "camelCase")]
+    SetUpscale { mode: String, quality: String },
     /// 渲染模式(设置 render_mode 的运行期形态,一次性下发):
     /// always 始终渲染 / autopause 全屏时不渲染画面 / fs_pause 全屏时
     /// 暂停播放(壁纸保留)/ fs_sleep 全屏时暂停并释放壁纸 / off 播放器
