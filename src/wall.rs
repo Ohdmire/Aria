@@ -1950,6 +1950,13 @@ fn prep_render_session(
         atlas_max_dim,
         slots,
     );
+    log::info!(
+        "图集: {}x{}({} MB,上限 {})",
+        atlas.width,
+        atlas.height,
+        atlas.width as u64 * atlas.height as u64 * 4 / 1024 / 1024,
+        atlas_max_dim
+    );
 
     // SurfaceRenderer:内部 16:9 场景 letterbox 到桌面比例
     let surf = SurfaceRenderer::new(w, h, &atlas, raw_display, raw_window)
