@@ -1,0 +1,14 @@
+{
+  "name": "aria",
+  "private": true,
+  "version": "0.8.0",
+  "scripts": {
+    "tauri": "tauri",
+    "build:setup": "tauri build",
+    "build:setup:ffmpeg": "tauri build --config tauri.conf.ffmpeg.json && node scripts/move-setup.mjs",
+    "build:setup:all": "pnpm build:setup:ffmpeg && pnpm build:setup"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4"
+  }
+}

@@ -1,0 +1,10 @@
+/target
+gen/schemas
+*.log
+
+# 内置 ffmpeg(打包资源,体积过大不入库;见 tauri.conf.ffmpeg.json)
+/bin
+node_modules
+
+# 图标 SVG 源文件禁止入库(仅产物入库)
+icons/ARIA.svg

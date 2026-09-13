@@ -1,0 +1,54 @@
+[package]
+name = "aria"
+version = "0.8.0"
+edition = "2024"
+license = "MIT"
+description = "Aria(ATRI rhythm interactive animation)—— osu! storyboard 桌面动态壁纸播放器"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+cc = "1"
+
+[dependencies]
+osu_replay_render = { git = "https://github.com/Ohdmire/osu-replay-render.git", branch = "master" }
+
+winit = "0.30"
+raw-window-handle = "0.6"
+zip = { version = "8", default-features = false, features = ["deflate"] }
+
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 谱面音频 + 打击音效
+kira = "0.12"
+symphonia = { version = "0.6", default-features = false, features = ["id3v2", "id3v1"] }
+
+# osu!lazer client.realm 只读解析
+realm-db-reader = { git = "https://github.com/Ohdmire/realm-db-reader", branch = "main" }
+
+# osu!stable osu!.db / collection.db 只读解析
+osu-db = "0.2.1"
+
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_System_Threading",
+] }
+winreg = "0.56"
+base64 = "0.23"
+tauri-plugin-single-instance = "2.4.4"
+
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = "thin"

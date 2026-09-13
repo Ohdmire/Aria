@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Aria</title>
+  <!-- 主题先行应用(渲染前),避免亮色主题用户每次启动闪一下暗色 -->
+  <script>
+    try {
+      const t = JSON.parse(localStorage.getItem('aria-theme') || '{}');
+      if (t.mode) document.documentElement.dataset.mode = t.mode;
+      if (t.accent) document.documentElement.dataset.accent = t.accent;
+    } catch {}
+  </script>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <img class="logo" src="icon.png" alt="" />
+    <div class="titles">
+      <h1>Aria <span class="ver" id="app-ver"></span></h1>
+      <p>osu! storyboard 桌面动态壁纸</p>
+    </div>
+    <div class="src-switch" id="src-switch">
+      <button data-src="lazer" class="on" title="osu!lazer 曲库(client.realm)">lazer</button>
+      <button data-src="stable" title="osu!stable 曲库(osu!.db)">stable</button>
+    </div>
+    <span id="badge" class="badge off">未运行</span>
+  </header>
+
+  <main>
+    <!-- 主区:播放列表(默认)+ 曲库 双 tab -->
+    <section class="card main-card">
+      <div class="tabs" id="tabs">
+        <button data-tab="queue" class="tab on">播放列表 <span class="tab-count" id="queue-count">0</span></button>
+        <button data-tab="library" class="tab">曲库</button>
+        <button data-tab="settings" class="tab">设置</button>
+        <button data-tab="about" class="tab">关于</button>
+      </div>
+
+      <!-- Tab: 播放列表(主) -->
+      <div class="tab-page on" id="tab-queue">
+        <div class="row toolbar" id="queue-normalbar">
+          <span class="dim" id="queue-summary">队列空闲</span>
+          <span class="grow"></span>
+          <button id="queue-select" class="btn ghost small" title="多选条目:批量改 mods / 设置难度 / 恢复默认">选择</button>
+          <button id="queue-clear" class="btn ghost small">清空</button>
+        </div>
+        <div class="row toolbar" id="queue-selbar" hidden>
+          <span class="dim" id="qsel-info">已选 0 首 · 右键所选条目可批量清除</span>
+          <span class="grow"></span>
+          <button id="qsel-all" class="btn ghost small">全选</button>
+          <button id="qsel-done" class="btn ghost small">完成</button>
+        </div>
+        <div class="queue-list" id="queue-list" aria-hidden="true"></div>
+        <div class="lib-foot" id="queue-foot"></div>
+      </div>
+
+      <!-- Tab: 曲库 -->
+      <div class="tab-page" id="tab-library">
+        <div class="row toolbar">
+          <input type="text" id="lib-search" class="input grow" placeholder="搜索标题 / 艺术家…" />
+          <div class="star-range" id="star-range">
+            <div class="sr-fill" id="sr-fill"></div>
+            <div class="sr-nub" id="sr-nub-lo"></div>
+            <div class="sr-nub" id="sr-nub-hi"></div>
+            <div class="sr-tip" id="sr-tip">0★ – ∞</div>
+          </div>
+          <select id="lib-sort" class="pick-mode" title="曲库排序">
+            <option value="date_added">按导入时间排序</option>
+            <option value="artist">按作者排序</option>
+            <option value="title">按标题排序</option>
+            <option value="creator">按谱师排序</option>
+            <option value="star">按难度排序</option>
+            <option value="size">按大小排序</option>
+            <option value="collection_order">按添加顺序排序</option>
+          </select>
+          <button id="lib-sort-dir" class="btn ghost small" title="升序 / 降序">↓</button>
+          <button id="lib-refresh" class="btn ghost small">刷新</button>
+        </div>
+        <div class="row toolbar">
+          <select id="lib-collection" class="grow">
+            <option value="">全部谱面</option>
+          </select>
+          <button id="lib-add" class="btn primary small">添加到播放列表</button>
+        </div>
+        <div class="lib-src" id="lib-src" title=""></div>
+        <div class="lib-hint dim">先过滤(搜索 / 星级 / 收藏夹)→「添加到播放列表」按谱面集批量入列 · 行单击右侧预览(再点切回) · 双击立即播放 · ▸ 展开选难度 · 播放中可在底栏切换难度</div>
+        <div class="lib-list" id="lib-list" aria-hidden="true"></div>
+        <div class="lib-foot" id="lib-foot"></div>
+      </div>
+
+      <!-- Tab: 设置 -->
+    <div class="tab-page" id="tab-settings">
+        <details class="grp">
+          <summary>外观</summary>
+          <div class="row">
+            <span class="dim" style="flex:none">主题</span>
+            <select id="theme-mode" class="grow" title="暗色 / 亮色">
+              <option value="dark">暗色</option>
+              <option value="light">亮色</option>
+            </select>
+          </div>
+          <div class="row">
+            <span class="dim" style="flex:none">主题色</span>
+            <div class="accent-row" id="accent-row"></div>
+          </div>
+        </details>
+        <details class="grp">
+          <summary>画面</summary>
+          <div class="row wrap">
+            <span class="dim">渲染</span>
+            <select id="render-mode" class="w-auto" title="渲染与省电策略">
+              <option value="always">始终渲染</option>
+              <option value="autopause">全屏时不渲染画面</option>
+              <option value="fs_pause">全屏时暂停播放</option>
+              <option value="fs_sleep">全屏时暂停并休眠</option>
+              <option value="off">播放器模式</option>
+            </select>
+          </div>
+          <div class="row wrap">
+            <label class="check-inline" title="谱面故事板与视频层"><input type="checkbox" id="sb" checked /> 故事板(含视频)</label>
+            <label class="check-inline" title="物件命中前淡出"><input type="checkbox" id="hidden" /> HD</label>
+            <label class="check-inline" title="计分板/血条/按键提示"><input type="checkbox" id="hud" /> HUD</label>
+                        <label class="check-inline" title="右上角实时 PP"><input type="checkbox" id="pp" /> PP</label>
+            <label class="check-inline" title="命中圆圈 60ms 淡出"><input type="checkbox" id="reduce-anim" /> 减少打击动画</label>
+            <label class="check-inline" title="break 期间背景变亮"><input type="checkbox" id="break-lighten" /> 休息变亮</label>
+          </div>
+          <div class="row wrap">
+            <label class="check-inline" title="只留背景与故事板"><input type="checkbox" id="gameplay-hidden" /> 隐藏游玩画面</label>
+          </div>
+          <div class="row">
+            <span class="dim">背景亮度</span><span class="val" id="bg-opacity-val">70%</span>
+            <input type="range" id="bg-opacity" min="0" max="1" step="0.05" value="0.7" class="grow" title="背景与故事板亮度" />
+          </div>
+          <div class="row">
+            <span class="dim">帧率上限</span>
+            <select id="fps" class="grow" title="渲染帧率上限">
+              <option value="0">跟随刷新率</option>
+              <option value="30">30</option>
+              <option value="60">60</option>
+              <option value="120">120</option>
+              <option value="240">240</option>
+              <option value="360">360</option>
+            </select>
+          </div>
+        </details>
+        <details class="grp">
+          <summary>音频</summary>
+          <div class="row wrap">
+            <label class="check-inline" title="打击音效开关"><input type="checkbox" id="hitsound" checked /> 音效</label>
+            <label class="check-inline" title="优先谱面自带采样;切换重载曲目"><input type="checkbox" id="bm-hits" checked /> 谱面音效</label>
+            <label class="check-inline" title="BGM 淡入淡出"><input type="checkbox" id="fade" checked /> 淡入淡出</label>
+          </div>
+          <div class="row">
+            <span class="dim">音乐音量</span><span class="val" id="vol-val">60%</span>
+            <input type="range" id="vol" min="0" max="1" step="0.05" value="0.6" class="grow" title="BGM 音量" />
+          </div>
+          <div class="row">
+            <span class="dim">音效音量</span><span class="val" id="hits-volume-val">80%</span>
+            <input type="range" id="hits-volume" min="0" max="1" step="0.05" value="0.8" class="grow" title="打击音效音量" />
+          </div>
+          <div class="row">
+            <span class="dim">音效偏移</span><span class="val" id="offset-val">0ms</span>
+            <input type="range" id="offset" min="-200" max="200" step="1" value="0" class="grow" title="音效偏移,正=提前" />
+          </div>
+        </details>
+        <details class="grp">
+          <summary>播放</summary>
+          <label class="check-inline" title="单曲播完重播"><input type="checkbox" id="loop" /> 单曲循环</label>
+          <label class="check-inline" title="双击播放并加入播放列表"><input type="checkbox" id="dblclick-add" /> 双击后添加到播放列表</label>
+          <label class="check-inline" title="单击封面直接导入,不弹窗"><input type="checkbox" id="quick-add" checked /> 单击封面快速导入</label>
+          <div class="row">
+            <span class="dim">默认导入选项</span>
+            <div class="seg grow" id="qa-mods">
+              <button type="button" class="seg-btn" data-qa-mod="HD">HD</button>
+              <button type="button" class="seg-btn" data-qa-mod="HR">HR</button>
+              <button type="button" class="seg-btn" data-qa-mod="EZ">EZ</button>
+              <button type="button" class="seg-btn" data-qa-mod="DT">DT</button>
+              <button type="button" class="seg-btn" data-qa-mod="HT">HT</button>
+              <button type="button" class="seg-btn" data-qa-mod="NC">NC</button>
+            </div>
+          </div>
+          <div class="row">
+            <span class="dim">默认难度</span>
+            <select id="qa-policy" class="w-auto" title="默认难度策略">
+              <option value="hardest">最难</option>
+              <option value="easiest">最容易</option>
+              <option value="custom">自定义星级</option>
+            </select>
+            <input type="text" id="qa-star" class="policy-star" inputmode="decimal" placeholder="星级" title="目标星级" hidden />
+          </div>
+        </details>
+        <details class="grp">
+          <summary>皮肤</summary>
+          <div class="row">
+            <select id="skin-select" class="grow" title="切换皮肤,即时生效">
+              <option value="">默认</option>
+            </select>
+          </div>
+          <label class="check-inline" title="皮肤颜色覆盖谱面颜色"><input type="checkbox" id="force-colours" /> 强制皮肤 combo 颜色</label>
+          <div class="row wrap">
+            <label class="check-inline" title="光标与拖尾显示"><input type="checkbox" id="cursor" checked /> 光标</label>
+          </div>
+          <div class="row">
+            <span class="dim">光标大小</span><span class="val" id="cursor-size-val">100%</span>
+            <input type="range" id="cursor-size" min="0.1" max="2" step="0.05" value="1" class="grow" title="光标与拖尾缩放" />
+          </div>
+          <div class="lib-hint dim">皮肤来自 osu!lazer / osu!stable 已安装列表,选中即挂载使用。</div>
+        </details>
+        <details class="grp">
+          <summary>系统</summary>
+          <div class="row">
+            <span class="dim" style="flex:none">osu!lazer 目录</span>
+            <span class="file-name grow" id="lazer-dir">自动检测</span>
+            <button id="lazer-dir-pick" class="btn small" title="指定 lazer 数据目录">选择…</button>
+            <button id="lazer-dir-reset" class="btn small ghost" hidden>重置</button>
+          </div>
+          <div class="row">
+            <span class="dim" style="flex:none">osu!stable 目录</span>
+            <span class="file-name grow" id="stable-dir">自动检测</span>
+            <button id="stable-dir-pick" class="btn small" title="指定 stable 安装目录">选择…</button>
+            <button id="stable-dir-reset" class="btn small ghost" hidden>重置</button>
+          </div>
+          <div class="row">
+            <span class="dim" style="flex:none">ffmpeg 路径</span>
+            <span class="file-name grow" id="ffmpeg-path">PATH 自动检测</span>
+            <button id="ffmpeg-pick" class="btn small" title="指定 ffmpeg.exe 路径">选择…</button>
+            <button id="ffmpeg-reset" class="btn small ghost" hidden>重置</button>
+          </div>
+          <div class="row">
+            <span class="dim" style="flex:none">ffprobe 路径</span>
+            <span class="file-name grow" id="ffprobe-path">PATH 自动检测</span>
+            <button id="ffprobe-pick" class="btn small" title="指定 ffprobe.exe 路径">选择…</button>
+            <button id="ffprobe-reset" class="btn small ghost" hidden>重置</button>
+          </div>
+          <label class="check-inline" title="开机静默启动到托盘"><input type="checkbox" id="autostart" /> 开机自动启动（静默到托盘）</label>
+          <label class="check-inline" title="日志写入 log/aria.log"><input type="checkbox" id="log-rec" /> 日志记录</label>
+          <div class="row">
+            <span class="dim">关闭窗口时</span>
+            <select id="close-action" class="grow" title="点 X 时的行为">
+              <option value="">每次询问</option>
+              <option value="tray">最小化到托盘</option>
+              <option value="exit">退出程序</option>
+            </select>
+            <button id="log-export" class="btn small" title="导出日志文件">导出日志</button>
+          </div>
+          <div class="row">
+            <button id="unload" class="btn ghost grow" title="停用壁纸,还原桌面">恢复桌面</button>
+            <button id="restart" class="btn ghost grow" title="重挂壁纸进程">重启壁纸</button>
+            <button id="quit" class="btn ghost danger" title="退出程序">退出</button>
+          </div>
+        </details>
+    </div>
+
+      <!-- Tab: 关于 -->
+      <div class="tab-page" id="tab-about">
+        <div class="about-head">
+          <img class="about-logo" src="icon.png" alt="" />
+          <div>
+            <div class="about-name">Aria <span class="dim about-ver" id="about-ver"></span></div>
+            <div class="dim">osu! storyboard 桌面动态壁纸 · by ATRI1024</div>
+            <a class="about-repo" href="https://github.com/Ohdmire/Aria" target="_blank" rel="noreferrer">https://github.com/Ohdmire/Aria</a>
+          </div>
+        </div>
+        <div class="about-sec">使用的开源库</div>
+        <div class="about-thanks">
+          <a class="about-item" href="https://github.com/Ohdmire/osu-replay-render" target="_blank" rel="noreferrer"><b>osu-replay-render</b><span>osu! 场景渲染: 游玩画面 + storyboard + 背景处理</span></a>
+          <a class="about-item" href="https://github.com/Ohdmire/osu-parse" target="_blank" rel="noreferrer"><b>osu-parse</b><span>.osu 谱面解析(hit objects / timing)</span></a>
+          <a class="about-item" href="https://github.com/Ohdmire/osu-storyboard-render" target="_blank" rel="noreferrer"><b>osu-storyboard-render</b><span>storyboard 指令处理与素材回调</span></a>
+          <a class="about-item" href="https://github.com/Ohdmire/osu-replay-judge" target="_blank" rel="noreferrer"><b>osu-replay-judge</b><span>提供判定支持</span></a>
+          <a class="about-item" href="https://github.com/Ohdmire/realm-db-reader" target="_blank" rel="noreferrer"><b>realm-db-reader</b><span>osu!lazer client.realm 只读解析</span></a>
+          <a class="about-item" href="https://github.com/negamartin/osu-db" target="_blank" rel="noreferrer"><b>osu-db</b><span>osu!stable 曲库 / 收藏夹 / 星级读取</span></a>
+          <a class="about-item" href="https://github.com/tauri-apps/tauri" target="_blank" rel="noreferrer"><b>Tauri</b><span>桌面应用框架</span></a>
+          <a class="about-item" href="https://github.com/gfx-rs/wgpu" target="_blank" rel="noreferrer"><b>wgpu</b><span>GPU 渲染</span></a>
+          <a class="about-item" href="https://github.com/tesselode/kira" target="_blank" rel="noreferrer"><b>kira</b><span>音频播放</span></a>
+          <a class="about-item" href="https://github.com/pdeljanov/Symphonia" target="_blank" rel="noreferrer"><b>Symphonia</b><span>音频解码</span></a>
+          <a class="about-item" href="https://codeberg.org/soundtouch/soundtouch" target="_blank" rel="noreferrer"><b>SoundTouch</b><span>BGM变速</span></a>
+        </div>
+        <div class="about-sec">感谢名单</div>
+        <div class="about-thanks" id="about-thanks">
+          <a class="about-item" href="https://osu.ppy.sh/users/34424018" target="_blank" rel="noreferrer"><b>xlfish233</b><span>Token Provider</span></a>
+          <a class="about-item" href="https://osu.ppy.sh/users/30298378" target="_blank" rel="noreferrer"><b>Citrusis</b><span>Logo 设计</span></a>
+        </div>
+        <div class="about-foot dim">osu! 是 Ppy Pty Ltd 的游戏;本项目与 ppy 无关 · MIT License</div>
+      </div>
+    </section>
+    <aside class="side">
+      <section class="card cover-card">
+        <img id="big-cover" class="big-cover" alt="" hidden />
+        <div class="big-cover-empty dim" id="big-cover-empty">未播放<br />播放或加入曲目后显示封面</div>
+        <div class="cover-cap" id="cover-cap" hidden>
+          <div class="cover-title" id="cover-title"></div>
+          <div class="cover-meta" id="cover-meta">
+            <div class="meta-line dim" id="meta-artist"></div>
+            <div class="meta-line dim" id="meta-diff"></div>
+          </div>
+        </div>
+      </section>
+      <!-- 谱面信息卡:AR/CS/OD/HP/BPM/时长等 + tags;所有条目单击即复制 -->
+      <section class="card info-card" id="info-card" hidden>
+        <div class="info-grid" id="info-grid"></div>
+        <div class="info-tags" id="info-tags" hidden></div>
+      </section>
+    </aside>
+  </main>
+
+  <!-- 底部播放器条:左播控 / 中曲目信息 / 右模式+音量,最下面全宽进度条 -->
+  <footer class="player-bar">
+    <div class="pb-row">
+      <div class="pb-left">
+        <button id="prev" class="btn icon pb-btn" title="上一首">⏮</button>
+        <button id="toggle" class="btn icon pb-btn pb-play" title="暂停 / 继续">▶</button>
+        <button id="next" class="btn icon pb-btn" title="下一首">⏭</button>
+      </div>
+      <div class="pb-center">
+        <img id="pb-cover" class="pb-cover" alt="" hidden />
+        <div class="pb-text">
+          <div class="pb-title"><span id="pb-title-text">未播放</span><span class="mod-tag pb-mods" id="pb-mods" hidden></span></div>
+          <div class="pb-sub" id="pb-sub"></div>
+        </div>
+        <select id="pb-diff" class="pb-diff" title="切换当前谱面集的难度(立即重播)" disabled>
+          <option value="">难度</option>
+        </select>
+      </div>
+      <div class="pb-right">
+        <button id="pb-mode" class="btn ghost small pb-mode" title="播放模式">顺序 ▸</button>
+        <div class="speed-wrap">
+          <button id="pb-speed" class="btn ghost small pb-speed" title="播放速度(变速不变调)">1×</button>
+          <div class="speed-pop" id="speed-pop">
+            <button type="button" class="seg-btn" data-speed="0.5">0.5×</button>
+            <button type="button" class="seg-btn" data-speed="0.75">0.75×</button>
+            <button type="button" class="seg-btn on" data-speed="1">1×</button>
+            <button type="button" class="seg-btn" data-speed="1.25">1.25×</button>
+            <button type="button" class="seg-btn" data-speed="1.5">1.5×</button>
+          </div>
+        </div>
+        <div class="vol-wrap">
+          <button id="pb-vol-btn" class="btn ghost small pb-vol-btn" title="音量">🔊</button>
+          <div class="vol-pop" id="vol-pop">
+            <input type="range" id="pb-vol" min="0" max="1" step="0.05" value="0.6" orient="vertical" />
+            <span id="pb-vol-val" class="dim">60%</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="pb-progress">
+      <span class="pb-time" id="pb-time-cur">0:00</span>
+      <input type="range" id="pb-seek" min="0" max="1000" value="0" class="grow" />
+      <span class="pb-time" id="pb-time-total">0:00</span>
+    </div>
+  </footer>
+
+  <!-- 关闭窗口询问:记住选择可选;也可在 设置→系统 里改 -->
+  <div id="close-modal" class="close-modal" hidden>
+    <div class="close-card">
+      <div class="close-title">关闭设置窗口</div>
+      <div class="dim">壁纸播放会继续,可从托盘重新打开。</div>
+      <div class="row wrap" style="justify-content:center;margin-top:14px">
+        <button id="close-to-tray" class="btn primary">最小化到托盘</button>
+        <button id="close-exit" class="btn ghost danger">退出程序</button>
+      </div>
+      <label class="check-inline" style="margin-top:12px"><input type="checkbox" id="close-remember" checked /> 记住我的选择（可在 设置 → 系统 修改）</label>
+      <button id="close-cancel" class="btn ghost small" style="margin-top:10px">取消</button>
+    </div>
+  </div>
+  <div id="src-modal" class="close-modal" hidden>
+    <div class="close-card">
+      <div class="close-title">切换数据源</div>
+      <div class="dim">切换到 <b id="src-modal-target"></b> 会<span class="danger-text">清空当前播放列表</span>(播放列表条目属于当前数据源,曲库列表也会随之刷新)。确定切换吗?</div>
+      <div class="row wrap" style="justify-content:center;margin-top:14px">
+        <button id="src-modal-ok" class="btn primary">确定切换</button>
+        <button id="src-modal-cancel" class="btn ghost">取消</button>
+      </div>
+    </div>
+  </div>
+  <div id="clear-modal" class="close-modal" hidden>
+    <div class="close-card">
+      <div class="close-title">清空播放列表</div>
+      <div class="dim" id="clear-modal-text">确定清空全部条目吗?</div>
+      <div class="row wrap" style="justify-content:center;margin-top:14px">
+        <button id="clear-modal-ok" class="btn primary">清空</button>
+        <button id="clear-modal-cancel" class="btn ghost">取消</button>
+      </div>
+    </div>
+  </div>
+  <!-- 加入/编辑播放列表条目:mods 多选(HR↔EZ、DT↔HT↔NC 互斥)+
+  谱面集/指定谱面(锁定难度,难度选择对锁定条目不生效) -->
+  <div id="mods-modal" class="close-modal" hidden>
+    <div class="close-card">
+      <div class="close-title" id="mods-title">加入播放列表</div>
+      <div class="dim" id="mods-sub"></div>
+      <div class="mods-row">
+        <button type="button" class="mod-btn" data-mod="HD" title="Hidden:物件命中前淡出(视觉)">HD</button>
+        <button type="button" class="mod-btn" data-mod="HR" title="Hard Rock:难度上调 + playfield 垂直镜像">HR</button>
+        <button type="button" class="mod-btn" data-mod="EZ" title="Easy:难度下调(圆圈变大等)">EZ</button>
+        <button type="button" class="mod-btn" data-mod="DT" title="Double Time:1.5× 加速(不变调)">DT</button>
+        <button type="button" class="mod-btn" data-mod="HT" title="Half Time:0.75× 减速(不变调)">HT</button>
+        <button type="button" class="mod-btn" data-mod="NC" title="Nightcore:1.5× 加速 + BGM 升调">NC</button>
+      </div>
+      <div class="row" id="mods-diff-row" style="margin-top:6px" hidden>
+        <select id="mods-diff" class="grow"></select>
+      </div>
+      <!-- 难度策略(常驻):最难/最容易/自定义星级(输入框内联,选最
+      相近锁定并记为新默认);难度 chip 右键时置顶多一项「所选难度」 -->
+      <div class="row" id="mods-policy-row" style="margin-top:6px" hidden>
+        <span class="dim">难度</span>
+        <select id="mods-policy" class="grow" title="按所选策略挑最相近的一档难度锁定导入,并记住为新默认难度值">
+          <option value="hardest">最难</option>
+          <option value="easiest">最容易</option>
+          <option value="custom">自定义星级</option>
+        </select>
+        <input type="text" id="mods-star-input" class="policy-star" inputmode="decimal"
+               placeholder="星级" title="目标星级:挑最接近的一档" hidden />
+      </div>
+      <div class="row wrap" style="justify-content:center;margin-top:14px">
+        <button id="mods-ok" class="btn primary">加入</button>
+        <button id="mods-cancel" class="btn ghost">取消</button>
+      </div>
+    </div>
+  </div>
+  <!-- 播放列表右键菜单:常态页(修改入口,二级)+ 多选主页(批量操作)
+  + 设置难度子页 -->
+  <div id="qsel-menu" hidden>
+    <div id="qsel-menu-edit" hidden>
+      <button type="button" id="qsel-menu-edit-open">修改…</button>
+    </div>
+    <div id="qsel-menu-main" hidden>
+      <button type="button" id="qsel-menu-mods">修改 mods…</button>
+      <button type="button" id="qsel-menu-diff">设置难度…</button>
+    </div>
+    <div id="qsel-menu-diffpage" hidden>
+      <button type="button" data-qdiff="hardest">最难</button>
+      <button type="button" data-qdiff="easiest">最容易</button>
+      <div class="qsel-custom-row">
+        <input type="text" id="qsel-star-input" inputmode="decimal" placeholder="星级" />
+        <button type="button" id="qsel-star-apply">自定义星级 · 应用</button>
+      </div>
+      <button type="button" id="qsel-diff-back" class="back">‹ 返回</button>
+    </div>
+  </div>
+  <div id="toast" hidden></div>
+  <script src="main.js"></script>
+</body>
+</html>
