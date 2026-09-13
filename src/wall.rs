@@ -911,7 +911,14 @@ impl WallApp {
             let result = self.build_render_session(event_loop, &game, &mut skin);
             self.skin = Some(skin);
             match result {
-                Ok(session) => self.adopt_render_session(session),
+                Ok(session) => {
+                    self.adopt_render_session(session);
+                    // BG 载入期超分:主渲染设备上放大 + 图集热换(无第二
+                    // 设备;与运行期切换滤镜同一条路径)
+                    if self.upscale != osu_replay_render::UpscaleMode::Off {
+                        self.hot_swap_bg_upscale(self.upscale);
+                    }
+                }
                 Err(e) => {
                     if !e.is_empty() {
                         self.out.send(&Event::Error { message: e });
@@ -1521,6 +1528,8 @@ impl WallApp {
     /// 或解码失败时静默跳过 —— 音频/时钟/判定全程不动。
     fn hot_swap_bg_upscale(&mut self, mode: osu_replay_render::UpscaleMode) {
         let Some(surf) = &mut self.surf else { return };
+        let device = surf.device().clone();
+        let queue = surf.queue().clone();
         if self.scene.as_ref().is_some_and(|s| s.sb_replaces_bg) {
             return;
         }
@@ -1541,7 +1550,7 @@ impl WallApp {
         };
         let Some(img) = osu_replay_render::decode_image_file(&cand)
             .ok()
-            .and_then(|i| osu_replay_render::upscale_bg(Some(i), mode, self.scene_size))
+            .and_then(|i| osu_replay_render::upscale_bg(&device, &queue, Some(i), mode, self.scene_size))
         else {
             return;
         };
@@ -2005,26 +2014,10 @@ fn prep_render_session(
             })
     };
     let has_bg = bg_image.is_some();
-    // BG 载入期一次性超分(静态图,放大后进图集,零每帧成本);
-    // 超分只作用于视频与 BG —— gameplay/HUD/普通精灵不走此链
-    let bg_image = if upscale != osu_replay_render::UpscaleMode::Off {
-        let t0 = std::time::Instant::now();
-        let before = bg_image.as_ref().map(|i| (i.width, i.height));
-        let up = osu_replay_render::upscale_bg(bg_image, upscale, (w, h));
-        let after = up.as_ref().map(|i| (i.width, i.height));
-        if before != after {
-            log::info!(
-                "[load] BG 超分 {:?}: {:?} → {:?}({:.2}s)",
-                upscale,
-                before,
-                after,
-                t0.elapsed().as_secs_f32()
-            );
-        }
-        up
-    } else {
-        bg_image
-    };
+    // BG 超分不在此时做:曾在此用临时第二设备放大,同进程反复建/销
+    // 设备与 dx12 生命周期交错会偶发致命 wgpu 错误(载入/切歌即崩)。
+    // 现在原图先进图集,会话建好后由调用方在**主渲染设备**上走
+    // hot_swap_bg_upscale 热换(与运行期切换滤镜同一条已验证路径)。
 
     // storyboard 合成槽位:场景分辨率(超分后的视频以该分辨率进入合成;
     // >1080p 片源也不再经 1080p 中转,槽位成本 +13MB@2K)

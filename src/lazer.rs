@@ -634,6 +634,9 @@ mod tests {
             storyboard: true,
             video: true,
             beatmap_hitsounds: true,
+            upscale: "off".into(),
+            upscale_quality: "m".into(),
+            monitor: None,
         };
         println!("SMOKE {}", serde_json::to_string(&cmd).unwrap());
     }
