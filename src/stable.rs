@@ -8,7 +8,7 @@
 //! `%LOCALAPPDATA%\osu!` > 各固定盘根下的 `osu!` 目录;以 `osu!.db`
 //! 存在为准。
 
-use crate::lazer::{LazerBeatmap, LazerCollection, LazerFile, LazerLibrary, LazerSet};
+use crate::lazer::{is_sb_video_name, LazerBeatmap, LazerCollection, LazerFile, LazerLibrary, LazerSet};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -178,6 +178,9 @@ pub fn library(root: &Path) -> Result<LazerLibrary, String> {
                         let mut out = Vec::new();
                         for (folder, acc, dir) in chunk.iter_mut() {
                             let mut files = Vec::new();
+                            // SB/视频标记与图片清单一趟判定(同一次 read_dir,
+                            // 零额外 I/O)
+                            let mut sb_video = false;
                             if let Ok(entries) = std::fs::read_dir(&*dir) {
                                 for e in entries.flatten() {
                                     let name = e.file_name().to_string_lossy().into_owned();
@@ -187,6 +190,8 @@ pub fn library(root: &Path) -> Result<LazerLibrary, String> {
                                         if size > 0 {
                                             files.push(LazerFile { filename: name, hash: String::new(), size });
                                         }
+                                    } else if is_sb_video_name(&name) {
+                                        sb_video = true;
                                     }
                                 }
                             }
@@ -209,6 +214,7 @@ pub fn library(root: &Path) -> Result<LazerLibrary, String> {
                                 tags: std::mem::take(&mut acc.tags),
                                 source: std::mem::take(&mut acc.source),
                                 root: Some(dir.to_string_lossy().into_owned()),
+                                sb_video,
                                 beatmaps: std::mem::take(&mut acc.beatmaps),
                                 files,
                             });

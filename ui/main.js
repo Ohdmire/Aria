@@ -448,8 +448,9 @@ function sortSets(sets) {
     .map((x) => x.s);
 }
 
-/// 当前过滤条件命中的谱面集(搜索 + 星级下限 + 收藏夹;不过滤返回全量)。
-/// 渲染(带上限)与「添加到播放列表」批量入列共用。
+/// 当前过滤条件命中的谱面集(搜索 + 星级下限 + 收藏夹 + 仅 SB/视频;
+/// 不过滤返回全量)。渲染(带上限)与「添加到播放列表」批量入列共用。
+let sbVideoOnly = false; // 「仅 SB/视频」开关(会话内有效,不持久化)
 function filteredSets() {
   const q = $('lib-search').value.trim().toLowerCase();
   const lo = starRange.lo, hi = starRange.hi;
@@ -458,6 +459,7 @@ function filteredSets() {
     ? new Set((state.libCollections.find((c) => c.name === collName)?.md5s) ?? [])
     : null;
   const filtered = state.lib.filter((set) => {
+    if (sbVideoOnly && !set.sbVideo) return false;
     const diffs = set.beatmaps;
     if (lo > 0 || hi !== null) {
       const inRange = diffs.some((b) => b.starRating >= lo && (hi === null || b.starRating <= hi));
@@ -1856,6 +1858,13 @@ $('pb-mode').addEventListener('click', () => {
 // 收藏夹 = 曲库过滤器(播放列表内容始终由用户显式添加)
 $('lib-collection').addEventListener('change', () => {
   state.libCollection = $('lib-collection').value;
+  renderLibList();
+});
+// 仅 SB/视频:只留带 storyboard(.osb)或视频文件的谱面集(标记由
+// 后端加载曲库时按文件名简单判定)
+$('lib-sbvideo').addEventListener('click', () => {
+  sbVideoOnly = !sbVideoOnly;
+  $('lib-sbvideo').classList.toggle('on', sbVideoOnly);
   renderLibList();
 });
 

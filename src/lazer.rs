@@ -68,6 +68,9 @@ pub struct LazerSet {
     /// lazer 源恒 None。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
+    /// 简单判定:谱面集带 storyboard(.osb)或视频文件(只看文件名
+    /// 扩展名,不解析 .osu,内嵌 storyboard 检出不到)。曲库过滤用。
+    pub sb_video: bool,
     pub beatmaps: Vec<LazerBeatmap>,
     pub files: Vec<LazerFile>,
 }
@@ -207,6 +210,11 @@ pub fn parse(realm: &Path) -> Result<LazerLibrary, String> {
     // 的每个谱面集都必须可物化播放,封面也直接用记录的大小。
     let root = realm.parent().unwrap_or(Path::new(""));
     retain_playable(&mut library, root);
+    // SB/视频标记:在 retain 过滤后的文件清单上判定(blob 缺失的
+    // .osb/视频本来也播不了),纯内存一趟,开销可忽略
+    for set in &mut library.sets {
+        set.sb_video = set.files.iter().any(|f| is_sb_video_name(&f.filename));
+    }
     Ok(library)
 }
 
@@ -356,6 +364,7 @@ fn parse_beatmap_sets(store: &mut RowStore<'_>, library: &mut LazerLibrary) -> R
             tags,
             source,
             root: None,
+            sb_video: false,
             beatmaps,
             files,
         });
@@ -408,6 +417,20 @@ fn parse_skins(store: &mut RowStore<'_>, library: &mut LazerLibrary) -> Result<(
     }
     library.skins.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     Ok(())
+}
+
+/// 文件名是否为 storyboard(.osb)或视频(扩展名大小写不敏感,
+/// 不分配)。视频扩展名 = osu! 支持列表(ffmpeg 直读)。
+pub(crate) fn is_sb_video_name(name: &str) -> bool {
+    const SUFFIXES: [&[u8]; 8] = [b".osb", b".mp4", b".avi", b".flv", b".m4v", b".mov", b".webm", b".wmv"];
+    let bytes = name.as_bytes();
+    SUFFIXES.iter().any(|suf| {
+        bytes.len() >= suf.len()
+            && bytes[bytes.len() - suf.len()..]
+                .iter()
+                .zip(*suf)
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
 }
 
 /// 文件名清洗(物化挂载用,同 zip 条目规则)。
