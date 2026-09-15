@@ -1,6 +1,6 @@
 [package]
 name = "aria"
-version = "0.9.0"
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
 description = "Aria(ATRI rhythm interactive animation)—— osu! storyboard 桌面动态壁纸播放器"
