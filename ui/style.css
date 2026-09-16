@@ -1121,3 +1121,5 @@ a.about-item:hover b { color: var(--accent); }
 }
 #qsel-menu button:hover { background: var(--hover); }
 #qsel-menu button.back { color: var(--dim); border-top: 1px solid var(--line-soft); border-radius: 0 0 7px 7px; margin-top: 2px; }
+a.about-foot-link { color: var(--accent); cursor: pointer; }
+a.about-foot-link:hover { text-decoration: underline; }

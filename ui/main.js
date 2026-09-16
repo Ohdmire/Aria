@@ -150,7 +150,7 @@ function applyTheme(mode, accent) {
 }
 
 // 关于页外链:webview 内不能导航外域,统一交给系统默认浏览器
-document.querySelectorAll('#tab-about a.about-item[href^="http"]').forEach((a) => {
+document.querySelectorAll('#tab-about a[href^="http"]').forEach((a) => {
   a.addEventListener('click', (ev) => {
     ev.preventDefault();
     invoke('open_url', { url: a.href }).catch((e) => toast(`${e}`));
