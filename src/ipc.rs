@@ -169,7 +169,30 @@ pub enum Command {
     /// 不发)。`path = None` = 预处理失败,回退原文件变调播放。
     #[serde(skip_deserializing)]
     AudioReady { speed: f32, path: Option<std::path::PathBuf>, fade_ms: f64 },
+    /// 内部命令:PP 后台补算完成(后台线程 → 事件循环,父进程不发):
+    /// 热注入带 PP/星级时间线的 GameData。`seq` = 补算发起时的加载序号,
+    /// 与当前不符(已切歌/重载)即整体丢弃;`game = None` = 补算失败
+    /// (保持无 PP 显示)。载荷不可序列化(仅进程内事件通道),serde skip。
+    #[serde(skip)]
+    PpReady { seq: u64, game: Option<PpGame> },
     Quit,
+}
+
+/// [`Command::PpReady`] 的载荷:Arc 共享的 GameData(无 Clone/Debug/
+/// serde derive,这里手工实现 Clone/Debug 满足 Command 的 derive 约束;
+/// serde 对所在变体整体 skip,永不走 stdin/stdout 的 JSON)。
+pub struct PpGame(pub std::sync::Arc<osu_replay_render::game::GameData>);
+
+impl Clone for PpGame {
+    fn clone(&self) -> Self {
+        PpGame(self.0.clone())
+    }
+}
+
+impl std::fmt::Debug for PpGame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PpGame(..)")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

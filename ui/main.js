@@ -398,6 +398,60 @@ function starText(v) {
   return v > 0 ? `★${v.toFixed(2)}` : '★—';
 }
 
+// ---- 星级彩色徽章:移植 lazer OsuColour.STAR_DIFFICULTY_SPECTRUM(背景
+// 渐变采样,ColourUtils.SampleFromLinearGradient 同款)与
+// ForStarDifficultyText(文字色),与 LazerExporter 同源。 ----
+const STAR_SPECTRUM = [
+  [0.1, [0xaa, 0xaa, 0xaa]],
+  [0.1, [0x42, 0x90, 0xfb]],
+  [1.25, [0x4f, 0xc0, 0xff]],
+  [2.0, [0x4f, 0xff, 0xd5]],
+  [2.5, [0x7c, 0xff, 0x4f]],
+  [3.3, [0xf6, 0xf0, 0x5c]],
+  [4.2, [0xff, 0x80, 0x68]],
+  [4.9, [0xff, 0x4e, 0x6f]],
+  [5.8, [0xc6, 0x45, 0xb8]],
+  [6.7, [0x65, 0x63, 0xde]],
+  [7.7, [0x18, 0x15, 0x8e]],
+  [9.0, [0x00, 0x00, 0x00]],
+  [10.0, [0x00, 0x00, 0x00]],
+];
+const STAR_TEXT_SPECTRUM = [
+  [9.0, [0xf6, 0xf0, 0x5c]],
+  [9.9, [0xff, 0x80, 0x68]],
+  [10.6, [0xff, 0x4e, 0x6f]],
+  [11.5, [0xc6, 0x45, 0xb8]],
+  [12.4, [0x65, 0x63, 0xde]],
+];
+function sampleGradient(spectrum, value) {
+  if (value <= spectrum[0][0]) return rgbHex(spectrum[0][1]);
+  for (let i = 1; i < spectrum.length; i++) {
+    const [pos, colour] = spectrum[i];
+    if (value <= pos) {
+      const [prevPos, prevColour] = spectrum[i - 1];
+      const t = pos === prevPos ? 0 : (value - prevPos) / (pos - prevPos);
+      return rgbHex(prevColour.map((c, k) => Math.round(c + (colour[k] - c) * t)));
+    }
+  }
+  return rgbHex(spectrum[spectrum.length - 1][1]);
+}
+const rgbHex = (c) => `#${c.map((v) => v.toString(16).padStart(2, '0')).join('')}`;
+function starFg(v) {
+  const x = Math.round(v * 100) / 100;
+  if (x < 6.5) return 'rgba(0,0,0,0.75)';
+  if (x < 9.0) return 'rgb(255,217,102)';
+  return sampleGradient(STAR_TEXT_SPECTRUM, x);
+}
+const STAR_ICON = '<svg viewBox="0 0 576 512" aria-hidden="true"><path fill="currentColor" d="M259.3 17.8L194 150.2 47.9 171.5c-26.2 3.8-36.7 36.1-17.7 54.6l105.7 103-25 145.5c-4.5 26.3 23.2 46 46.4 33.7L288 439.6l130.7 68.7c23.2 12.2 50.9-7.4 46.4-33.7l-25-145.5 105.7-103c19-18.5 8.5-50.8-17.7-54.6L338 150.2 292.9 17.8c-11.7-26.2-44.6-26.2-56.3 0z"/></svg>';
+/// 星级彩色徽章(lazer 难度色 pill);v<=0(未知)退回暗色纯文本。
+function starBadge(v) {
+  if (!(v > 0)) return `<span class="star-badge plain">${starText(v)}</span>`;
+  const x = Math.round(v * 100) / 100;
+  return `<span class="star-badge" style="background:${sampleGradient(STAR_SPECTRUM, x)};color:${starFg(x)}">` +
+    `<span class="star-badge__icon">${STAR_ICON}</span>` +
+    `<span class="star-badge__rating">${v.toFixed(2)}</span></span>`;
+}
+
 // 曲库排序。默认按导入时间降序
 // (最新导入在前):lazer = realm DateAdded,stable ≈ 谱面集目录 mtime。
 // collection_order = 收藏夹内添加顺序(读取顺序):谱面集取其难度 md5
@@ -576,7 +630,14 @@ const libScrollObserver = new IntersectionObserver((entries) => {
 function buildLibRow(set) {
   const title = set.titleUnicode || set.title;
   const artist = set.artistUnicode || set.artist;
-  const diffs = [...set.beatmaps].sort((a, b) => a.starRating - b.starRating);
+  const allDiffs = [...set.beatmaps].sort((a, b) => a.starRating - b.starRating);
+  // 星级过滤生效时,展示口径跟随过滤:区间/难度 chips/计数只算范围内的
+  // 难度(如全集 1~10 过滤 1~5,最高难度 7.5 被筛掉 → 显示 1~4.2);
+  // 全不在范围的谱面集在 filteredSets 已整集隐藏,这里必有 ≥1 个。
+  const starActive = starRange.lo > 0 || starRange.hi !== null;
+  const diffs = starActive
+    ? allDiffs.filter((b) => b.starRating >= starRange.lo && (starRange.hi === null || b.starRating <= starRange.hi))
+    : allDiffs;
   const row = document.createElement('div');
   row.className = 'lib-row'
     + (state.nowTrack?.setId === set.id ? ' playing' : '')
@@ -588,16 +649,22 @@ function buildLibRow(set) {
   const isPlayingSet = state.nowTrack?.setId === set.id;
   const maxStar = diffs.length ? diffs[diffs.length - 1].starRating : 0;
   const starSpan = diffs.length
-    ? `<b>${starText(diffs[0].starRating)}</b>–<b>${starText(maxStar)}</b>`
+    ? `${starBadge(diffs[0].starRating)}<span class="star-sep">–</span>${starBadge(maxStar)}`
     : '';
+  const starTip = starActive && diffs.length !== allDiffs.length
+    ? `全集 ${starText(allDiffs[0].starRating)}–${starText(allDiffs[allDiffs.length - 1].starRating)}(已按星级过滤)`
+    : '';
+  const diffCount = starActive && diffs.length !== allDiffs.length
+    ? `${diffs.length}/${allDiffs.length}`
+    : `${allDiffs.length}`;
   head.dataset.set = set.id;
   head.innerHTML =
     `<img class="lib-cover loading" alt="" data-cover="${set.id}" />` +
     `<div class="lib-meta">` +
     `<span class="lib-title">${isPlayingSet ? '▶ ' : ''}${esc(title)} <span class="dim">— ${esc(artist)}</span></span>` +
-    `<span class="lib-artist">${diffs.length} 难度 · ${esc(set.creator)}</span>` +
+    `<span class="lib-artist">${diffCount} 难度 · ${esc(set.creator)}</span>` +
     `</div>` +
-    `<span class="lib-stars">${starSpan}</span>`;
+    `<span class="lib-stars"${starTip ? ` title="${esc(starTip)}"` : ''}>${starSpan}</span>`;
   bindLibRow(head, set.id, null);
   const chevron = document.createElement('button');
   chevron.className = 'chevron';
@@ -620,7 +687,7 @@ function buildLibRow(set) {
       chip.dataset.set = set.id;
       chip.dataset.sha2 = b.sha2;
       chip.title = '右键:以此难度加入播放列表';
-      chip.innerHTML = `<span class="star">${starText(b.starRating)}</span>${esc(b.name)}`;
+      chip.innerHTML = `${starBadge(b.starRating)}${esc(b.name)}`;
       bindLibRow(chip, set.id, b.sha2);
       wrap.appendChild(chip);
     }
@@ -737,7 +804,7 @@ function appendQueueRows(list, from, to) {
     row.dataset.set = t.setId;
     row.dataset.qid = t.qid;
     row.dataset.index = idx;
-    const star = t.star > 0 ? ` <span class="q-star">★${t.star.toFixed(2)}</span>` : '';
+    const star = t.star > 0 ? ` ${starBadge(t.star)}` : '';
     const dur = t.lengthMs > 0 ? fmt(t.lengthMs) : '';
     // 快照模式(曲库未就绪)标题可能为空(旧存档无快照):显示占位
     const title = t.title || '…';

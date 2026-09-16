@@ -1158,8 +1158,9 @@ fn set_hud(app: AppHandle, on: bool) -> Result<(), String> {
     ctl::send_cmd(&app, Command::SetHud { on })
 }
 
-/// PP 计数器开关(HUD 的子项,默认开)。实时生效:只控制显示;PP 时间
-/// 线在加载期随 HUD 一起计算,与该开关无关。
+/// PP 计数器开关(HUD 的子项,默认关)。本开关决定加载期是否计算
+/// PP/星级时间线(rosu-pp 全程计算可观):开了才算,与 HUD 显隐无关;
+/// 途中开启时若缺数据,壁纸端立即后台补算热注入,无需重载。
 #[tauri::command]
 fn set_pp(app: AppHandle, on: bool) -> Result<(), String> {
     {

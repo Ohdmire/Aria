@@ -344,8 +344,24 @@ input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.lib-stars { font-size: 11px; color: var(--dim); white-space: nowrap; flex: none; }
-.lib-stars b { color: var(--accent); font-weight: 600; }
+.lib-stars { font-size: 11px; white-space: nowrap; flex: none; display: inline-flex; align-items: center; gap: 3px; }
+.star-sep { color: var(--dim); }
+/* 星级彩色徽章(lazer 难度色 pill,同 LazerExporter):背景 = 星级
+   渐变采样,文字色 = lazer ForStarDifficultyText,内容为 星形图标 + 数值 */
+.star-badge {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 10000px;
+  font-weight: 700;
+  font-size: 11px;
+  line-height: 1.25;
+  padding: 1px 6px;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.star-badge__icon { display: inline-flex; margin-right: 3px; }
+.star-badge__icon svg { width: 0.72em; height: 0.72em; }
+.star-badge.plain { color: var(--dim); font-weight: 600; padding: 1px 0; }
 .chevron {
   appearance: none;
   border: none;
@@ -370,8 +386,7 @@ input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent);
 }
 .chip:hover { border-color: var(--accent-dim); }
 .chip.on { background: var(--accent); border-color: var(--accent); color: var(--accent-contrast); }
-.chip .star { color: var(--accent); margin-right: 4px; }
-.chip.on .star { color: var(--accent-contrast); }
+.chip .star-badge { margin-right: 6px; }
 .lib-src {
   font-size: 11px;
   color: var(--dim);
@@ -633,7 +648,6 @@ details.grp > *:not(summary) { margin-top: 6px; }
 .queue-row.on .q-idx { color: var(--accent); }
 .q-meta { display: flex; flex-direction: column; min-width: 0; flex: 1; }
 .q-title { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.q-star { color: var(--accent); font-size: 11px; }
 .q-sub { font-size: 11px; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .q-dur { flex: none; font-size: 11px; font-variant-numeric: tabular-nums; }
 .q-del {

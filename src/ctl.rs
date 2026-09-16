@@ -146,6 +146,28 @@ pub fn resolve_skin_dir(app: &AppHandle, stored: &Option<String>) -> Option<std:
     p.is_dir().then_some(p)
 }
 
+/// 从父进程 argv 提取 `--preview` 调试参数(供透传给壁纸子进程):
+/// 支持 `--preview`、`--preview=WxH`、`--preview WxH` 三种写法。
+/// 未开启时返回空切片(零开销)。
+fn preview_passthrough() -> Vec<String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut out = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        if a == "--preview" {
+            out.push(a.clone());
+            // 两段式:紧跟的尺寸(非 - 开头且含 x)一并透传
+            if let Some(next) = args.get(i + 1) {
+                if !next.starts_with('-') && next.contains('x') {
+                    out.push(next.clone());
+                }
+            }
+        } else if a.starts_with("--preview=") {
+            out.push(a.clone());
+        }
+    }
+    out
+}
+
 fn spawn_child(app: &AppHandle) -> anyhow::Result<ChildCtl> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -153,6 +175,10 @@ fn spawn_child(app: &AppHandle) -> anyhow::Result<ChildCtl> {
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--wallpaper")
+        // 调试预览透传:--preview[=WxH] / --preview WxH 原样带给子进程,
+        // 子进程据此跳过桌面挂接、开常规可调窗口(见 wall::parse_preview_args);
+        // 现场从父进程 argv 提取,无需全局状态。
+        .args(preview_passthrough())
         // DX12 后端:省掉 Vulkan 驱动栈与第三方 hook 层(OBS 等)的常驻
         // 内存(实测比 Vulkan 少 ~57MB)。注意 osu-replay-render 侧需
         // Backends::from_env() 才生效 —— InstanceDescriptor::default()

@@ -7,6 +7,10 @@
 **Aria** -- **A**TRI **R**hythm **I**nteractive **A**nimation ~ 咏叹调
 osu! storyboard 动态桌面壁纸
 
+<p align="center">
+  <img src="preview.png" alt="Aria 预览">
+</p>
+
 ## 快速开始
 
 Release 下载安装 exe 即用
@@ -53,3 +57,4 @@ cargo build --release
 - [Citrusis](https://osu.ppy.sh/users/30298378) —— Logo 设计
 - pxyxy —— 5元赞助~
 - [telecomadm1145](https://osu.ppy.sh/users/30656658) —— 5元赞助~
+- 有人 —— 5元赞助~

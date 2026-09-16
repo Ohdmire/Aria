@@ -10,7 +10,7 @@
 //! 暂停/seek/倍速画面与声音天然同步;stdin EOF 即退出信号。
 
 use crate::audio::AudioOut;
-use crate::ipc::{Command, Event, VFile};
+use crate::ipc::{Command, Event, PpGame, VFile};
 use crate::loader::{Library, LoadedWall};
 use crate::win::{self, WallpaperHost};
 use osu_replay_render::draw::{Atlas, DrawList};
@@ -85,8 +85,49 @@ fn basename_of(p: &str) -> &str {
     p.rsplit(['\\', '/']).next().unwrap_or(p)
 }
 
+/// 解析 `--preview[=WxH]` 调试参数(也接受 `--preview WxH` 两段式):
+/// 开启后不挂桌面 WorkerW 层,改为常规带边框、可自由调整大小的预览
+/// 窗口,初始尺寸 WxH(默认 1280×720)。返回 None = 正常壁纸模式。
+fn parse_preview_args() -> Option<(u32, u32)> {
+    let args: Vec<String> = std::env::args().collect();
+    parse_preview_from(&args)
+}
+
+/// [`parse_preview_args`] 的纯函数形态(测试用)。
+fn parse_preview_from(args: &[String]) -> Option<(u32, u32)> {
+    let mut size = (1280u32, 720u32);
+    let parse_size = |s: &str| -> Option<(u32, u32)> {
+        let lower = s.to_lowercase();
+        let (w, h) = lower.split_once('x')?;
+        Some((w.parse().ok()?, h.parse().ok()?))
+    };
+    let mut on = false;
+    for (i, a) in args.iter().enumerate() {
+        if a == "--preview" {
+            on = true;
+            if let Some(next) = args.get(i + 1) {
+                if !next.starts_with('-') {
+                    if let Some(s) = parse_size(next) {
+                        size = s;
+                    }
+                }
+            }
+        } else if let Some(v) = a.strip_prefix("--preview=") {
+            on = true;
+            if let Some(s) = parse_size(v) {
+                size = s;
+            }
+        }
+    }
+    on.then_some(size)
+}
+
 pub fn main() -> i32 {
     let _ = crate::logging::init();
+    let preview = parse_preview_args();
+    if let Some((w, h)) = preview {
+        log::info!("调试预览模式: {}×{} 可调窗口(不挂桌面层)", w, h);
+    }
     log::info!("壁纸渲染子进程启动 (pid {})", std::process::id());
 
     let event_loop = match EventLoop::with_user_event().build() {
@@ -110,7 +151,7 @@ pub fn main() -> i32 {
     }
     let out = Arc::new(Out(Mutex::new(BufWriter::new(std::io::stdout()))));
     let audio = AudioOut::new(); // 无设备则 None,静音播放
-    let mut app = WallApp::new(out, proxy, audio);
+    let mut app = WallApp::new(out, proxy, audio, preview);
     match event_loop.run_app(&mut app) {
         Ok(()) => 0,
         Err(e) => {
@@ -424,6 +465,43 @@ impl Clock {
 }
 
 #[cfg(test)]
+mod preview_args_tests {
+    use super::parse_preview_from;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 三种写法等价:裸 --preview(默认 1280×720)、=WxH、两段式 WxH。
+    #[test]
+    fn preview_forms_parse() {
+        assert_eq!(parse_preview_from(&args(&["aria.exe"])), None, "未开启");
+        assert_eq!(parse_preview_from(&args(&["aria.exe", "--preview"])), Some((1280, 720)));
+        assert_eq!(
+            parse_preview_from(&args(&["aria.exe", "--preview=1920x1080"])),
+            Some((1920, 1080)),
+            "--preview=WxH"
+        );
+        assert_eq!(
+            parse_preview_from(&args(&["aria.exe", "--preview", "1920x1080"])),
+            Some((1920, 1080)),
+            "--preview WxH 两段式"
+        );
+        // 非法尺寸回退默认;--preview 后跟其他开关不吞
+        assert_eq!(
+            parse_preview_from(&args(&["aria.exe", "--preview", "--hidden"])),
+            Some((1280, 720)),
+            "后跟开关 → 默认尺寸"
+        );
+        assert_eq!(
+            parse_preview_from(&args(&["aria.exe", "--preview=abc"])),
+            Some((1280, 720)),
+            "非法尺寸 → 默认尺寸"
+        );
+    }
+}
+
+#[cfg(test)]
 mod clock_tests {
     use super::*;
 
@@ -640,10 +718,22 @@ struct WallApp {
     ended_sent: bool,
     poll_at: Instant,
     status_at: Instant,
+    /// 调试预览模式(--preview[=WxH]):不挂桌面层,常规可调窗口。
+    /// Some(初始尺寸) = 开启;None = 正常壁纸。
+    preview_size: Option<(u32, u32)>,
+    /// 加载序号:每次 apply_load 自增。PP 补算等后台任务携带发起时的
+    /// 序号,落地时与当前不符(已切歌/重载)即丢弃,防止旧曲数据热
+    /// 替换到新曲上。
+    load_seq: u64,
 }
 
 impl WallApp {
-    fn new(out: Arc<Out>, proxy: EventLoopProxy<Command>, audio: Option<AudioOut>) -> WallApp {
+    fn new(
+        out: Arc<Out>,
+        proxy: EventLoopProxy<Command>,
+        audio: Option<AudioOut>,
+        preview: Option<(u32, u32)>,
+    ) -> WallApp {
         WallApp {
             out,
             proxy,
@@ -718,6 +808,8 @@ impl WallApp {
             ended_sent: false,
             poll_at: Instant::now(),
             status_at: Instant::now(),
+            preview_size: preview,
+            load_seq: 0,
         }
     }
 
@@ -733,6 +825,7 @@ impl WallApp {
         let mut p = p;
         p.start = p.start.max(0.0);
         self.user_paused = false; // 换曲/重载 = 新的播放意图
+        self.load_seq += 1; // 作废在途的后台补算等任务
         self.last_load = Some(p.clone());
         // 淡出旧曲 BGM(只动 BGM,音效不参与;与下方载入耗时重叠,
         // 换曲/重载过渡无硬切)
@@ -775,8 +868,10 @@ impl WallApp {
         // ---- autoplay 会话 ----
         let map_str = p.path.clone();
         log::info!("[load] 解析谱面: {}", basename_of(&map_str));
-        // HUD 关闭时不算 PP/星级(rosu-pp 全程计算可观,壁纸 HUD 默认关)
-        let with_pp = self.hud_visible;
+        // PP/星级时间线按 PP 开关计算(rosu-pp 全程计算可观):HUD 只管
+        // 显隐 —— 加载时 HUD 关、PP 开也照算,播放途中开 HUD 即有数据;
+        // PP 关加载的谱面,途中开 PP 会立即后台补算热注入(SetPp)。
+        let with_pp = self.pp_display;
         let game_result = match &source {
             MapSource::Path { map_path, .. } => {
                 game::load_autoplay(&map_path.to_string_lossy(), p.mods, p.hidden, with_pp)
@@ -919,7 +1014,7 @@ impl WallApp {
         if self.render_desired() {
             let game = self.game.clone().unwrap();
             let mut skin = self.skin.take().unwrap();
-            let result = self.build_render_session(event_loop, &game, &mut skin);
+            let result = self.build_render_session(event_loop, &game, &mut skin, p.start);
             self.skin = Some(skin);
             match result {
                 Ok(session) => {
@@ -1170,7 +1265,9 @@ impl WallApp {
     fn rebuild_render(&mut self, event_loop: &ActiveEventLoop) {
         let Some(game) = self.game.clone() else { return };
         let Some(mut skin) = self.skin.take() else { return };
-        let result = self.build_render_session(event_loop, &game, &mut skin);
+        // 会话重建(遮挡恢复等):按当前播放头预热视频管道,恢复后画面
+        // 从正确位置继续(warm ffmpeg 首帧 ~0.3s,在重建阻塞预算内)
+        let result = self.build_render_session(event_loop, &game, &mut skin, self.clock.t);
         self.skin = Some(skin);
         match result {
             Ok(session) => {
@@ -1191,11 +1288,14 @@ impl WallApp {
 
     /// 构建渲染会话(窗口 + storyboard + 图集 + GPU)。调用前需已清掉旧
     /// GPU 会话(clear_old_render)。纯音频模式下不应调用。
+    /// `start_ms` = 起播时刻(新载入 = Load.start;会话重建 = 当前播放
+    /// 头),视频管道预热按它定位。
     fn build_render_session(
         &mut self,
         event_loop: &ActiveEventLoop,
         game: &game::GameData,
         skin: &mut skin::ResolvedSkin,
+        start_ms: f32,
     ) -> Result<RenderSession, String> {
         if self.window.is_none() && self.create_window(event_loop).is_err() {
             return Err(String::new()); // 错误事件已在 create_window 内上报
@@ -1232,6 +1332,7 @@ impl WallApp {
             self.ffmpeg_bin.as_deref(),
             self.ffprobe_bin.as_deref(),
             self.upscale,
+            start_ms,
         )
     }
 
@@ -1251,30 +1352,50 @@ impl WallApp {
 
     /// 创建壁纸窗口(隐藏)→ 附加桌面(attach 内部完成布局探测/撑开/定位)。
     /// GPU 会话在 Load 时创建。
+    /// 预览模式(--preview):跳过桌面附加,开常规带边框、可自由调整大小
+    /// 的窗口,初始尺寸即参数值;host 为 None,遮挡检测/桌面尺寸跟随
+    /// 随之停用(见 about_to_wait)。
     fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
-        let attrs = WindowAttributes::default()
+        let mut attrs = WindowAttributes::default()
             .with_title("aria wallpaper")
             .with_decorations(false)
             .with_resizable(false)
             .with_visible(false)
             .with_inner_size(PhysicalSize::new(2560, 1440)); // 占位,attach 会重设
+        if let Some((w, h)) = self.preview_size {
+            attrs = attrs
+                .with_title("aria preview (debug)")
+                .with_decorations(true)
+                .with_resizable(true)
+                .with_inner_size(PhysicalSize::new(w.max(1), h.max(1)));
+        }
         let window = event_loop
             .create_window(attrs)
             .map_err(|e| format!("创建壁纸窗口失败: {e}"))?;
         let window = Arc::new(window);
         let hwnd = win::window_hwnd(&window).map_err(|e| format!("{e}"))?;
-        let host = win::attach(hwnd, self.monitor);
-        if host.width == 0 || host.height == 0 {
-            self.out.send(&Event::Error { message: "桌面壁纸层不可用".into() });
-            return Err(String::new());
-        }
+        let (host, desk) = if self.preview_size.is_some() {
+            (None, self.preview_size.unwrap())
+        } else {
+            let host = win::attach(hwnd, self.monitor);
+            if host.width == 0 || host.height == 0 {
+                self.out.send(&Event::Error { message: "桌面壁纸层不可用".into() });
+                return Err(String::new());
+            }
+            (Some(host), (host.width, host.height))
+        };
 
-        self.host = Some(host);
+        self.host = host;
         self.window = Some(window);
         self.wall_hwnd = Some(hwnd);
-        self.desk = (host.width, host.height);
+        self.desk = desk;
         self.window.as_ref().unwrap().set_visible(true);
-        log::info!("壁纸窗口已附加桌面: {}×{}", self.desk.0, self.desk.1);
+        log::info!(
+            "窗口就绪{}: {}×{}",
+            if self.host.is_some() { ",已附加桌面" } else { "(调试预览)" },
+            self.desk.0,
+            self.desk.1
+        );
         self.out.send(&Event::Ready {
             width: self.desk.0,
             height: self.desk.1,
@@ -1812,6 +1933,43 @@ impl WallApp {
         });
     }
 
+    /// PP 途中开启的立即补算:加载期 PP 关(`with_pp=false`)的谱面没有
+    /// PP/星级时间线 —— 后台按同谱面同 mods 重跑加载路径(autoplay 判定
+    /// 是确定性的,新 GameData 与在播数据逐字段一致,仅多出 PP 数据),
+    /// 完成后经 [`Command::PpReady`] 热替换 `self.game`。rosu-pp 全程
+    /// 计算可观,放后台不阻塞事件循环;播放/画面全程无感。
+    /// `seq` 防过期:切歌/重载后旧结果落地即丢弃。
+    fn spawn_pp_backfill(&mut self) {
+        let (Some(game), Some(load), Some(source)) =
+            (self.game.as_ref(), self.last_load.as_ref(), self.source.as_ref())
+        else {
+            return;
+        };
+        if !game.pp_events.is_empty() {
+            return; // 加载期已算(PP 开启时加载)或已补算过
+        }
+        let seq = self.load_seq;
+        let (mods, hidden) = (load.mods, load.hidden);
+        let source = source.clone();
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &source {
+                MapSource::Path { map_path } => {
+                    game::load_autoplay(&map_path.to_string_lossy(), mods, hidden, true)
+                }
+                MapSource::Virtual { text, .. } => {
+                    game::load_autoplay_content(text, mods, hidden, true)
+                }
+            }))
+            .unwrap_or_else(|_| Err("PP 补算线程 panic".into()));
+            let game = result.ok().map(|g| PpGame(std::sync::Arc::new(g)));
+            if game.is_none() {
+                log::warn!("PP 补算失败(保持无 PP 显示)");
+            }
+            let _ = proxy.send_event(Command::PpReady { seq, game });
+        });
+    }
+
     /// 丢弃预处理状态:作废在途任务 + 删除在播临时文件 + 解除等待。
     fn drop_stretch(&mut self) {
         self.audio_pending = false;
@@ -1950,6 +2108,7 @@ fn prep_render_session(
     ffmpeg_bin: Option<&std::path::Path>,
     ffprobe_bin: Option<&std::path::Path>,
     upscale: osu_replay_render::UpscaleMode,
+    start_ms: f32,
 ) -> Result<RenderSession, String> {
     // 相对名解析(背景/storyboard 素材;来自保留的谱面来源)
     let resolve = |name: &str| -> Option<PathBuf> {
@@ -2094,6 +2253,13 @@ fn prep_render_session(
         // 手动指定的 bin 路径优先于 PATH。
         l.set_video_bins(ffmpeg_bin);
         l.set_video_enabled(video);
+        // 视频管道预热(须在 set_video_bins 之后):按起播时刻 spawn 并
+        // 有界等首帧。ffmpeg 冷启动(百 MB 静态 exe 首次执行的 Defender
+        // 扫描 + 冷页载入)出首帧可达数秒~数十秒 —— 程序重启后首播正
+        // 是全冷路径;放到加载期等(音频尚未起播,与"全部就绪再同帧
+        // 起播"的会话原则一致),起播时视频第一帧已就绪。超时则留给
+        // 播放期泵继续非阻塞等待(等待不裁开头)。
+        l.prewarm_video(start_ms as f64, std::time::Instant::now() + std::time::Duration::from_secs(2));
         // 视频通道超分:原帧 → FSR/Anime4K 链 → 槽位分辨率纹理
         l.set_video_upscale(upscale, sb_slot);
         l.set_dim(bg_opacity.clamp(0.0, 1.0));
@@ -2361,6 +2527,32 @@ impl WallApp {
                 if let Some(scene) = &mut self.scene {
                     scene.hud.pp_display = on;
                 }
+                // 途中开启:加载期 PP 关的谱面没有时间线,立即后台补算
+                // 热注入(同谱面同 mods 重跑一遍,不打断播放)
+                if on {
+                    self.spawn_pp_backfill();
+                }
+            }
+            Command::PpReady { seq, game } => {
+                // 过期任务(已切歌/重载):丢弃,不得把旧曲数据换上来
+                if seq != self.load_seq {
+                    return;
+                }
+                let Some(pp) = game else {
+                    log::warn!("PP 补算失败(保持无 PP 显示)");
+                    return;
+                };
+                let mut new_game = pp.0;
+                // 复刻加载期的组合色处理(新 Arc 唯一持有 → get_mut 原地涂色)
+                if let (Some(skin), Some(load)) = (self.skin.as_ref(), self.last_load.as_ref()) {
+                    if let Some(g) = std::sync::Arc::get_mut(&mut new_game) {
+                        game::apply_skin_combo_colours(g, skin, load.force_colours);
+                    }
+                }
+                log::info!("PP 补算完成:时间线 {} 条,已热注入", new_game.pp_events.len());
+                // 场景逐帧从 self.game 取数,下一拍 PP 计数器即有数;
+                // 判定/快照/音效与原数据完全一致(autoplay 确定性),无缝
+                self.game = Some(new_game);
             }
             Command::SetHitAnimations { on } => {
                 self.hit_animations = on;
@@ -2478,7 +2670,7 @@ impl ApplicationHandler<Command> for WallApp {
 
     fn window_event(
         &mut self,
-        _event_loop: &ActiveEventLoop,
+        event_loop: &ActiveEventLoop,
         _window_id: winit::window::WindowId,
         event: WindowEvent,
     ) {
@@ -2503,8 +2695,20 @@ impl ApplicationHandler<Command> for WallApp {
                     self.send_status();
                 }
             }
-            WindowEvent::CloseRequested => { /* 壁纸窗口不接受用户关闭 */ }
-            WindowEvent::Destroyed => self.on_detached(),
+            WindowEvent::CloseRequested => {
+                // 预览窗口:关闭即退出渲染子进程;壁纸窗口不接受用户关闭
+                if self.preview_size.is_some() {
+                    self.drop_stretch();
+                    self.out.send(&Event::Exited);
+                    event_loop.exit();
+                }
+            }
+            WindowEvent::Destroyed => {
+                // 预览窗口只在退出时销毁,不算"被外部干掉"(explorer 重启)
+                if self.preview_size.is_none() {
+                    self.on_detached();
+                }
+            }
             _ => {}
         }
     }
@@ -2530,9 +2734,11 @@ impl ApplicationHandler<Command> for WallApp {
             // 窗口销毁的暂停态用保留的 wall_hwnd 检测,恢复才能触发。
             // AutoPause/FsPause/FsSleep 都吃遮挡;FsPause 只暂停播放
             // (壁纸会话保留,画面冻结),FsSleep 暂停播放 + 拆会话释放内存。
+            // 预览模式无桌面挂接,遮挡概念不适用,整块跳过。
             if !self.render_mode.pure()
                 && self.render_mode != RenderMode::Always
                 && self.game.is_some()
+                && self.host.is_some()
             {
                 let covered = self.wall_hwnd.map(win::desktop_covered).unwrap_or(false);
                 if covered != self.covered {
