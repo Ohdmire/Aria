@@ -10,8 +10,8 @@ osu! storyboard 动态桌面壁纸
 ## 快速开始
 
 Release 下载安装 exe 即用
-- 如电脑内未安装 `ffmpeg` 则第一次下载需要下载带 _ffmpeg 的安装包 
-- 后续更新可以直接下载不带 _ffmpeg 的
+- 如电脑内未安装 `ffmpeg` 则第一次下载需要下载带 `-ffmpeg` 的安装包 
+- 后续更新可以直接下载不带 `-ffmpeg` 的
 
 ## 核心特色
 
@@ -52,4 +52,4 @@ cargo build --release
 - [xlfish233](https://osu.ppy.sh/users/34424018) —— Token Provider
 - [Citrusis](https://osu.ppy.sh/users/30298378) —— Logo 设计
 - pxyxy —— 5元赞助~
-- telecomadm1145 —— 5元赞助~
+- [telecomadm1145](https://osu.ppy.sh/users/30656658) —— 5元赞助~

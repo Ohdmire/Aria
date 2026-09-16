@@ -410,6 +410,17 @@ impl Clock {
     fn take_jump(&mut self) -> bool {
         std::mem::take(&mut self.jumped)
     }
+
+    /// 事件循环线程上的同步重活(皮肤热换 / 超分热切等)刚完成:手动标记
+    /// 跳变,下一 tick 按 STALL_JUMP 同款路径重置播放头。短于 500ms 的
+    /// 阻塞不会被自动标记,墙钟积分又把时间补齐,期间跨过的音效事件会
+    /// 在恢复后一口气补播 —— 皮肤热换后"音频集中爆发"的根因。
+    /// 暂停时不标:时钟冻结、无事件跨过,标了反而会误停暂停中的循环音。
+    fn note_stall(&mut self) {
+        if self.playing {
+            self.jumped = true;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1705,6 +1716,9 @@ impl WallApp {
         if self.clock.take_jump() {
             let t = self.hs_time();
             self.hs_cursor = self.hs_events.partition_point(|e| e.time <= t);
+            // SB 采样游标同步跳过阻塞/seek 期间的事件,否则语音同样集中补播
+            self.sb_sample_cursor =
+                self.sb_samples.partition_point(|(t0, _, _)| *t0 as f64 <= t);
             self.stop_loops();
         }
         self.fire_hitsounds();
@@ -2320,6 +2334,7 @@ impl WallApp {
             Command::SetBeatmapHitsounds { on } => {
                 self.beatmap_hitsounds = on;
                 self.reswap_hitsounds();
+                self.clock.note_stall();
             }
             Command::SetFps { fps } => {
                 self.fps = fps;
@@ -2373,6 +2388,7 @@ impl WallApp {
             }
             Command::SetSkin { skin, force_colours } => {
                 self.reswap_skin(skin, force_colours);
+                self.clock.note_stall();
             }
             Command::SetBgOpacity { v } => {
                 self.bg_opacity = v.clamp(0.0, 1.0);
@@ -2418,6 +2434,7 @@ impl WallApp {
                     sb.set_video_upscale(m, (w, h));
                 }
                 self.hot_swap_bg_upscale(m);
+                self.clock.note_stall();
             }
             // 无缝切换:不重载、不打断音频,仅拆/建渲染会话与暂停/恢复播放
             Command::SetRenderMode { mode } => {
