@@ -785,6 +785,10 @@ async function refreshQueue() {
 // 封面仍由 IntersectionObserver 按可见性加载,几千行的列表也不卡。
 const QUEUE_BATCH = 200;
 let queueRendered = 0; // 已渲染行数
+// 滚动保持窗口(performance.now() 时间戳):设难度 / 改 mods 等编辑操作
+// 后的刷新 —— 含当前曲原位重载触发的 track 事件刷新 —— 不吸滚到当前
+// 曲,保持用户正在查看的位置。时间戳自然过期,不影响自动切歌跟随。
+let queueScrollHoldUntil = 0;
 
 const queueScrollObserver = new IntersectionObserver((entries) => {
   if (entries.some((en) => en.isIntersecting)) renderQueueMore();
@@ -1001,8 +1005,12 @@ function renderQueue() {
   appendQueueRows(list, 0, to);
   queueRendered = to;
   updateQueueSentinel(list);
-  if (state.qsel) {
-    // 多选重渲染不打断操作:保持滚动位置,不吸滚到当前曲
+  if (state.qsel || performance.now() < queueScrollHoldUntil) {
+    // 多选重渲染 / 编辑类操作后的刷新:保持滚动位置,不吸滚到当前曲。
+    // 原位置超出已渲染范围时先补渲染到能承载,否则 scrollTop 被夹紧跳位。
+    while (queueRendered < items.length && list.scrollHeight - list.clientHeight < keepScroll) {
+      renderQueueMore();
+    }
     list.scrollTop = keepScroll;
     return;
   }
@@ -1110,7 +1118,7 @@ function openModsModal(ctx) {
     if (explicit.length === 1) {
       defaultVal = `sha2:${explicit[0].sha2}`;
     } else if (explicit.length > 1) {
-      // 多命中:默认 = 记忆策略在命中难度内挑的那档(仍是"当前难度")
+      // 多命中:默认 = 默认难度策略在命中难度内挑的那档(仍是"当前难度")
       defaultVal = `sha2:${pickDiffLocal(explicit.map((e) => {
         const b = set.beatmaps.find((x) => x.sha2 === e.sha2);
         return b;
@@ -1190,6 +1198,11 @@ $('mods-ok').addEventListener('click', async () => {
   const sha2 = ctx.mode === 'edit' ? ($('mods-diff').value || null) : null;
   closeModsModal();
   try {
+    // 编辑条目 / 多选 mods:含当前曲时后端原位重载触发 track 事件刷新,
+    // 与多选「设置难度」一致 —— 保持滚动位置,不吸滚到当前曲
+    if (ctx.mode === 'edit' || ctx.mode === 'multi') {
+      queueScrollHoldUntil = performance.now() + 1500;
+    }
     if (ctx.mode === 'multi') {
       await invoke('queue_set_mods', { qids: ctx.qids, mods: bits });
       toast(`已将所选 ${ctx.qids.length} 个条目的 mods 统一为${bits ? ' ' + describeMods(bits) : '无'}`);
@@ -1266,6 +1279,7 @@ function openQSelMenu(x, y, page = 'main') {
     const n = state.qsel?.size ?? 0;
     if (!n) return closeQSelMenu();
     $('qsel-menu-mods').textContent = `修改 mods…(${n} 首)`;
+    $('qsel-menu-remove').textContent = `移除(${n} 首)`;
   }
   menu.hidden = false;
   showQSelPage(page);
@@ -1292,6 +1306,32 @@ $('qsel-menu-edit-open').addEventListener('click', () => {
     mods: item.mods,
     title: item.title,
   });
+});
+// 常态页「移除」→ 与行内 ✕ 同一单条移除
+$('qsel-menu-edit-remove').addEventListener('click', async () => {
+  const item = qeditCtx;
+  closeQSelMenu();
+  if (!item) return;
+  try {
+    await invoke('playlist_remove', { qid: item.qid });
+    refreshQueue();
+  } catch (e) {
+    toast(`${e}`);
+  }
+});
+// 多选页「移除(N 首)」→ 批量移除所选(后端一次持久化)
+$('qsel-menu-remove').addEventListener('click', async () => {
+  const qids = [...(state.qsel ?? [])];
+  closeQSelMenu();
+  if (!qids.length) return;
+  try {
+    await invoke('playlist_remove_batch', { qids });
+    toast(`已移除 ${qids.length} 首`);
+    setQueueSelect(false);
+    refreshQueue();
+  } catch (e) {
+    toast(`移除失败:${e}`);
+  }
 });
 document.addEventListener('click', (ev) => {
   if (!ev.target.closest('#qsel-menu')) closeQSelMenu();
@@ -1666,7 +1706,7 @@ window.__TAURI__.app?.getVersion?.()
     starRange.lo = s.star_min > 0 ? Math.min(s.star_min, STAR_MAX - 0.5) : 0;
     starRange.hi = null;
     srRender();
-    // 默认难度值(多选「设置难度」/导入自选记住的)
+    // 默认难度值(设置→播放 里配置,导入/多选「设置难度」不回写)
     const tv = s.target_star;
     targetStar = tv != null && tv > 0 ? tv : null;
     policyMode = tv == null ? 'hardest' : tv < 0 ? 'easiest' : 'custom';
@@ -1824,7 +1864,7 @@ $('qa-mods').addEventListener('click', (e) => {
   invoke('set_quick_mods', { mods: bits }).catch((err) => toast(`${err}`));
 });
 
-// 默认难度(= 默认难度值,与导入对话框/多选「设置难度」同源):
+// 设置页「默认难度」(= 默认难度值,供快速导入/预览/批量导入兜底):
 // 变更即持久化,UI 双向同步
 function syncQaPolicyUi() {
   $('qa-policy').value = policyMode;
@@ -2042,11 +2082,10 @@ window.addEventListener('load', () => requestAnimationFrame(srRender));
 requestAnimationFrame(srRender);
 // ---- 难度统一逻辑:导入即锁定(难度 chip = 该难度;批量 = 单难度
 //      直接锁、多难度按默认难度值挑最相近),之后任何条目右键可再改。
-//      默认难度值(最难/最简单/自定义星级)无常驻 UI,在多选右键
-//      「设置难度」里选择:立即应用到所选条目并记住为新默认(影响
-//      之后的批量导入)。 ----
-let targetStar = null; // >0 = 自定义星级默认值
-let policyMode = 'hardest'; // 记忆的难度策略:hardest / easiest / custom
+//      默认难度值(最难/最简单/自定义星级)只在 设置→播放 里配置,
+//      导入对话框与多选「设置难度」的选择都是一次性的,不回写默认。 ----
+let targetStar = null; // >0 = 自定义星级默认值(设置页配置)
+let policyMode = 'hardest'; // 默认难度策略:hardest / easiest / custom(设置页配置)
 function policyTarget() {
   return policyMode === 'easiest' ? -1 : policyMode === 'custom' ? targetStar : null;
 }
@@ -2057,29 +2096,28 @@ function setPolicy(mode, star) {
   syncQaPolicyUi();
 }
 /// 读取导入对话框策略行当前选择 → { sha2, target }(显式难度优先;
-/// 自定义星级读内联输入框,合法时记忆为新默认)。`setId` 提供时叠加
-/// 收藏筛选命中难度(只在命中的难度里挑)。
+/// 自定义星级读内联输入框,非法时退回设置页的默认值。选择只在本次
+/// 导入生效,不回写默认)。`setId` 提供时叠加收藏筛选命中难度(只在
+/// 命中的难度里挑)。
 function readPolicySelection(setId) {
   const v = $('mods-policy').value;
   if (v === 'coll') {
     // 当前难度(收藏命中):每集锁命中那档;多命中 fallback 按默认
-    // 难度挑最相近(collPickSha2 已按此实现),不记忆为新策略
+    // 难度挑最相近(collPickSha2 已按此实现)
     return { sha2: null, target: policyTarget() };
   }
   if (v.startsWith('sha2:')) return { sha2: v.slice(5), target: null };
   if (v === 'custom') {
     const sv = Number($('mods-star-input').value.trim());
     if (!Number.isFinite(sv) || sv <= 0) {
-      return { sha2: null, target: targetStar }; // 输入无效:退回记忆值
+      return { sha2: null, target: targetStar }; // 输入无效:退回设置页默认
     }
-    setPolicy('custom', sv);
     const picked = setId ? (() => {
       const set = state.lib?.find((x) => x.id === setId);
       return set ? collPickSha2(set, sv) : null;
     })() : null;
     return { sha2: picked, target: picked ? null : sv };
   }
-  setPolicy(v, null);
   const t = v === 'easiest' ? -1 : null;
   const picked = setId ? (() => {
     const set = state.lib?.find((x) => x.id === setId);
@@ -2088,14 +2126,15 @@ function readPolicySelection(setId) {
   return { sha2: picked, target: picked ? null : t };
 }
 
-/// 多选「设置难度」:按策略锁定所选条目的难度(单难度集即那一档),
-/// 同时把该策略持久化为新默认(后续导入按它挑最相近)。
+/// 多选「设置难度」:按策略锁定所选条目的难度(单难度集即那一档)。
+/// 一次性操作,不改变设置页的默认难度。
 async function applyQSelDiff(qids, target) {
   try {
+    // 含当前曲时后端原位重载会触发 track 事件刷新:两条刷新路径都
+    // 不吸滚到当前曲,保持用户所在位置
+    queueScrollHoldUntil = performance.now() + 1500;
     await invoke('queue_set_diff', { qids, target });
-    setPolicy(target == null ? 'hardest' : target < 0 ? 'easiest' : 'custom',
-      target != null && target > 0 ? target : null);
-    toast(`已设置 ${qids.length} 个条目的难度(并记为默认难度值)`);
+    toast(`已设置 ${qids.length} 个条目的难度`);
     setQueueSelect(false);
     refreshQueue();
   } catch (e) {

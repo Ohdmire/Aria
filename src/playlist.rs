@@ -221,7 +221,39 @@ impl Playlist {
         }
     }
 
-    /// 清空播放列表(保留模式)。
+    /// 批量移除队列项(多选右键「移除」)。语义与逐条 remove 一致:
+    /// order 保序映射到新下标,pos 按前方被移除条数前移 —— 当前曲
+    /// 本身被移除时位置不动,自然落到下一首。
+    pub fn remove_batch(&mut self, qids: &[u64]) {
+        if qids.is_empty() || self.tracks.is_empty() {
+            return;
+        }
+        let doomed: std::collections::HashSet<u64> = qids.iter().copied().collect();
+        // 旧 tracks 下标 → 保留后的新下标(被移除 = None)
+        let mut remap = Vec::with_capacity(self.tracks.len());
+        let mut next = 0;
+        for t in &self.tracks {
+            if doomed.contains(&t.qid) {
+                remap.push(None);
+            } else {
+                remap.push(Some(next));
+                next += 1;
+            }
+        }
+        let pos = self.pos.min(self.order.len());
+        let removed_before = self.order[..pos].iter().filter(|&&o| remap[o].is_none()).count();
+        self.order.retain(|&o| remap[o].is_some());
+        for o in &mut self.order {
+            *o = remap[*o].unwrap();
+        }
+        self.pos = pos.saturating_sub(removed_before);
+        if self.pos >= self.order.len() {
+            self.pos = self.order.len().saturating_sub(1);
+        }
+        self.tracks.retain(|t| !doomed.contains(&t.qid));
+    }
+
+    /// 清空播放列表。
     pub fn clear(&mut self) {
         self.tracks.clear();
         self.order.clear();
@@ -508,6 +540,28 @@ mod tests {
         let mut r = Playlist::default();
         for i in 0..50 { r.add(format!("s{i}"), Some(format!("h{i}")), 0, String::new(), String::new(), 0.0); }
         r.rebuild_shuffle_for_test();
+    }
+
+    #[test]
+    fn batch_remove_pos_semantics() {
+        // 5 首(qid 1..=5),顺序模式,当前第 3 首
+        let mut p = Playlist::default();
+        for i in 0..5 { p.add(format!("s{i}"), None, 0, String::new(), String::new(), 0.0); }
+        p.pos = 2;
+        // 移除当前曲之前的两首:当前曲仍是在播的那首,pos 前移到 0
+        p.remove_batch(&[1, 2]);
+        assert_eq!(p.order, vec![0, 1, 2]);
+        assert_eq!(p.pos, 0);
+        assert_eq!(p.tracks[p.order[p.pos]].qid, 3);
+        // 移除当前曲本身:pos 不动,自然落到下一首(qid 4)
+        p.remove_batch(&[3]);
+        assert_eq!(p.pos, 0);
+        assert_eq!(p.tracks[p.order[p.pos]].qid, 4);
+        // 全部移除:列表/顺序清空,pos 归 0 不越界
+        p.remove_batch(&[4, 5]);
+        assert!(p.tracks.is_empty() && p.order.is_empty());
+        assert_eq!(p.pos, 0);
+        assert!(p.current().is_none());
     }
 
     impl Playlist {

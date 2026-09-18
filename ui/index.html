@@ -430,7 +430,7 @@
       相近锁定并记为新默认);难度 chip 右键时置顶多一项「所选难度」 -->
       <div class="row" id="mods-policy-row" style="margin-top:6px" hidden>
         <span class="dim">难度</span>
-        <select id="mods-policy" class="grow" title="按所选策略挑最相近的一档难度锁定导入,并记住为新默认难度值">
+        <select id="mods-policy" class="grow" title="按所选策略挑最相近的一档难度锁定导入(仅本次生效,默认难度在 设置→播放 里配置)">
           <option value="hardest">最难</option>
           <option value="easiest">最容易</option>
           <option value="custom">自定义星级</option>
@@ -449,10 +449,12 @@
   <div id="qsel-menu" hidden>
     <div id="qsel-menu-edit" hidden>
       <button type="button" id="qsel-menu-edit-open">修改…</button>
+      <button type="button" id="qsel-menu-edit-remove" class="danger">移除</button>
     </div>
     <div id="qsel-menu-main" hidden>
       <button type="button" id="qsel-menu-mods">修改 mods…</button>
       <button type="button" id="qsel-menu-diff">设置难度…</button>
+      <button type="button" id="qsel-menu-remove" class="danger">移除…</button>
     </div>
     <div id="qsel-menu-diffpage" hidden>
       <button type="button" data-qdiff="hardest">最难</button>

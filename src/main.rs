@@ -103,6 +103,7 @@ fn main() {
             playlist_reorder,
             playlist_add_batch,
             playlist_remove,
+            playlist_remove_batch,
             playlist_clear,
             queue_set_entry,
             queue_set_mods,
@@ -809,6 +810,14 @@ async fn queue_set_diff(app: AppHandle, qids: Vec<u64>, target: Option<f64>) -> 
 #[tauri::command]
 async fn playlist_remove(app: AppHandle, qid: u64) -> Result<(), String> {
     app.state::<ctl::WallState>().playlist.lock().unwrap().remove(qid);
+    ctl::save_playlist(&app);
+    Ok(())
+}
+
+/// 批量移除播放列表条目(多选右键「移除」):一次持久化,不逐条写盘。
+#[tauri::command]
+async fn playlist_remove_batch(app: AppHandle, qids: Vec<u64>) -> Result<(), String> {
+    app.state::<ctl::WallState>().playlist.lock().unwrap().remove_batch(&qids);
     ctl::save_playlist(&app);
     Ok(())
 }
