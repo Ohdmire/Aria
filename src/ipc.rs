@@ -105,6 +105,9 @@ pub enum Command {
     Status,
     /// 音乐音量(0.0–1.0,总音量之下的分量)。
     SetVolume { v: f32 },
+    /// 切换输出设备(cpal 设备 id;`None` = 跟随系统默认)。立即重建
+    /// 音频管线;播放中则 BGM 从当前进度续播(看门狗重建同走此路径)。
+    SetAudioDevice { id: Option<String> },
     /// 总音量(0.0–1.0):主增益,同时作用于音乐与打击音效。
     SetMaster { v: f32 },
     /// 音效偏移(ms):正值 = 音效提前,负值 = 延后;实时生效。

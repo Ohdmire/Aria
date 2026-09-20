@@ -14,11 +14,199 @@ use kira::sound::static_sound::{StaticSoundData, StaticSoundHandle, StaticSoundS
 use kira::sound::streaming::StreamingSoundData;
 use kira::sound::streaming::{StreamingSoundHandle, StreamingSoundSettings};
 use kira::sound::{FromFileError, PlaybackState};
-use kira::{AudioManager, Decibels, Panning, PlaybackRate, Tween};
+use kira::{
+    AudioManager, AudioManagerSettings, Decibels, Panning, PlaybackRate, Tween,
+    // cpal 经 kira re-export 借用(同一实例,选设备 API 的类型就是它),
+    // 本工程不直接依赖 cpal
+    backend::cpal::{CpalBackendSettings, cpal},
+};
 use std::collections::HashMap;
 use std::path::Path;
 
 use osu_replay_render::hitsound::{HitsoundEvent, SampleSlot};
+
+/// 枚举系统输出设备(id 用于设置/命令,名字给 UI 显示)。id 为
+/// DeviceId 的 Display 形态(可持久化/跨进程传,kira 侧同源)。
+pub fn output_devices() -> Vec<(String, String)> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let host = cpal::default_host();
+    let mut out = Vec::new();
+    if let Some(devices) = host.output_devices().ok() {
+        for d in devices {
+            let id = d.id().map(|i| i.to_string()).unwrap_or_default();
+            let name = d
+                .description()
+                .map(|x| x.name().to_string())
+                .unwrap_or_else(|_| id.clone());
+            if !id.is_empty() {
+                out.push((id, name));
+            }
+        }
+    }
+    out
+}
+
+/// 按 id 找输出设备(找不到 = 已拔出/禁用,调用方决定回退)。
+pub fn device_by_id(id: &str) -> Option<cpal::Device> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    if id.is_empty() {
+        return None;
+    }
+    cpal::default_host()
+        .output_devices()
+        .ok()?
+        .find(|d| d.id().map(|i| i.to_string() == id).unwrap_or(false))
+}
+
+/// 当前默认输出端点 id(wasapi-rs 查询,`wasapi:{端点id}` 形态)。
+/// "跟随系统默认"不再走 cpal 的默认设备哨兵 —— 该路径的 IAudioClient
+/// 后台预激活在部分环境稳定触发 COM 公寓冲突(RPC_E_CHANGED_MODE,
+/// "无法在设置线程模式后对其加以更改"),而按具体端点打开无此问题;
+/// 默认跟随改由本函数解析出具体端点 + 设备事件监听驱动重建。
+pub fn default_output_id() -> Option<String> {
+    let enumerator = wasapi::DeviceEnumerator::new().ok()?;
+    let dev = enumerator.get_default_device(&wasapi::Direction::Render).ok()?;
+    Some(format!("wasapi:{}", dev.get_id().ok()?))
+}
+
+/// 解析应打开的**具体端点**:指定 id 优先,失效/未指定时回退当前默认。
+/// 返回 (设备, 解析到的端点 id)。解析与打开都含 WASAPI 调用,只在
+/// 后台构建线程上执行(见 wall::rebuild_audio)。
+pub fn resolve_target(desired: Option<&str>) -> (Option<cpal::Device>, Option<String>) {
+    // 构建线程同样要先初始化 COM(wasapi-rs 查询默认端点要用)
+    com_init_mta();
+    if let Some(id) = desired {
+        if let Some(d) = device_by_id(id) {
+            return (Some(d), Some(id.to_string()));
+        }
+    }
+    match default_output_id() {
+        Some(id) => (device_by_id(&id), Some(id)),
+        None => (None, None),
+    }
+}
+
+/// 线程级 COM 初始化(MTA)。wasapi-rs 的 `DeviceEnumerator::new()`
+/// 直接 `CoCreateInstance`,不预初始化 COM 的裸线程上会
+/// CO_E_NOTINITIALIZED 失败(设备事件监听"从未启动"的根因)。已初始化
+/// 成其他公寓(RPC_E_CHANGED_MODE)无妨 —— COM 会跨公寓封送,照常可用;
+/// cpal 侧自己的 STA 初始化也容忍该返回值,互不冲突。
+fn com_init_mta() {
+    use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+    // 初始化后不再撤销:调用线程要么常驻(监视线程),要么短命但重复
+    // 调用得到 S_FALSE,均无害
+    let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    debug_assert!(hr.is_ok() || hr == RPC_E_CHANGED_MODE);
+}
+
+/// 设备热拔插事件(去抖合并后的一组,见 [`spawn_device_watcher`])。
+/// id 统一为 cpal DeviceId 的 Display 形态(`wasapi:{端点id}`),
+/// 与设置存储/`device_by_id` 同源可比。
+#[derive(Debug, Clone)]
+pub enum AudioDeviceEvent {
+    /// 默认输出设备变化(新默认 id;None = 已无默认设备)。
+    DefaultChanged(Option<String>),
+    /// 设备出现/激活。
+    DeviceActive(String),
+    /// 设备移除/失活。
+    DeviceGone(String),
+}
+
+/// 订阅系统音频设备事件(IMMNotificationClient,wasapi-rs 封装),
+/// 去抖 300ms 合并为一次回调 —— 一次拔插会触发成簇事件。回调在专用
+/// 监视线程上执行(非渲染线程)。枚举器与注册句柄都是 !Send 且必须
+/// 同线程存活,本函数自管线程,随进程存活。返回是否订阅成功(失败时
+/// 调用方退回轮询兜底)。
+pub fn spawn_device_watcher(
+    on_events: impl Fn(&[AudioDeviceEvent]) + Send + 'static,
+) -> bool {
+    use std::sync::mpsc;
+    // wasapi-rs 给裸端点 id;本项目标识带 "wasapi:" 前缀(cpal Display),
+    // 统一转换后发出
+    fn with_host_prefix(id: String) -> String {
+        format!("wasapi:{id}")
+    }
+    let (tx, rx) = mpsc::channel::<AudioDeviceEvent>();
+    let spawned = std::thread::Builder::new()
+        .name("audio-dev-watch".into())
+        .spawn(move || {
+            // 裸线程先初始化 COM(见 com_init_mta 注释),否则下面的
+            // CoCreateInstance 必败 —— 监听从未启动过正是这个原因
+            com_init_mta();
+            // 启动期可能撞上设备切换的扰动,失败带错误重试几次
+            let mut enumerator = None;
+            for attempt in 1..=3 {
+                match wasapi::DeviceEnumerator::new() {
+                    Ok(e) => {
+                        enumerator = Some(e);
+                        break;
+                    }
+                    Err(err) => {
+                        log::warn!("[audio] 设备事件枚举器创建失败(第{attempt}次):{err:?}");
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    }
+                }
+            }
+            let Some(mut enumerator) = enumerator else {
+                log::warn!("[audio] 设备事件监听不可用,退回轮询兜底");
+                return;
+            };
+            let mut cbs = wasapi::DeviceEventCallbacks::new();
+            {
+                let tx = tx.clone();
+                cbs.set_default_device_callback(move |dir, _role, id| {
+                    if matches!(dir, wasapi::Direction::Render) {
+                        let _ = tx.send(AudioDeviceEvent::DefaultChanged(
+                            id.map(with_host_prefix),
+                        ));
+                    }
+                });
+            }
+            {
+                let tx = tx.clone();
+                cbs.set_device_added_callback(move |id| {
+                    let _ = tx.send(AudioDeviceEvent::DeviceActive(with_host_prefix(id)));
+                });
+            }
+            {
+                let tx = tx.clone();
+                cbs.set_device_removed_callback(move |id| {
+                    let _ = tx.send(AudioDeviceEvent::DeviceGone(with_host_prefix(id)));
+                });
+            }
+            {
+                let tx = tx.clone();
+                cbs.set_device_state_callback(move |id, state| {
+                    // 状态回到 Active 视为出现,其余(禁用/拔出/不在场)视为失活
+                    let ev = if matches!(state, wasapi::DeviceState::Active) {
+                        AudioDeviceEvent::DeviceActive(with_host_prefix(id))
+                    } else {
+                        AudioDeviceEvent::DeviceGone(with_host_prefix(id))
+                    };
+                    let _ = tx.send(ev);
+                });
+            }
+            // 注册句柄必须与枚举器同线程持有直到进程退出
+            let _registration = match enumerator.register_notification_callback(cbs) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!("[audio] 设备事件注册失败({e:?}),退回轮询兜底");
+                    return;
+                }
+            };
+            log::info!("[audio] 设备事件监听已启动 (IMMNotificationClient)");
+            // 去抖循环:首事件后 300ms 内到达的合并为一组,一次回调
+            while let Ok(first) = rx.recv() {
+                let mut batch = vec![first];
+                while let Ok(ev) = rx.recv_timeout(std::time::Duration::from_millis(300)) {
+                    batch.push(ev);
+                }
+                on_events(&batch);
+            }
+        });
+    spawned.is_ok()
+}
 
 /// 线性振幅 → 分贝(kira 音量单位)。
 pub fn amplitude_to_decibels(amplitude: f32) -> Decibels {
@@ -55,9 +243,16 @@ pub struct AudioOut {
 }
 
 impl AudioOut {
-    /// 打开默认输出设备;失败则本进程无音频(壁纸继续)。
-    pub fn new() -> Option<AudioOut> {
-        match AudioManager::new(Default::default()) {
+    /// 打开输出设备(`None` = 系统默认,kira 内置 500ms 轮询跟随默认设备
+    /// 切换/热拔插);失败则本进程无音频(壁纸继续)。
+    /// **含 WASAPI 阻塞调用,不得在渲染线程上执行**(由 wall.rs 后台
+    /// 线程构建后经事件循环挂载)。
+    pub fn new(device: Option<cpal::Device>) -> Option<AudioOut> {
+        let settings = AudioManagerSettings {
+            backend_settings: CpalBackendSettings { device, config: None },
+            ..Default::default()
+        };
+        match AudioManager::new(settings) {
             Ok(manager) => {
                 log::info!("音频输出已打开 (kira)");
                 Some(AudioOut {
@@ -245,5 +440,26 @@ impl AudioOut {
             PlaybackState::Stopped => None,
             _ => Some(h.position() * 1000.0 * self.timeline_scale),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 设备枚举/按 id 解析冒烟:枚举不 panic;本机有设备时 id 能回查。
+    /// (无输出设备的 CI 机器上仅验证不 panic。)
+    #[test]
+    fn audio_device_enumerate_and_lookup() {
+        let devs = output_devices();
+        if let Some((id, name)) = devs.first().cloned() {
+            assert!(!id.is_empty() && !name.is_empty());
+            assert!(
+                device_by_id(&id).is_some(),
+                "枚举出的设备应能按 id 回查"
+            );
+        }
+        assert!(device_by_id("").is_none(), "空 id 不应解析出设备");
+        assert!(device_by_id("不存在的设备id").is_none());
     }
 }

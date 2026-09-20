@@ -130,7 +130,7 @@ pub fn main() -> i32 {
     }
     log::info!("壁纸渲染子进程启动 (pid {})", std::process::id());
 
-    let event_loop = match EventLoop::with_user_event().build() {
+    let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
         Ok(l) => l,
         Err(e) => {
             eprintln!("创建事件循环失败: {e}");
@@ -150,8 +150,22 @@ pub fn main() -> i32 {
         }
     }
     let out = Arc::new(Out(Mutex::new(BufWriter::new(std::io::stdout()))));
-    let audio = AudioOut::new(); // 无设备则 None,静音播放
-    let mut app = WallApp::new(out, proxy, audio, preview);
+    // 启动设备:宿主经 ARIA_AUDIO_DEVICE 传入用户设置。首次开流也走
+    // 异步构建(渲染线程零 WASAPI 阻塞):结果经 UserEvent::AudioBuilt
+    // 回投事件循环后接管播放。
+    let audio_device = std::env::var("ARIA_AUDIO_DEVICE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let mut app = WallApp::new(out, proxy, audio_device, preview);
+    app.rebuild_audio();
+    // 设备热拔插事件(kira → wasapi-rs → WASAPI):插回/默认切换即时
+    // 响应;订阅失败时内部的轮询探测兜底仍在
+    {
+        let proxy = app.proxy.clone();
+        crate::audio::spawn_device_watcher(move |evs| {
+            let _ = proxy.send_event(UserEvent::AudioDevices(evs.to_vec()));
+        });
+    }
     match event_loop.run_app(&mut app) {
         Ok(()) => 0,
         Err(e) => {
@@ -216,7 +230,18 @@ fn write_wav_pcm16(path: &Path, samples: &[f32], sample_rate: u32) -> std::io::R
     Ok(())
 }
 
-fn spawn_stdin_reader(proxy: EventLoopProxy<Command>) {
+/// 事件循环自定义事件:宿主命令 + 内部异步结果回投。
+/// AudioOut 不参与 serde 协议,不能塞进 [`Command`],单独包一层。
+enum UserEvent {
+    Cmd(Command),
+    /// 音频管线异步构建完成(挂到事件循环后接管播放)。
+    /// `seq` = 构建序号:超时后重发的构建会作废在途结果。
+    AudioBuilt { seq: u64, out: Option<AudioOut> },
+    /// 系统音频设备事件(去抖合并,见 audio::spawn_device_watcher)。
+    AudioDevices(Vec<crate::audio::AudioDeviceEvent>),
+}
+
+fn spawn_stdin_reader(proxy: EventLoopProxy<UserEvent>) {
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
@@ -227,7 +252,7 @@ fn spawn_stdin_reader(proxy: EventLoopProxy<Command>) {
             }
             match serde_json::from_str::<Command>(line) {
                 Ok(cmd) => {
-                    if proxy.send_event(cmd).is_err() {
+                    if proxy.send_event(UserEvent::Cmd(cmd)).is_err() {
                         return;
                     }
                 }
@@ -235,7 +260,7 @@ fn spawn_stdin_reader(proxy: EventLoopProxy<Command>) {
             }
         }
         // EOF:父进程退出或关闭了管道
-        let _ = proxy.send_event(Command::Quit);
+        let _ = proxy.send_event(UserEvent::Cmd(Command::Quit));
     });
 }
 
@@ -390,6 +415,15 @@ const ANCHOR_GATE: f32 = 250.0;
 /// 与音频位置误差依旧很小 —— 但打击音效播放头停在阻塞前,若不标记跳变
 /// 会把期间的事件一口气全补播(全屏返回桌面的"爆发"根因)。
 const STALL_JUMP: f32 = 500.0;
+/// 音频看门狗门限:播放中 BGM 位置冻结超过它 = kira 流管理线程死亡
+/// (设备热拔/默认切换恢复路径的 panic 竞态),重建音频管线。kira 自身
+/// 的设备跟随轮询是 500ms,正常切换远小于本门限,不会误伤。
+const AUDIO_STALL: Duration = Duration::from_secs(2);
+/// 无输出设备时的重试间隔(插入新设备后 ≤3s 内恢复发声)。
+const AUDIO_PROBE: Duration = Duration::from_secs(3);
+/// 异步构建音频管线的超时:超时释放单飞锁,允许下一次重试(极少数
+/// WASAPI 调用不返回的场景;卡住的构建线程不影响渲染线程)。
+const AUDIO_BUILD_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Clock {
     fn new(t: f32, speed: f32) -> Clock {
@@ -591,13 +625,33 @@ fn scene_size(desk_w: u32, desk_h: u32) -> (u32, u32) {
 
 struct WallApp {
     out: Arc<Out>,
-    proxy: EventLoopProxy<Command>,
+    proxy: EventLoopProxy<UserEvent>,
     library: Library,
     last_load: Option<LoadParams>,
     /// 当前曲目的音频文件(循环重播用)。
     audio_path: Option<PathBuf>,
     /// None = 本机无音频设备,静音播放。
     audio: Option<AudioOut>,
+    /// 指定输出设备(cpal id;None = 跟随系统默认)。SetAudioDevice /
+    /// 看门狗重建都按它开流。
+    audio_device: Option<String>,
+    /// 音频看门狗:(最近 BGM 位置, 该位置首次出现的时刻)。播放中位置
+    /// 长时间不动 = kira 流管理线程已死(设备热拔/默认设备切换的恢复
+    /// 路径有 panic 竞态,死后无人推进位置三缓冲)—— 时钟会被冻结的
+    /// 锚点反复拽回,画面即"卡死"。超时重建音频管线。
+    audio_watch: (f64, Option<Instant>),
+    /// 异步构建状态:单飞标志 / 发起时刻 / 序号(作废在途结果)/
+    /// 本轮构建目标设备。设备解析与 WASAPI 开流都可能长时间阻塞,
+    /// 全部在后台线程,渲染线程零等待。
+    audio_building: bool,
+    audio_build_at: Instant,
+    audio_build_seq: u64,
+    audio_building_for: Option<String>,
+    /// 期望音量三路(master/bgm/hits):音量命令先落这里再下发当前
+    /// 管线;管线重建后按它重放 —— 音量不再随重建丢失。
+    vol_master: f32,
+    vol_bgm: f32,
+    vol_hits: f32,
     /// 打击音效:事件表(按时间排序)+ 采样预载 + 播放头游标。
     hs_events: Vec<osu_replay_render::hitsound::HitsoundEvent>,
     hs_sounds: HashMap<osu_replay_render::hitsound::SampleSlot, kira::sound::static_sound::StaticSoundData>,
@@ -730,8 +784,8 @@ struct WallApp {
 impl WallApp {
     fn new(
         out: Arc<Out>,
-        proxy: EventLoopProxy<Command>,
-        audio: Option<AudioOut>,
+        proxy: EventLoopProxy<UserEvent>,
+        audio_device: Option<String>,
         preview: Option<(u32, u32)>,
     ) -> WallApp {
         WallApp {
@@ -755,7 +809,16 @@ impl WallApp {
             frame_count: 0,
             measured_fps: 0,
             fps_measure_at: Instant::now(),
-            audio,
+            audio: None,
+            audio_device,
+            audio_watch: (f64::NEG_INFINITY, None),
+            audio_building: false,
+            audio_build_at: Instant::now(),
+            audio_build_seq: 0,
+            audio_building_for: None,
+            vol_master: 1.0,
+            vol_bgm: 1.0,
+            vol_hits: 0.8,
             window: None,
             host: None,
             desk: (0, 0),
@@ -1140,6 +1203,145 @@ impl WallApp {
         };
         if !played {
             log::warn!("曲终重播失败:无法在 {:.0}ms 重建 BGM 流", ms);
+        }
+    }
+
+    /// 重建音频管线(输出设备切换 / 看门狗判定管线死亡 / 无设备重试 /
+    /// 启动首次开流)。**全异步**:设备解析与 WASAPI 开流在后台线程
+    /// —— 设备刚消失/插入时这些 COM 调用可能长时间阻塞,发生在渲染
+    /// 线程上就是整个壁纸卡死(此前"切设备后卡住再也回不来"的根源)。
+    /// 旧管线同样移到后台线程销毁;构建结果经 UserEvent::AudioBuilt
+    /// 回投,挂载时按期望音量重放并续播。单飞 + 序号:构建中目标不变
+    /// 则等待,目标变了(用户刚切设备)作废在途结果重发。
+    fn rebuild_audio(&mut self) {
+        if self.audio_building && self.audio_building_for == self.audio_device {
+            return;
+        }
+        self.audio_building = true;
+        self.audio_build_at = Instant::now();
+        self.audio_build_seq += 1;
+        self.audio_building_for = self.audio_device.clone();
+        let seq = self.audio_build_seq;
+        let desired = self.audio_device.clone();
+        let proxy = self.proxy.clone();
+        // **旧管线保持在线继续出声**:新管线在后台建好(含插入窗口期的
+        // 多次重试探测)才原子换管 —— 切换无缝,没有"先静音再找设备"
+        // 的空窗。旧管线的下线发生在挂载新管线的那一刻(见 attach_audio)。
+        log::info!(
+            "[audio] 重建音频管线(设备:{})…",
+            desired.as_deref().unwrap_or("<系统默认>")
+        );
+        std::thread::spawn(move || {
+            // 目标恒解析为**具体端点**打开(指定 id 优先,失效/跟随默认时
+            // 取当前默认)。绝不走 cpal 的默认设备哨兵 —— 它的 IAudioClient
+            // 后台预激活在部分环境稳定触发 COM 公寓冲突(RPC_E_CHANGED_MODE,
+            // 实测指定端点必成、默认哨兵必败即此因)。默认跟随由设备事件
+            // 监听(DefaultChanged → 重建)驱动。
+            //
+            // **插入场景两个坑都在这兜**:刚插入的端点常短暂开不了流
+            // (Activate 未就绪即失败);插入事件落在构建窗口时端点解析
+            // 又取到旧值。故失败即快重试(200/400/600ms),且**每次重试
+            // 重新解析**,重试期间新插入/新默认自然被下一轮吃到 —— 全程
+            // 旧管线在播,用户无感。全部后台线程。
+            let mut out = None;
+            let mut resolved = None;
+            for attempt in 0..4 {
+                let (target, id) = crate::audio::resolve_target(desired.as_deref());
+                resolved = id;
+                out = AudioOut::new(target);
+                if out.is_some() {
+                    break;
+                }
+                if attempt < 3 {
+                    std::thread::sleep(Duration::from_millis(200 * (attempt as u64 + 1)));
+                }
+            }
+            match &resolved {
+                Some(id) => log::info!("[audio] 目标端点:{id}"),
+                None => log::warn!("[audio] 无可用输出端点(指定失效且无默认)"),
+            }
+            let _ = proxy.send_event(UserEvent::AudioBuilt { seq, out });
+        });
+    }
+
+    /// AudioBuilt 回投:**原子换管** —— 新管线在后台完整建好(含插入
+    /// 窗口期的多次重试)的这一刻,旧管线才下线(后台销毁,不占渲染
+    /// 线程),全程旧管线持续出声,切换无缝。期望音量重放 + 续播。
+    fn attach_audio(&mut self, seq: u64, mut out: Option<AudioOut>) {
+        if seq != self.audio_build_seq || !self.audio_building {
+            log::info!("[audio] 丢弃过期的音频构建结果(seq {seq})");
+            std::thread::spawn(move || drop(out));
+            return;
+        }
+        self.audio_building = false;
+        self.audio_watch = (f64::NEG_INFINITY, None);
+        if let Some(o) = &mut out {
+            o.set_master(self.vol_master);
+            o.set_volume(self.vol_bgm);
+            o.set_hits_volume(self.vol_hits);
+        }
+        log::info!(
+            "[audio] 音频管线就绪({}),换管",
+            if out.is_some() { "设备已打开" } else { "无可用设备,静音播放" }
+        );
+        // 换管:旧管线此刻下线(后台销毁 —— WASAPI 拆流可能阻塞)
+        let old = self.audio.take();
+        self.audio = out;
+        std::thread::spawn(move || drop(old));
+        self.resume_audio_tail();
+    }
+
+    /// 系统设备事件(去抖后)的决策。kira 恒按**具体端点**打开(见
+    /// rebuild_audio),默认跟随由本监听驱动:
+    /// - **跟随默认**:默认设备变化(含拔出后落到新默认)→ 立即重建;
+    /// - **指定设备**:该设备失活 → 重建(回退默认);恢复 → 重建(切回)。
+    fn on_device_events(&mut self, evs: &[crate::audio::AudioDeviceEvent]) {
+        use crate::audio::AudioDeviceEvent;
+        if self.audio.is_none() {
+            if !self.audio_building {
+                log::info!("[audio] 设备事件:尝试(重)开音频");
+                self.rebuild_audio();
+            }
+            return;
+        }
+        match self.audio_device.clone() {
+            None => {
+                let changed = evs
+                    .iter()
+                    .any(|e| matches!(e, AudioDeviceEvent::DefaultChanged(_)));
+                if changed {
+                    log::info!("[audio] 设备事件:默认输出设备变化,跟随切换");
+                    self.rebuild_audio();
+                }
+            }
+            Some(id) => {
+                let hit = evs.iter().any(|e| match e {
+                    AudioDeviceEvent::DeviceActive(x) | AudioDeviceEvent::DeviceGone(x) => {
+                        *x == id
+                    }
+                    _ => false,
+                });
+                if hit {
+                    log::info!("[audio] 设备事件:指定设备状态变化,重建(失效回退默认/恢复切回)");
+                    self.rebuild_audio();
+                }
+            }
+        }
+    }
+
+    /// 音频重建/恢复后的续播尾巴:BGM 从当前进度重启;**非播放态也要
+    /// 重建并立即置回暂停** —— 否则句柄为空,之后 Resume 对着空 BGM
+    /// 恢复就是无声死路(无设备期曲目自由走完关掉 playing 的场景)。
+    fn resume_audio_tail(&mut self) {
+        if self.game.is_none() || self.audio_pending || self.audio_path.is_none() {
+            return;
+        }
+        self.revive_bgm_at(self.clock.t);
+        if self.clock.playing {
+            // 重建耗时不计入墙钟 dt
+            self.clock.wall_at = None;
+        } else if let Some(out) = &mut self.audio {
+            out.pause(0.0);
         }
     }
 
@@ -1831,6 +2033,36 @@ impl WallApp {
         }
         let audio_pos = self.audio.as_ref().and_then(|a| a.position_ms());
         self.clock.step(audio_pos);
+        // 音频看门狗:见 WallApp::audio_watch 字段注释。暂停/曲终
+        // (audio_pos = None)时清零,不参与判定。
+        if self.clock.playing {
+            if let Some(pos) = audio_pos {
+                let stalled = {
+                    let (last, last_at) = &mut self.audio_watch;
+                    if (*last - pos).abs() > 0.5 {
+                        // 位置仍在前进(含 seek/循环回跳):重置观察窗
+                        *last = pos;
+                        *last_at = Some(Instant::now());
+                        false
+                    } else if last_at.is_none() {
+                        *last_at = Some(Instant::now());
+                        false
+                    } else {
+                        last_at.is_some_and(|at| at.elapsed() >= AUDIO_STALL)
+                    }
+                };
+                if stalled && !self.audio_building {
+                    // 重建期间不再重复告警/重发(单飞锁也会拦,这里是
+                    // 把每帧一条的日志刷屏压成每轮一次)
+                    log::warn!("[audio] BGM 位置冻结超过 2s(设备热拔/流管理线程死亡),重建音频管线");
+                    self.rebuild_audio();
+                }
+            } else {
+                self.audio_watch = (f64::NEG_INFINITY, None);
+            }
+        } else {
+            self.audio_watch = (f64::NEG_INFINITY, None);
+        }
         // 时钟硬跳(seek 落地 / 事件循环阻塞后的音频对齐):播放头直接跳
         // 到当前时刻,期间事件不补播(否则密集爆发),循环音重置后由
         // update_loops 按新时刻重启
@@ -1922,12 +2154,12 @@ impl WallApp {
             }
             match r {
                 Ok(()) => {
-                    let _ = proxy.send_event(Command::AudioReady { speed, path: Some(out_path), fade_ms });
+                    let _ = proxy.send_event(UserEvent::Cmd(Command::AudioReady { speed, path: Some(out_path), fade_ms }));
                 }
                 Err(e) => {
                     log::warn!("tempo 预处理失败({e:?})");
                     let _ = std::fs::remove_file(&out_path);
-                    let _ = proxy.send_event(Command::AudioReady { speed, path: None, fade_ms });
+                    let _ = proxy.send_event(UserEvent::Cmd(Command::AudioReady { speed, path: None, fade_ms }));
                 }
             }
         });
@@ -1966,7 +2198,7 @@ impl WallApp {
             if game.is_none() {
                 log::warn!("PP 补算失败(保持无 PP 显示)");
             }
-            let _ = proxy.send_event(Command::PpReady { seq, game });
+            let _ = proxy.send_event(UserEvent::Cmd(Command::PpReady { seq, game }));
         });
     }
 
@@ -1990,7 +2222,7 @@ impl WallApp {
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
             std::thread::sleep(REATTACH_DELAY);
-            let _ = proxy.send_event(Command::Reload);
+            let _ = proxy.send_event(UserEvent::Cmd(Command::Reload));
         });
     }
 }
@@ -2331,31 +2563,54 @@ impl WallApp {
                 );
             }
             Command::Reload => {
-                // 重挂桌面:窗口已销毁,按上次参数重走加载
-                if let Some(p) = self.last_load.clone() {
+                // 重挂桌面:窗口已销毁,按上次参数重走加载。重挂**不是**
+                // 新的播放意图:保留用户手动暂停与当前进度 —— 否则窗口
+                // 被外部销毁(explorer 重启/显示拓扑变化,拔带音频的
+                // HDMI 也算)后自动重挂,暂停中的壁纸会自己唱起来。
+                let was_paused = self.user_paused;
+                // 未播完:从当前进度续;已播完(曲终未循环):整曲重开
+                let at_end = self.clock.t >= self.limit();
+                if let Some(mut p) = self.last_load.clone() {
+                    if !at_end {
+                        p.start = self.clock.t;
+                    }
                     self.apply_load(event_loop, p);
+                    if was_paused {
+                        self.user_paused = true;
+                        self.clock.playing = false;
+                        let fade = self.fade_swap_ms();
+                        if let Some(out) = &mut self.audio {
+                            out.pause(fade);
+                        }
+                    }
                 }
             }
             Command::AudioReady { speed, path, fade_ms } => match path {
                 Some(tmp) => {
+                    // 预处理产物先落账 + pending 必须无条件清 —— 整段逻辑
+                    // 若包在 "audio 在场" 里,设备拔出(管线置空)期间完成
+                    // 的预处理会卡死 pending:step_playback 永久早退,画面
+                    // 冻结、无声,attach 也被 pending 拦下(热拔插"卡一下
+                    // 全没了"的死锁路径)。管线缺席时由 attach 后的
+                    // resume_audio_tail 按当前进度续播。
+                    if let Some(old) = self.last_stretch.replace(tmp.clone()) {
+                        let _ = std::fs::remove_file(old);
+                    }
                     if let Some(out) = &mut self.audio {
                         // clock.t = 冻结的起播点(加载等待)或当前进度
                         // (变速替换);play 内换算到压缩文件的素材时间
                         let t = self.clock.t;
                         out.play(&tmp, t, 1.0, speed as f64, fade_ms);
-                        if let Some(old) = self.last_stretch.replace(tmp) {
-                            let _ = std::fs::remove_file(old);
-                        }
-                        // 等待期结束:重置墙钟锚(等待时长不计入 dt),
-                        // 用户已暂停则 BGM 同步暂停
-                        if self.audio_pending {
-                            self.audio_pending = false;
-                            self.clock.wall_at = None;
+                        // 等待期结束:用户已暂停则 BGM 同步暂停
+                        if self.audio_pending && !self.clock.playing {
                             let fade = if self.fade_audio { 40.0 } else { 0.0 };
-                            if !self.clock.playing {
-                                out.pause(fade);
-                            }
+                            out.pause(fade);
                         }
+                    }
+                    if self.audio_pending {
+                        // 重置墙钟锚(等待时长不计入 dt)
+                        self.audio_pending = false;
+                        self.clock.wall_at = None;
                         self.send_status();
                     }
                 }
@@ -2364,9 +2619,9 @@ impl WallApp {
                     log::warn!("tempo 预处理失败,回退变调播放");
                     if let (Some(out), Some(src)) = (&mut self.audio, self.audio_path.clone()) {
                         out.play(&src, self.clock.t, speed, 1.0, 0.0);
-                        self.audio_pending = false;
-                        self.clock.wall_at = None;
                     }
+                    self.audio_pending = false;
+                    self.clock.wall_at = None;
                 }
             },
             Command::Unload => {
@@ -2446,10 +2701,19 @@ impl WallApp {
                     .is_some_and(|a| a.position_ms().is_none());
                 if stream_dead {
                     self.revive_bgm_at(ms);
-                    // seek = 新的播放意图(镜像 apply_load;UI 的 seek 后
-                    // 总跟 resume,这里先行置位让无 resume 的调用方也成立)
-                    self.clock.playing = true;
-                    self.user_paused = false;
+                    if self.clock.playing && !self.user_paused {
+                        // seek = 新的播放意图(镜像 apply_load;UI 的 seek
+                        // 后总跟 resume,这里先行置位让无 resume 的调用方
+                        // 也成立)
+                        self.clock.playing = true;
+                        self.user_paused = false;
+                    } else {
+                        // 暂停/已停态 seek:流重建后立即回暂停,不得借机
+                        // 开播(需要续播由显式 Resume 决定)
+                        if let Some(out) = &mut self.audio {
+                            out.pause(0.0);
+                        }
+                    }
                 } else if let Some(out) = &mut self.audio {
                     out.seek(ms);
                 }
@@ -2477,11 +2741,22 @@ impl WallApp {
             Command::SetLoop { on } => self.looping = on,
             Command::Status => self.send_status(),
             Command::SetVolume { v } => {
+                // 期望音量先落字段(管线重建后按它重放),再下发当前管线
+                self.vol_bgm = v.clamp(0.0, 1.0);
                 if let Some(out) = &mut self.audio {
                     out.set_volume(v);
                 }
             }
+            Command::SetAudioDevice { id } => {
+                self.audio_device = id.clone().filter(|s| !s.is_empty());
+                log::info!(
+                    "[audio] 切换输出设备:{}",
+                    self.audio_device.as_deref().unwrap_or("<系统默认>")
+                );
+                self.rebuild_audio();
+            }
             Command::SetMaster { v } => {
+                self.vol_master = v.clamp(0.0, 1.0);
                 if let Some(out) = &mut self.audio {
                     out.set_master(v);
                 }
@@ -2493,6 +2768,7 @@ impl WallApp {
                 self.hs_cursor = self.hs_events.partition_point(|e| e.time <= t);
             }
             Command::SetHitsVolume { v } => {
+                self.vol_hits = v.clamp(0.0, 1.0);
                 if let Some(out) = &mut self.audio {
                     out.set_hits_volume(v);
                 }
@@ -2659,13 +2935,17 @@ impl WallApp {
     }
 }
 
-impl ApplicationHandler<Command> for WallApp {
+impl ApplicationHandler<UserEvent> for WallApp {
     fn resumed(&mut self, _event_loop: &ActiveEventLoop) {
         // 壁纸窗口按需在 Load/Reload 时创建,这里无事可做
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, cmd: Command) {
-        self.handle_command(event_loop, cmd);
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, ev: UserEvent) {
+        match ev {
+            UserEvent::Cmd(cmd) => self.handle_command(event_loop, cmd),
+            UserEvent::AudioBuilt { seq, out } => self.attach_audio(seq, out),
+            UserEvent::AudioDevices(evs) => self.on_device_events(&evs),
+        }
     }
 
     fn window_event(
@@ -2718,6 +2998,23 @@ impl ApplicationHandler<Command> for WallApp {
         // 桌面尺寸跟随 + 渲染自动暂停的遮挡检测
         if self.poll_at.elapsed() >= Duration::from_secs(1) {
             self.poll_at = Instant::now();
+            // 音频构建超时兜底:WASAPI 在极端情况下可能不返回 —— 释放
+            // 单飞锁让看门狗/探测可再次发起(卡住的构建线程随它去,
+            // 结果回来时序号对不上会被丢弃,不占渲染线程)
+            if self.audio_building
+                && self.audio_build_at.elapsed() >= AUDIO_BUILD_TIMEOUT
+            {
+                log::warn!("[audio] 音频构建超时,允许重试");
+                self.audio_building = false;
+            }
+            // 无输出设备(audio == None 且不在构建)时定期重试:插入/
+            // 启用新设备后自动恢复发声(异步构建,见 rebuild_audio)
+            if self.audio.is_none()
+                && !self.audio_building
+                && self.audio_build_at.elapsed() >= AUDIO_PROBE
+            {
+                self.rebuild_audio();
+            }
             // 尺寸跟随:显示器热插拔 / 分辨率变化(只读尺寸)
             if let Some(host) = self.host {
                 let (w, h) = win::client_size(host.parent);

@@ -1,6 +1,6 @@
 [package]
 name = "aria"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2024"
 license = "MIT"
 description = "Aria(ATRI rhythm interactive animation)—— osu! storyboard 桌面动态壁纸播放器"
@@ -25,6 +25,10 @@ serde_json = "1"
 # 谱面音频 + 打击音效
 kira = "0.12"
 symphonia = { version = "0.6", default-features = false, features = ["id3v2", "id3v1"] }
+# 设备热拔插事件(IMMNotificationClient 封装):默认设备切换/加入/移除,
+# 事件级响应代替轮询。设备枚举/按 id 开流经 kira 的 cpal re-export,
+# 不直接依赖 cpal(kira → wasapi-rs → WASAPI)
+wasapi = "0.24"
 
 # osu!lazer client.realm 只读解析
 realm-db-reader = { git = "https://github.com/Ohdmire/realm-db-reader", branch = "main" }
@@ -41,6 +45,7 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
     "Win32_System_Threading",
+    "Win32_System_Com",
 ] }
 winreg = "0.56"
 base64 = "0.23"

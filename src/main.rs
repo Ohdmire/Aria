@@ -113,6 +113,8 @@ fn main() {
             skip_next,
             skip_prev,
             set_volume,
+            audio_devices,
+            set_audio_device,
             set_master_volume,
             set_audio_offset,
             set_hitsound,
@@ -704,16 +706,21 @@ async fn playlist_add_batch(app: AppHandle, items: Vec<BatchAdd>) -> Result<usiz
 }
 
 /// 编辑类命令的公共尾巴:被改条目含当前播放曲目时原位重载(回到当前
-/// 进度),让 mods/难度立即生效。
+/// 进度),让 mods/难度立即生效。**暂停中被编辑则保持暂停**(重载不是
+/// 新的播放意图,Load 后按 FIFO 补发 Pause)。
 async fn reload_current(app: &AppHandle, track: Track) -> Result<(), String> {
-    let t = match &*app.state::<ctl::WallState>().last_event.lock().unwrap() {
-        Some(crate::ipc::Event::Status { t_ms, .. }) => *t_ms,
-        _ => 0.0,
+    let (t_ms, was_playing) = match &*app.state::<ctl::WallState>().last_event.lock().unwrap() {
+        Some(crate::ipc::Event::Status { t_ms, playing, .. }) => (*t_ms, *playing),
+        _ => (0.0, true),
     };
     let app2 = app.clone();
-    tauri::async_runtime::spawn_blocking(move || ctl::load_track_at(&app2, &track, t))
+    tauri::async_runtime::spawn_blocking(move || ctl::load_track_at(&app2, &track, t_ms))
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())??;
+    if !was_playing {
+        let _ = ctl::send_cmd(app, Command::Pause);
+    }
+    Ok(())
 }
 
 /// 编辑播放列表条目(右键菜单):覆盖 mods 与难度锁定方式。正在播放的
@@ -934,6 +941,31 @@ fn set_volume(app: AppHandle, v: f32) -> Result<(), String> {
         settings::save(&app, &s);
     }
     ctl::send_cmd(&app, Command::SetVolume { v: v.clamp(0.0, 1.0) })
+}
+
+/// 枚举输出设备 [(id, name)]:设置页下拉用。枚举可能触碰 WASAPI,
+/// 放线程池避免占 async 运行时线程。
+#[tauri::command]
+async fn audio_devices() -> Result<Vec<(String, String)>, String> {
+    tauri::async_runtime::spawn_blocking(crate::audio::output_devices)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 指定输出设备(None = 跟随系统默认):持久化,运行中的壁纸子进程
+/// 立即重建音频管线(BGM 从当前进度续播);未运行时下次启动经环境
+/// 变量生效。
+#[tauri::command]
+fn set_audio_device(app: AppHandle, id: Option<String>) -> Result<(), String> {
+    let id = id.filter(|s| !s.is_empty());
+    {
+        let state = app.state::<ctl::WallState>();
+        let mut s = state.settings.lock().unwrap();
+        s.audio_device = id.clone();
+        settings::save(&app, &s);
+    }
+    let _ = ctl::send_cmd(&app, Command::SetAudioDevice { id });
+    Ok(())
 }
 
 /// 打击音效开关(关 = 音量 0)。

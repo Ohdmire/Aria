@@ -47,6 +47,9 @@ pub struct Settings {
     /// BGM 淡入淡出(换曲淡出旧曲、起播淡入;只作用于 BGM,默认开)。
     #[serde(default = "default_true")]
     pub fade_audio: bool,
+    /// 指定输出设备(cpal 设备 id;None = 跟随系统默认,热拔插自动跟随)。
+    #[serde(default)]
+    pub audio_device: Option<String>,
     /// 音效偏移(ms):正值 = 音效提前,负值 = 延后(相对 BGM;实时生效)。
     #[serde(default)]
     pub audio_offset_ms: f32,
@@ -246,6 +249,7 @@ impl Default for Settings {
             hits_volume: default_hits_volume(),
             master_volume: default_master(),
             fade_audio: true,
+            audio_device: None,
             audio_offset_ms: 0.0,
             hud: false,
             pp: false,

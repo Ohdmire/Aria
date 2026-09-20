@@ -1,7 +1,7 @@
 {
   "name": "aria",
   "private": true,
-  "version": "1.2.0",
+  "version": "1.2.1",
   "scripts": {
     "tauri": "tauri",
     "build:setup": "tauri build",

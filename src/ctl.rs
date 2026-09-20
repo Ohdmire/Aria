@@ -196,6 +196,19 @@ fn spawn_child(app: &AppHandle) -> anyhow::Result<ChildCtl> {
         // 贴图集中回归的那一帧要整批重新上线,是"突然卡一下再顺畅"的
         // 来源;1024MB 让绝大多数谱面永不淘汰,用显存换流畅
         .env("SB_GPU_MB", "1024");
+    // 用户指定的输出设备(设置→播放):子进程启动即开对设备,免"先默认
+    // 后切换"的起播噪音;None/失效 = 系统默认(运行期切换走 SetAudioDevice)
+    if let Some(dev) = app
+        .state::<WallState>()
+        .settings
+        .lock()
+        .unwrap()
+        .audio_device
+        .clone()
+        .filter(|s| !s.is_empty())
+    {
+        cmd.env("ARIA_AUDIO_DEVICE", dev);
+    }
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

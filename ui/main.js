@@ -94,6 +94,8 @@ function switchTab(name) {
     $(`tab-${page}`).classList.toggle('on', name === page);
   }
   if (name === 'library' && starRange.dirty) srRender();
+  // 每次进设置页刷新设备列表:热拔插后列表即时反映现状
+  if (name === 'settings') refreshAudioDevices();
 }
 $('tabs').querySelectorAll('button').forEach((btn) => {
   btn.addEventListener('click', () => switchTab(btn.dataset.tab));
@@ -834,15 +836,22 @@ function appendQueueRows(list, from, to) {
       handle.addEventListener('dblclick', (ev) => ev.stopPropagation());
       row.prepend(handle);
     }
-    // 多选模式:点击 = 切换选中(预览/播放/删除/拖动均让位);
-    // 常态:单击右侧预览,双击播放
-    if (state.qsel) {
-      row.addEventListener('click', () => toggleQSel(t.qid));
-    } else {
-      onClickDblClick(row, () => previewSet(t.setId, t.sha2), () => playSet(t.setId, t.sha2));
-    }
+    // 行点击在事件时刻按 state.qsel 分流:多选 = 立即切换选中(零延迟),
+    // 常态 = 单击延迟预览、双击播放。这样进/出多选不需要重建行。
+    let clickTimer = 0;
+    row.addEventListener('click', () => {
+      if (state.qsel) return toggleQSel(t.qid);
+      clickTimer = setTimeout(() => previewSet(t.setId, t.sha2), CLICK_DELAY);
+    });
+    row.addEventListener('dblclick', () => {
+      if (state.qsel) return;
+      clearTimeout(clickTimer);
+      playSet(t.setId, t.sha2);
+    });
     row.querySelector('.q-del').addEventListener('click', async (ev) => {
       ev.stopPropagation();
+      // 移除后保持滚动位置(用户正看着这一行,别弹走)
+      queueScrollHoldUntil = performance.now() + 1500;
       try {
         await invoke('playlist_remove', { qid: t.qid });
         refreshQueue();
@@ -989,6 +998,7 @@ function renderQueue() {
   $('queue-summary').textContent = items.length
     ? `${items.length} 首 · 约 ${fmtTotal(totalMs)}`
     : '队列空闲';
+  const keepScroll = list.scrollTop; // 必须在 innerHTML='' 前取:清空瞬间 scrollTop 已归零
   queueScrollObserver.disconnect();
   list.innerHTML = '';
   if (!items.length) {
@@ -1001,7 +1011,6 @@ function renderQueue() {
   const curIdx = items.findIndex((t) => t.current);
   const initial = Math.max(QUEUE_BATCH, (curIdx >= 0 ? curIdx : 0) + QUEUE_BATCH / 2);
   const to = Math.min(items.length, initial);
-  const keepScroll = list.scrollTop;
   appendQueueRows(list, 0, to);
   queueRendered = to;
   updateQueueSentinel(list);
@@ -1234,15 +1243,24 @@ $('mods-ok').addEventListener('click', async () => {
 });
 
 // ---- 播放列表多选:选择 → 右键 → 清除设置 ----
-// 条目本体恒为谱面集;mods 与难度锁定都是可清除的状态覆盖,
-// 清除后难度回到目标星级(最难/最简单/自定义)解析。
+// 交互原则:进/出多选、勾选、全选一律**就地更新行样式**,不整表重渲
+// —— 重渲会清掉懒加载与封面,并把滚动位置弹走(选一个跳一个的根源)。
+// 行点击在事件时刻按 state.qsel 分流(见 appendQueueRows),因此切换
+// 模式只需切容器类名(q-check 显隐纯 CSS)+ 清残留选中样式。
 function setQueueSelect(on) {
   state.qsel = on ? new Set() : null;
   $('queue-selbar').hidden = !on;
   $('queue-normalbar').hidden = on;
   closeQSelMenu();
   updateSelBar();
-  renderQueue();
+  const list = $('queue-list');
+  list.classList.toggle('selecting', on);
+  if (!on) {
+    list.querySelectorAll('.queue-row.selected').forEach((r) => {
+      r.classList.remove('selected');
+      r.querySelector('.q-check')?.classList.remove('on');
+    });
+  }
 }
 
 function updateSelBar() {
@@ -1257,7 +1275,13 @@ function toggleQSel(qid) {
   if (state.qsel.has(qid)) state.qsel.delete(qid);
   else state.qsel.add(qid);
   updateSelBar();
-  renderQueue();
+  // 只改这一行的样式,不重渲列表
+  const row = $('queue-list').querySelector(`.queue-row[data-qid="${qid}"]`);
+  if (row) {
+    const sel = state.qsel.has(qid);
+    row.classList.toggle('selected', sel);
+    row.querySelector('.q-check')?.classList.toggle('on', sel);
+  }
 }
 
 $('queue-select').addEventListener('click', () => setQueueSelect(true));
@@ -1269,7 +1293,12 @@ $('qsel-all').addEventListener('click', () => {
     ? new Set()
     : new Set(state.queue.map((t) => t.qid));
   updateSelBar();
-  renderQueue();
+  // 已渲染行就地更新选中样式;未渲染行懒加载时按 state.qsel 生成,不重渲
+  $('queue-list').querySelectorAll('.queue-row').forEach((row) => {
+    const sel = state.qsel.has(Number(row.dataset.qid));
+    row.classList.toggle('selected', sel);
+    row.querySelector('.q-check')?.classList.toggle('on', sel);
+  });
 });
 
 // 多选右键菜单:跟随鼠标的浮层;点击外部 / Escape 关闭
@@ -1312,6 +1341,7 @@ $('qsel-menu-edit-remove').addEventListener('click', async () => {
   const item = qeditCtx;
   closeQSelMenu();
   if (!item) return;
+  queueScrollHoldUntil = performance.now() + 1500; // 移除后留在原地
   try {
     await invoke('playlist_remove', { qid: item.qid });
     refreshQueue();
@@ -1324,6 +1354,7 @@ $('qsel-menu-remove').addEventListener('click', async () => {
   const qids = [...(state.qsel ?? [])];
   closeQSelMenu();
   if (!qids.length) return;
+  queueScrollHoldUntil = performance.now() + 1500; // 移除后留在原地
   try {
     await invoke('playlist_remove_batch', { qids });
     toast(`已移除 ${qids.length} 首`);
@@ -1653,7 +1684,8 @@ window.__TAURI__.app?.getVersion?.()
     $('pb-vol-val').textContent = `${Math.round(master * 100)}%`;
     state.lastVol = master;
     $('hitsound').checked = s.hitsound ?? true;
-    $('fade').checked = s.fadeAudio ?? true;
+    $('fade').checked = s.fade_audio ?? true;
+    refreshAudioDevices(s.audio_device ?? null);
     $('vol').value = String(s.volume ?? 0.6);
     $('vol-val').textContent = `${Math.round((s.volume ?? 0.6) * 100)}%`;
     $('hits-volume').value = String(s.hits_volume ?? 0.8);
@@ -2127,7 +2159,8 @@ function readPolicySelection(setId) {
 }
 
 /// 多选「设置难度」:按策略锁定所选条目的难度(单难度集即那一档)。
-/// 一次性操作,不改变设置页的默认难度。
+/// 一次性操作,不改变设置页的默认难度;完成后**留在多选模式**,
+/// 所选保持勾选,便于继续其他批量操作(与「修改 mods」一致)。
 async function applyQSelDiff(qids, target) {
   try {
     // 含当前曲时后端原位重载会触发 track 事件刷新:两条刷新路径都
@@ -2135,7 +2168,6 @@ async function applyQSelDiff(qids, target) {
     queueScrollHoldUntil = performance.now() + 1500;
     await invoke('queue_set_diff', { qids, target });
     toast(`已设置 ${qids.length} 个条目的难度`);
-    setQueueSelect(false);
     refreshQueue();
   } catch (e) {
     toast(`设置难度失败:${e}`);
@@ -2188,6 +2220,30 @@ $('hitsound').addEventListener('change', () => {
 // BGM 淡入淡出(换曲淡出旧曲、起播淡入;只作用于 BGM,不影响音效)
 $('fade').addEventListener('change', () => {
   invoke('set_fade_audio', { on: $('fade').checked }).catch((e) => toast(`${e}`));
+});
+// ---- 输出设备:枚举 + 选择(持久化到设置,壁纸子进程即时重建管线) ----
+async function refreshAudioDevices(selected) {
+  const sel = $('audio-device');
+  const cur = selected ?? sel.value;
+  let devs = [];
+  try {
+    devs = await invoke('audio_devices');
+  } catch { /* 枚举失败:仅显示默认项 */ }
+  sel.innerHTML = '<option value="">跟随系统默认</option>'
+    + devs.map(([id, name]) => `<option value="${esc(id)}">${esc(name)}</option>`).join('');
+  if (cur && !devs.some(([id]) => id === cur)) {
+    // 已保存的设备当前不可用(拔出/禁用):标出来,选择即保留/切走
+    const o = document.createElement('option');
+    o.value = cur;
+    o.textContent = '已保存的设备(当前不可用)';
+    sel.appendChild(o);
+  }
+  sel.value = cur || '';
+}
+$('audio-device').addEventListener('change', () => {
+  invoke('set_audio_device', { id: $('audio-device').value || null })
+    .then(() => toast('输出设备已切换'))
+    .catch((e) => toast(`切换失败:${e}`));
 });
 // 音乐音量:只作用于 BGM(总音量之下的分量,不影响音效)
 $('vol').addEventListener('input', () => {
