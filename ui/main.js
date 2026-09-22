@@ -1679,7 +1679,7 @@ window.__TAURI__.app?.getVersion?.()
     $('autostart').checked = !!s.autostart;
     $('log-rec').checked = !!s.log_enabled;
     // 播放条音量即总音量(音乐 + 音效主增益)
-    const master = s.master_volume ?? 1;
+    const master = s.master_volume ?? 0.6;
     $('pb-vol').value = String(master);
     $('pb-vol-val').textContent = `${Math.round(master * 100)}%`;
     state.lastVol = master;
@@ -1688,8 +1688,8 @@ window.__TAURI__.app?.getVersion?.()
     refreshAudioDevices(s.audio_device ?? null);
     $('vol').value = String(s.volume ?? 0.6);
     $('vol-val').textContent = `${Math.round((s.volume ?? 0.6) * 100)}%`;
-    $('hits-volume').value = String(s.hits_volume ?? 0.8);
-    $('hits-volume-val').textContent = `${Math.round((s.hits_volume ?? 0.8) * 100)}%`;
+    $('hits-volume').value = String(s.hits_volume ?? 0.6);
+    $('hits-volume-val').textContent = `${Math.round((s.hits_volume ?? 0.6) * 100)}%`;
     $('hits-volume').disabled = !$('hitsound').checked;
     $('offset').value = String(s.audio_offset_ms ?? 0);
     $('offset-val').textContent = `${Math.round(s.audio_offset_ms ?? 0)}ms`;
@@ -1705,12 +1705,13 @@ window.__TAURI__.app?.getVersion?.()
     $('bg-opacity').value = String(s.bg_opacity ?? 0.7);
     $('bg-opacity-val').textContent = `${Math.round((s.bg_opacity ?? 0.7) * 100)}%`;
     $('hidden').checked = !!s.hidden;
-    $('gameplay-hidden').checked = !!s.gameplayHidden;
+    $('gameplay-hidden').checked = !!s.gameplay_hidden;
+    $('debug-window').checked = !!s.debug_window;
     $('sb').checked = s.storyboard ?? true;
     // 旧值兼容:裸 "anime4k" 归一到 A
     const up = s.upscale === 'anime4k' ? 'anime4k-a' : s.upscale;
     $('upscale').value = ['off', 'fsr', 'anime4k-a', 'anime4k-aa', 'anime4k-b', 'anime4k-bb', 'anime4k-c', 'anime4k-ca'].includes(up) ? up : 'off';
-    $('upscale-quality').value = ['s', 'm', 'l', 'vl', 'ul'].includes(s.upscaleQuality) ? s.upscaleQuality : 'm';
+    $('upscale-quality').value = ['s', 'm', 'l', 'vl', 'ul'].includes(s.upscale_quality) ? s.upscale_quality : 'm';
     updateUpscaleQualityVisibility();
     // 屏幕下拉:列表异步拉取,当前值优先用已存设备名
     const savedMonitor = s.monitor ?? '';
@@ -2312,6 +2313,10 @@ $('hidden').addEventListener('change', () => {
 // 隐藏游玩画面:实时生效(只渲染背景 + storyboard)
 $('gameplay-hidden').addEventListener('change', () => {
   invoke('set_gameplay_hidden', { on: $('gameplay-hidden').checked }).catch((e) => toast(`${e}`));
+});
+// 调试窗口:不挂桌面层,常规窗口播放(切换重建窗口并重载当前曲目)
+$('debug-window').addEventListener('change', () => {
+  invoke('set_debug_window', { on: $('debug-window').checked }).catch((e) => toast(`${e}`));
 });
 // storyboard / 视频:加载期生效,切换会重播当前曲目
 $('sb').addEventListener('change', () => {

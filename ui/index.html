@@ -86,7 +86,7 @@
           <button id="lib-add" class="btn primary small">添加到播放列表</button>
         </div>
         <div class="lib-src" id="lib-src" title=""></div>
-        <div class="lib-hint dim">先过滤(搜索 / 星级 / 收藏夹)→「添加到播放列表」按谱面集批量入列 · 行单击右侧预览(再点切回) · 双击立即播放 · ▸ 展开选难度 · 播放中可在底栏切换难度</div>
+        <div class="lib-hint dim">单击封面加入播放列表 · 双击播放</div>
         <div class="lib-list" id="lib-list" aria-hidden="true"></div>
         <div class="lib-foot" id="lib-foot"></div>
       </div>
@@ -183,7 +183,7 @@
           </div>
           <div class="row">
             <span class="dim">音效音量</span><span class="val" id="hits-volume-val">80%</span>
-            <input type="range" id="hits-volume" min="0" max="1" step="0.05" value="0.8" class="grow" title="打击音效音量" />
+            <input type="range" id="hits-volume" min="0" max="1" step="0.05" value="0.6" class="grow" title="打击音效音量" />
           </div>
           <div class="row">
             <span class="dim">音效偏移</span><span class="val" id="offset-val">0ms</span>
@@ -265,6 +265,7 @@
           </div>
           <label class="check-inline" title="开机静默启动到托盘"><input type="checkbox" id="autostart" /> 开机自动启动（静默到托盘）</label>
           <label class="check-inline" title="日志写入 log/aria.log"><input type="checkbox" id="log-rec" /> 日志记录</label>
+          <label class="check-inline" title="不挂桌面层,用常规窗口播放(桌面挂接失败时自动退回此模式;排障用,切换会重载当前曲目)"><input type="checkbox" id="debug-window" /> 调试窗口</label>
           <div class="row">
             <span class="dim">关闭窗口时</span>
             <select id="close-action" class="grow" title="点 X 时的行为">

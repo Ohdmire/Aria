@@ -134,6 +134,7 @@ fn main() {
             set_upscale,
             monitors,
             set_monitor,
+            set_debug_window,
             set_beatmap_hitsounds,
             dir_status,
             pick_data_dir,
@@ -1628,6 +1629,20 @@ fn set_monitor(app: AppHandle, device: Option<String>) -> Result<(), String> {
         settings::save(&app, &s);
     }
     reload_current_track(&app);
+    Ok(())
+}
+
+/// 调试窗口模式:不挂桌面层,常规带边框窗口播放(排障用)。切换由
+/// 壁纸子进程按新形态重建窗口并重载当前曲目。
+#[tauri::command]
+fn set_debug_window(app: AppHandle, on: bool) -> Result<(), String> {
+    {
+        let state = app.state::<ctl::WallState>();
+        let mut s = state.settings.lock().unwrap();
+        s.debug_window = on;
+        settings::save(&app, &s);
+    }
+    ctl::send_cmd(&app, Command::SetDebugWindow { on });
     Ok(())
 }
 

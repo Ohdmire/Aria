@@ -775,6 +775,9 @@ struct WallApp {
     /// 调试预览模式(--preview[=WxH]):不挂桌面层,常规可调窗口。
     /// Some(初始尺寸) = 开启;None = 正常壁纸。
     preview_size: Option<(u32, u32)>,
+    /// 调试窗口模式(设置项/挂接失败兜底):与 preview_size 同形态
+    /// (常规带边框窗口,不挂桌面)。--preview 参数优先且运行期不可关。
+    debug_window: bool,
     /// 加载序号:每次 apply_load 自增。PP 补算等后台任务携带发起时的
     /// 序号,落地时与当前不符(已切歌/重载)即丢弃,防止旧曲数据热
     /// 替换到新曲上。
@@ -816,9 +819,9 @@ impl WallApp {
             audio_build_at: Instant::now(),
             audio_build_seq: 0,
             audio_building_for: None,
-            vol_master: 1.0,
-            vol_bgm: 1.0,
-            vol_hits: 0.8,
+            vol_master: 0.6,
+            vol_bgm: 0.6,
+            vol_hits: 0.6,
             window: None,
             host: None,
             desk: (0, 0),
@@ -872,6 +875,7 @@ impl WallApp {
             poll_at: Instant::now(),
             status_at: Instant::now(),
             preview_size: preview,
+            debug_window: false,
             load_seq: 0,
         }
     }
@@ -1552,52 +1556,78 @@ impl WallApp {
         self.scene_size = session.scene_size;
     }
 
+    /// 当前是否为调试窗口形态(--preview 或调试设置/兜底):不挂桌面层,
+    /// 常规可调窗口。窗口生命周期与遮挡检测等分支共用。
+    fn window_is_debug(&self) -> bool {
+        self.preview_size.is_some() || self.debug_window
+    }
+
     /// 创建壁纸窗口(隐藏)→ 附加桌面(attach 内部完成布局探测/撑开/定位)。
     /// GPU 会话在 Load 时创建。
     /// 预览模式(--preview):跳过桌面附加,开常规带边框、可自由调整大小
     /// 的窗口,初始尺寸即参数值;host 为 None,遮挡检测/桌面尺寸跟随
     /// 随之停用(见 about_to_wait)。
+    ///
+    /// **终极兜底**:桌面挂接彻底失败(attach 三轮重试全拒)时不再报错
+    /// 退出 —— 销毁无装饰的暗窗,改开调试窗口继续播放,并上报一次性
+    /// 提示;设置里的"调试窗口"开关可主动选择该形态。
     fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
-        let mut attrs = WindowAttributes::default()
-            .with_title("aria wallpaper")
-            .with_decorations(false)
-            .with_resizable(false)
-            .with_visible(false)
-            .with_inner_size(PhysicalSize::new(2560, 1440)); // 占位,attach 会重设
-        if let Some((w, h)) = self.preview_size {
-            attrs = attrs
-                .with_title("aria preview (debug)")
-                .with_decorations(true)
-                .with_resizable(true)
-                .with_inner_size(PhysicalSize::new(w.max(1), h.max(1)));
+        if !self.window_is_debug() {
+            // ---- 壁纸形态:隐藏无装饰窗口 → 挂桌面 ----
+            let attrs = WindowAttributes::default()
+                .with_title("aria wallpaper")
+                .with_decorations(false)
+                .with_resizable(false)
+                .with_visible(false)
+                .with_inner_size(PhysicalSize::new(2560, 1440)); // 占位,attach 会重设
+            let window = event_loop
+                .create_window(attrs)
+                .map_err(|e| format!("创建壁纸窗口失败: {e}"))?;
+            let window = Arc::new(window);
+            let hwnd = win::window_hwnd(&window).map_err(|e| format!("{e}"))?;
+            let host = win::attach(hwnd, self.monitor);
+            if host.width > 0 && host.height > 0 {
+                self.host = Some(host);
+                self.window = Some(window);
+                self.wall_hwnd = Some(hwnd);
+                self.desk = (host.width, host.height);
+                self.window.as_ref().unwrap().set_visible(true);
+                log::info!("窗口就绪,已附加桌面: {}×{}", self.desk.0, self.desk.1);
+                self.out.send(&Event::Ready {
+                    width: self.desk.0,
+                    height: self.desk.1,
+                    refresh_hz: win::monitor_refresh_hz(),
+                });
+                return Ok(());
+            }
+            // 挂接失败 → 调试窗口兜底:暗窗作废,改走下方常规窗口分支
+            log::warn!("[attach] 桌面挂接失败,退回调试窗口模式继续播放");
+            self.out.send(&Event::Error {
+                message: "桌面壁纸层不可用,已退回调试窗口播放(设置 → 画面 → 调试窗口可控制)".into(),
+            });
+            self.debug_window = true;
+            drop(window); // 无装饰暗窗销毁,不与调试窗口并存
         }
+
+        // ---- 调试窗口形态(--preview / 调试开关 / 挂接失败兜底) ----
+        let (w, h) = self.preview_size.unwrap_or((1280, 720));
+        let attrs = WindowAttributes::default()
+            .with_title("aria debug window")
+            .with_decorations(true)
+            .with_resizable(true)
+            .with_visible(false)
+            .with_inner_size(PhysicalSize::new(w.max(1), h.max(1)));
         let window = event_loop
             .create_window(attrs)
-            .map_err(|e| format!("创建壁纸窗口失败: {e}"))?;
+            .map_err(|e| format!("创建调试窗口失败: {e}"))?;
         let window = Arc::new(window);
         let hwnd = win::window_hwnd(&window).map_err(|e| format!("{e}"))?;
-        let (host, desk) = if self.preview_size.is_some() {
-            (None, self.preview_size.unwrap())
-        } else {
-            let host = win::attach(hwnd, self.monitor);
-            if host.width == 0 || host.height == 0 {
-                self.out.send(&Event::Error { message: "桌面壁纸层不可用".into() });
-                return Err(String::new());
-            }
-            (Some(host), (host.width, host.height))
-        };
-
-        self.host = host;
+        self.host = None;
         self.window = Some(window);
         self.wall_hwnd = Some(hwnd);
-        self.desk = desk;
+        self.desk = (w.max(1), h.max(1));
         self.window.as_ref().unwrap().set_visible(true);
-        log::info!(
-            "窗口就绪{}: {}×{}",
-            if self.host.is_some() { ",已附加桌面" } else { "(调试预览)" },
-            self.desk.0,
-            self.desk.1
-        );
+        log::info!("窗口就绪(调试窗口): {}×{}", self.desk.0, self.desk.1);
         self.out.send(&Event::Ready {
             width: self.desk.0,
             height: self.desk.1,
@@ -2922,6 +2952,21 @@ impl WallApp {
                 self.ffmpeg_bin = ffmpeg.map(PathBuf::from);
                 self.ffprobe_bin = ffprobe.map(PathBuf::from);
             }
+            Command::SetDebugWindow { on } => {
+                // --preview 启动参数优先:运行期切换对其无效
+                if self.preview_size.is_none() && on != self.debug_window {
+                    self.debug_window = on;
+                    log::info!("[window] 调试窗口模式: {on},重建窗口");
+                    if self.window.is_some() {
+                        // 拆会话 + 销毁窗口,立即按新形态重走加载(挂桌面
+                        // 或开调试窗口)。Destroyed 事件随后到达:两个方向
+                        // 都不会重复 Reload —— 开启方向 helper 为真直接跳过;
+                        // 关闭方向 on_detached 见窗口已 None 即返回。
+                        self.destroy_state();
+                        let _ = self.proxy.send_event(UserEvent::Cmd(Command::Reload));
+                    }
+                }
+            }
             Command::Quit => {
                 self.drop_stretch();
                 self.out.send(&Event::Exited);
@@ -2976,16 +3021,16 @@ impl ApplicationHandler<UserEvent> for WallApp {
                 }
             }
             WindowEvent::CloseRequested => {
-                // 预览窗口:关闭即退出渲染子进程;壁纸窗口不接受用户关闭
-                if self.preview_size.is_some() {
+                // 调试窗口:关闭即退出渲染子进程;壁纸窗口不接受用户关闭
+                if self.window_is_debug() {
                     self.drop_stretch();
                     self.out.send(&Event::Exited);
                     event_loop.exit();
                 }
             }
             WindowEvent::Destroyed => {
-                // 预览窗口只在退出时销毁,不算"被外部干掉"(explorer 重启)
-                if self.preview_size.is_none() {
+                // 调试窗口只在退出时销毁,不算"被外部干掉"(explorer 重启)
+                if !self.window_is_debug() {
                     self.on_detached();
                 }
             }

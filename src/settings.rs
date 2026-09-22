@@ -120,6 +120,11 @@ pub struct Settings {
     /// 更改后重载当前曲目生效。
     #[serde(default)]
     pub monitor: Option<String>,
+    /// 调试窗口模式(默认关):不挂桌面层,用常规带边框窗口播放,
+    /// 排障用。桌面挂接彻底失败时也会自动退回此模式(仅当次会话)。
+    /// --preview 启动参数与之等效且优先。
+    #[serde(default)]
+    pub debug_window: bool,
     /// 帧率上限(0 = 跟随屏幕刷新率;30/60/120/240/360)。
     #[serde(default)]
     pub fps: u32,
@@ -214,7 +219,7 @@ fn default_upscale_quality() -> String {
 }
 
 fn default_hits_volume() -> f32 {
-    0.8
+    0.6
 }
 
 fn default_true() -> bool {
@@ -226,7 +231,7 @@ fn default_cursor_size() -> f32 {
 }
 
 fn default_master() -> f32 {
-    1.0
+    0.6
 }
 
 impl Default for Settings {
@@ -271,6 +276,7 @@ impl Default for Settings {
             upscale: default_upscale(),
             upscale_quality: default_upscale_quality(),
             monitor: None,
+            debug_window: false,
             fps: 0,
             target_star: None,
             star_min: 0.0,

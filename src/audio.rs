@@ -259,9 +259,9 @@ impl AudioOut {
                     manager,
                     bgm: None,
                     timeline_scale: 1.0,
-                    bgm_volume: 1.0,
-                    hits_volume: 0.8,
-                    master: 1.0,
+                    bgm_volume: 0.6,
+                    hits_volume: 0.6,
+                    master: 0.6,
                 })
             }
             Err(e) => {
@@ -274,6 +274,14 @@ impl AudioOut {
     /// 换曲:BGM 流式起播,从音乐时间 `start_ms` 起。`rate` = kira 播放
     /// 速率(变调路径 = 有效速度,恒播原文件;预处理文件恒 1.0);
     /// `timeline_scale` 见结构体字段。`fade_ms > 0` 时从静音淡入。
+    ///
+    /// 音量/淡入/起点必须全部写进**创建参数**(StreamingSoundSettings),
+    /// 不能起播后拿句柄补:句柄命令最早也要到下一个渲染批次才被声音
+    /// 读到,窗口期里新声以 kira 默认音量 0dB(满格振幅)直出——换曲
+    /// 瞬间"突然很大声、音量限制不生效"正是这个竞态;seek_to 同理由
+    /// 解码线程异步消费,跳转生效前会先把预充的开头帧放掉。settings 的
+    /// volume 从第一帧就位,fade_in_tween 由 kira 原生从静音补间到该
+    /// 音量,start_position 让解码器出声前就定位到目标帧。
     pub fn play(
         &mut self,
         bgm_path: &Path,
@@ -289,25 +297,22 @@ impl AudioOut {
             let _ = h.stop(if fade_ms > 0.0 { fade_tween(120.0) } else { Tween::default() });
         }
         self.timeline_scale = timeline_scale.max(1e-6);
-        let tween = Tween::default();
         match StreamingSoundData::from_file(bgm_path) {
             Ok(data) => {
-                // 起播即带速率(起播后再 set 会有 1× 瞬态)
-                let data = data.with_settings(
-                    StreamingSoundSettings::new().playback_rate(rate.clamp(0.05, 16.0) as f64),
-                );
-                match self.manager.play(data) {
-                    Ok(mut h) => {
-                        let target = amplitude_to_decibels(self.master * self.bgm_volume);
-                        if fade_ms > 0.0 {
-                            h.set_volume(Decibels::SILENCE, Tween::default());
-                            h.set_volume(target, fade_tween(fade_ms));
-                        } else {
-                            h.set_volume(target, tween);
-                        }
-                        if start_ms > 250.0 {
-                            h.seek_to(start_ms as f64 / 1000.0 / self.timeline_scale);
-                        }
+                // 起播即带速率与目标音量(起播后再 set 会有按默认值
+                // 直出的瞬态)
+                let mut settings = StreamingSoundSettings::new()
+                    .playback_rate(rate.clamp(0.05, 16.0) as f64)
+                    .volume(amplitude_to_decibels(self.master * self.bgm_volume));
+                if fade_ms > 0.0 {
+                    settings = settings.fade_in_tween(fade_tween(fade_ms));
+                }
+                if start_ms > 250.0 {
+                    settings =
+                        settings.start_position(start_ms as f64 / 1000.0 / self.timeline_scale);
+                }
+                match self.manager.play(data.with_settings(settings)) {
+                    Ok(h) => {
                         self.bgm = Some(h);
                         true
                     }
