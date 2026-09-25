@@ -16,9 +16,14 @@
 //!   按父句柄枚举子级不受影响;
 //! - shell 会偶发重建桌面窗口(Progman 句柄换新),旧句柄上的
 //!   SetParent 无声失败(GetLastError=0)—— 附加必须带"重新发现 +
-//!   重试",且已 raised 的桌面不再发 0x052C 以免触发重组。
+//!   重试"。0x052C 可能触发这次重组,所以发完立刻重新找 Progman,
+//!   失败交给外层重试,不在旧句柄上继续挂。
 //!
-//! 0x052C 消息按 Lively 的参数发:wParam=0xD、lParam=0x1(仅经典布局)。
+//! 0x052C 消息按 Lively 的参数发:wParam=0xD、lParam=0x1。raised
+//! 桌面也要发一次,让 shell 生出画静态壁纸的子 WorkerW;自己的窗口
+//! 夹在 DefView 和这个 WorkerW 之间,并把 WorkerW 压到 Progman 最底
+//! ([`keep_workerw_under`],Lively `EnsureWorkerWZOrder`)。WorkerW
+//! 浮上来会把画面整个盖住。
 
 use anyhow::{Result, bail};
 use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, RECT, WPARAM};
@@ -29,9 +34,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowExW, FindWindowW, GA_PARENT, GWL_EXSTYLE, GWL_STYLE, GetAncestor,
     GetClientRect, GetWindowLongPtrW, GetWindowThreadProcessId, HWND_BOTTOM, IsIconic, IsWindow,
     IsWindowVisible, LWA_ALPHA, MONITORINFOF_PRIMARY, SMTO_NORMAL, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOZORDER, SendMessageTimeoutW, SetLayeredWindowAttributes, SetParent,
-    SetWindowLongPtrW, SetWindowPos, WS_CAPTION, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE, SendMessageTimeoutW,
+    SetLayeredWindowAttributes, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow, WS_CAPTION,
+    WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::BOOL;
 use windows::core::{PCWSTR, w};
@@ -354,6 +359,124 @@ unsafe fn shell_workerw_child(progman: HWND) -> HWND {
     HWND::default()
 }
 
+/// 让 shell 生成壁纸 WorkerW(Lively 参数 wParam=0xD, lParam=0x1)。
+/// 已存在时 shell 通常无操作;个别构建会趁机换掉 Progman 句柄。
+unsafe fn spawn_workerw(progman: HWND) {
+    let mut result = 0usize;
+    let _ = SendMessageTimeoutW(
+        progman,
+        SPAWN_WORKER,
+        WPARAM(0xD),
+        LPARAM(0x1),
+        SMTO_NORMAL,
+        1000,
+        Some(&mut result),
+    );
+}
+
+/// 5 秒内只发一次。挂接和每秒保活都会走到这里,连发会把 Progman 句柄换掉。
+unsafe fn spawn_workerw_throttled(progman: HWND) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let prev = LAST_WORKERW_SPAWN.load(std::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(prev) < 5_000 {
+        return false;
+    }
+    LAST_WORKERW_SPAWN.store(now, std::sync::atomic::Ordering::Relaxed);
+    spawn_workerw(progman);
+    true
+}
+
+/// Progman 的直接子窗口,按 z 序从顶到底。
+unsafe fn direct_children(parent: HWND) -> Vec<HWND> {
+    let mut out = Vec::new();
+    let mut after: Option<HWND> = None;
+    for _ in 0..64 {
+        let child = FindWindowExW(Some(parent), after, None, PCWSTR::null()).unwrap_or_default();
+        if child.is_invalid() {
+            break;
+        }
+        out.push(child);
+        after = Some(child);
+    }
+    out
+}
+
+/// raised desktop 保活(Lively `EnsureWorkerWZOrder` + WorkerW 销毁后重排):
+/// 静态壁纸 WorkerW 必须留在 Progman 最底,自己的窗口留在 DefView 正下方。
+/// WorkerW 不见了就再请求 shell 生一次(5s 节流,避免每秒重组桌面)。
+/// 只在 z 序真的错了时才 SetWindowPos。
+pub fn keep_workerw_under(child: HWND) {
+    unsafe {
+        if child.is_invalid() || !IsWindow(Some(child)).as_bool() {
+            return;
+        }
+        let mut progman = find_progman();
+        if progman.is_invalid() || !IsWindow(Some(progman)).as_bool() {
+            return;
+        }
+        if (GetWindowLongPtrW(progman, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP) == 0 {
+            return;
+        }
+        let mut workerw = shell_workerw_child(progman);
+        if workerw.is_invalid() && spawn_workerw_throttled(progman) {
+            log::info!("[attach] 壁纸 WorkerW 缺失,已请求 shell 重建");
+            progman = find_progman();
+            if progman.is_invalid() {
+                return;
+            }
+            workerw = shell_workerw_child(progman);
+        }
+        if workerw.is_invalid() || !IsWindow(Some(workerw)).as_bool() {
+            return;
+        }
+        let kids = direct_children(progman);
+        if kids.last().copied() != Some(workerw) {
+            let _ = SetWindowPos(
+                workerw,
+                Some(HWND_BOTTOM),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            log::info!("[attach] WorkerW {:?} 压回 Progman 最底", workerw.0);
+        }
+        if GetAncestor(child, GA_PARENT) != progman {
+            return;
+        }
+        let defview = FindWindowExW(Some(progman), None, w!("SHELLDLL_DefView"), PCWSTR::null())
+            .unwrap_or_default();
+        if defview.is_invalid() {
+            return;
+        }
+        let kids = direct_children(progman);
+        let above = |h: HWND| kids.iter().position(|c| *c == h);
+        // 索引越小越靠上。目标:DefView 在上,自己居中,WorkerW 在下。
+        let buried = match (above(defview), above(child), above(workerw)) {
+            (Some(d), Some(c), Some(w)) => !(d < c && c < w),
+            _ => false,
+        };
+        if buried {
+            let _ = SetWindowPos(
+                child,
+                Some(defview),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            log::info!("[attach] 壁纸窗口重新压到 DefView {:?} 之下", defview.0);
+        }
+    }
+}
+
+static LAST_WORKERW_SPAWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// 目标显示器 bounds(虚拟屏绝对坐标 x/y/w/h):None = 铺满宿主客户区
 /// (旧行为,双屏下即"span"效果)。
 pub type MonitorBounds = (i32, i32, u32, u32);
@@ -397,19 +520,56 @@ unsafe fn find_progman() -> HWND {
 /// 旧句柄上的 SetParent 无声失败,GetLastError=0)—— 每轮重新发现全部
 /// 句柄再试,总计 3 轮。
 pub fn attach(child: HWND, bounds: Option<MonitorBounds>) -> WallpaperHost {
+    attach_impl(child, bounds, true)
+}
+
+/// [`attach`] 之后 winit `set_visible` 会按自己的 WindowFlags 整页重写
+/// `GWL_STYLE` / `GWL_EXSTYLE`，把 `WS_CHILD` 和 `WS_EX_LAYERED` 清掉。
+/// raised desktop 上 Progman 没有 GDI 重定向位图，只合成带 LAYERED 的
+/// 子窗口 —— 样式被清掉后挂接日志仍是成功，桌面上看不到画面。
+/// 显示之后再走一遍挂接把样式和 z 序盖回去。此时窗口多半已经是
+/// 桌面子窗口，不能再按屏幕坐标预定位。
+pub fn reattach(child: HWND, bounds: Option<MonitorBounds>) -> WallpaperHost {
+    attach_impl(child, bounds, false)
+}
+
+/// 不激活地显示。`set_visible` 改完样式后再调一次，避免样式回写把
+/// 可见位一起弄丢。
+pub fn show_no_activate(hwnd: HWND) {
     unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+}
+
+fn attach_impl(child: HWND, bounds: Option<MonitorBounds>, screen_place: bool) -> WallpaperHost {
+    unsafe {
+        // raised 且还没有画静态壁纸的子 WorkerW:先让 shell 生出来。
+        // 这一步可能把 Progman 句柄换新,所以放在重试循环之前,循环里
+        // 每次都重新 find_progman。已有 WorkerW 就不再发,避免每次
+        // 重新封样式都触发一次桌面重组。
+        let progman = find_progman();
+        if !progman.is_invalid()
+            && (GetWindowLongPtrW(progman, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP) != 0
+            && shell_workerw_child(progman).is_invalid()
+            && spawn_workerw_throttled(progman)
+        {
+            log::info!("[attach] raised desktop 无壁纸 WorkerW,已请求 shell 生成");
+        }
         // 重定父前先按屏幕绝对坐标就位(SetParent 保留视觉位置,挂靠后
-        // 再按换算出的父相对坐标精确定位)
-        if let Some((x, y, w, h)) = bounds {
-            let _ = SetWindowPos(
-                child,
-                None,
-                x,
-                y,
-                w as i32,
-                h as i32,
-                SWP_NOACTIVATE | SWP_NOZORDER,
-            );
+        // 再按换算出的父相对坐标精确定位)。已经挂上之后再调用时跳过:
+        // 子窗口的 SetWindowPos 坐标是父客户区坐标,屏幕坐标会把它挪飞。
+        if screen_place {
+            if let Some((x, y, w, h)) = bounds {
+                let _ = SetWindowPos(
+                    child,
+                    None,
+                    x,
+                    y,
+                    w as i32,
+                    h as i32,
+                    SWP_NOACTIVATE | SWP_NOZORDER,
+                );
+            }
         }
         let mut host = WallpaperHost::invalid();
         for attempt in 0..3 {
@@ -436,10 +596,9 @@ unsafe fn attach_once(child: HWND, bounds: Option<MonitorBounds>) -> WallpaperHo
         return WallpaperHost::invalid();
     }
 
-    // raised desktop:Progman 无 GDI 重定向位图。**raised 时不再发 0x052C**:
-    // 26100+ 桌面默认即 raised,消息对已 raised 的桌面没有意义,反而可能
-    // 触发 shell 重组桌面窗口(实测 Progman 句柄被换新,正好赶上挂接
-    // 就是被无声拒绝的一种来路)。经典布局分支按旧逻辑发。
+    // raised desktop:Progman 无 GDI 重定向位图。0x052C 在 attach_impl
+    // 里、本轮发现之前发(仅当还没有子 WorkerW)。这里用的是发完之后
+    // 重新找到的 Progman。
     let raised = (GetWindowLongPtrW(progman, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP) != 0;
     let defview = FindWindowExW(Some(progman), None, w!("SHELLDLL_DefView"), PCWSTR::null())
         .unwrap_or_default();
@@ -534,6 +693,9 @@ unsafe fn attach_once(child: HWND, bounds: Option<MonitorBounds>) -> WallpaperHo
             host.height,
             defview.0
         );
+        if parent == progman {
+            keep_workerw_under(child);
+        }
         return host;
     }
 

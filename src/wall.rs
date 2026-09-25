@@ -1591,7 +1591,18 @@ impl WallApp {
                 self.window = Some(window);
                 self.wall_hwnd = Some(hwnd);
                 self.desk = (host.width, host.height);
+                // set_visible 会重写 GWL_STYLE/EXSTYLE,清掉 WS_CHILD 和
+                // WS_EX_LAYERED。必须在它之后再封一次,GPU surface 才建在
+                // 桌面真正会合成的那层窗口上。
                 self.window.as_ref().unwrap().set_visible(true);
+                let sealed = win::reattach(hwnd, self.monitor);
+                if sealed.width > 0 && sealed.height > 0 {
+                    self.host = Some(sealed);
+                    self.desk = (sealed.width, sealed.height);
+                } else {
+                    log::warn!("[attach] 显示后重新封样式失败,壁纸可能不可见");
+                }
+                win::show_no_activate(hwnd);
                 log::info!("窗口就绪,已附加桌面: {}×{}", self.desk.0, self.desk.1);
                 self.out.send(&Event::Ready {
                     width: self.desk.0,
@@ -3078,6 +3089,9 @@ impl ApplicationHandler<UserEvent> for WallApp {
             }
             // 尺寸跟随:显示器热插拔 / 分辨率变化(只读尺寸)
             if let Some(host) = self.host {
+                // raised desktop:静态壁纸 WorkerW 浮上来会盖住画面。
+                // 每秒核对一次 z 序,缺了就请 shell 再生并压回最底。
+                win::keep_workerw_under(host.child);
                 let (w, h) = win::client_size(host.parent);
                 if w > 0 && h > 0 && (w, h) != self.desk {
                     log::info!("桌面尺寸变化: {}×{} → {}×{}", self.desk.0, self.desk.1, w, h);
