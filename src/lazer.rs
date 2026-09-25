@@ -239,11 +239,15 @@ fn retain_playable(library: &mut LazerLibrary, root: &Path) {
             scope.spawn(|| {
                 for set in chunk {
                     for file in &mut set.files {
-                        file.size = std::fs::metadata(files_root.join(blob_relative_path(&file.hash)))
-                            .map(|m| m.len())
-                            .unwrap_or(0);
+                        // 缺失 blob 与 0 字节文件都是 size 0，必须分开：
+                        // 0 字节 wav/mp3/ogg 是谱面作者的静音占位（lazer
+                        // `LegacyBeatmapSkin` 命中该文件后不再回退皮肤）。
+                        match std::fs::metadata(files_root.join(blob_relative_path(&file.hash))) {
+                            Ok(meta) => file.size = meta.len(),
+                            Err(_) => file.size = u64::MAX,
+                        }
                     }
-                    set.files.retain(|f| f.size > 0);
+                    set.files.retain(|f| f.size != u64::MAX && (f.size > 0 || is_sample_filename(&f.filename)));
                     set.beatmaps.retain(|b| set.files.iter().any(|f| f.hash == b.sha2));
                 }
             });
@@ -594,6 +598,12 @@ pub fn beatmap_blob(root: &Path, sha2: &str) -> PathBuf {
     root.join("files").join(blob_relative_path(sha2))
 }
 
+/// 谱面采样扩展名。0 字节的这些文件是静音占位，必须留在文件表里。
+fn is_sample_filename(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [".wav", ".mp3", ".ogg"].iter().any(|ext| lower.ends_with(ext))
+}
+
 fn non_empty_or(value: String, fallback: String) -> String {
     if value.is_empty() { fallback } else { value }
 }
@@ -790,6 +800,14 @@ Sprite,Background,Centre,\"SB\\Flashy.jpg\",320,240
     }
 
     #[test]
+    fn empty_sample_names_are_kept_as_silence_placeholders() {
+        assert!(is_sample_filename("soft-hitclap2.wav"));
+        assert!(is_sample_filename("SB\\tick.MP3"));
+        assert!(!is_sample_filename("SB\\dot.png"));
+        assert!(!is_sample_filename("beatmap.osu"));
+    }
+
+    #[test]
     fn parse_real_realm() {
         let Some(realm) = realm_path() else {
             eprintln!("本机无 client.realm,跳过");
@@ -802,10 +820,10 @@ Sprite,Background,Centre,\"SB\\Flashy.jpg\",320,240
         let with_files = lib.sets.iter().filter(|s| !s.files.is_empty()).count();
         eprintln!("含文件列表的谱面集: {with_files}");
         assert!(with_files > 0, "所有谱面集都无文件列表");
-        // 过滤后所有条目的 blob 都必须存在(零拷贝点播可直读)
+        // 过滤后 blob 必须真实存在。size=0 只剩空音效占位(静音)，不是缺失文件。
         assert!(
-            lib.sets.iter().all(|s| s.files.iter().all(|f| f.size > 0)),
-            "过滤后仍有 size=0 的文件条目"
+            lib.sets.iter().all(|s| s.files.iter().all(|f| f.size > 0 || is_sample_filename(&f.filename))),
+            "过滤后仍有非音效的 size=0 文件"
         );
         // 零拷贝路径:.osu blob 与 manifest 内全部 blob 都必须真实存在
         let root = realm.parent().unwrap().to_path_buf();
