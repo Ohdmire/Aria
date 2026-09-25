@@ -2032,6 +2032,14 @@ impl WallApp {
         self.list.finish();
         // storyboard 先合成进图集槽位(队列序在场景提交之前)
         if let Some(sb) = &mut self.sb_layer {
+            let bright = osu_replay_render::scene::effective_brightness(
+                self.bg_opacity,
+                scene.break_lighten,
+                game_data,
+                t,
+            );
+            sb.set_dim(bright);
+            sb.set_passing(game::health_at(game_data, t) >= 0.5);
             sb.render(t as f32, surf.renderer_mut(), atlas);
         }
         surf.render(&self.list, CLEAR);
@@ -2392,7 +2400,7 @@ fn prep_render_session(
     // 解析(巨型 SB 省数秒)与渲染 —— 无论谱面是否存在。
     // 先解析故事板:背景接管(lazer ReplacesBackground)判定决定背景图
     // 是否还要解码上传——被接管的谱面不加载背景(execute me 等)。
-    let sb_parsed = if !storyboard {
+    let mut sb_parsed = if !storyboard {
         log::info!("[load] storyboard: 关闭(跳过解析)");
         None
     } else {
@@ -2508,8 +2516,16 @@ fn prep_render_session(
             log::info!("[load] SB 采样: {} 条", sb_samples.len());
         }
     }
+    if let Some(parsed) = sb_parsed.as_mut() {
+        if parsed.use_skin_sprites() {
+            if let Some(files) = skin.legacy().map(|s| s.image_files().clone()) {
+                parsed.set_skin_files(files);
+            }
+        }
+    }
     let sb_layer = sb_parsed.map(|p| {
         let mut l = p.into_layer(surf.device(), surf.queue(), sb_slot.0, sb_slot.1);
+        l.arm_triggers(&storyboard::gameplay_trigger_events(game));
         // 视频层:外部 ffmpeg(rawvideo 管道)+ ffprobe,PATH 上没有则
         // 静默跳过;视频直接喂 blob 路径,ffmpeg 按内容解封装。
         // 手动指定的 bin 路径优先于 PATH。

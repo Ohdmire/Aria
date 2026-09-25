@@ -63,3 +63,6 @@ osu_replay_render = { path = "../osu-replay-render" }
 
 [patch."https://github.com/Ohdmire/osu-storyboard-render.git"]
 osu-storyboard-render = { path = "../osu-storyboard-render" }
+
+[patch."https://github.com/Ohdmire/osu-parse.git"]
+osu-parse = { path = "../osu-parse" }
