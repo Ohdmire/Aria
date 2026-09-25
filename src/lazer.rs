@@ -473,23 +473,108 @@ pub fn mount_skin(root: &Path, skin: &LazerSkin, cache: &Path) -> Result<PathBuf
     Ok(dir)
 }
 
-/// 谱面集封面:文件列表里最大的图片(大小在解析时
-/// 已 stat 进 LazerFile.size),读 blob 转 data URL(base64 + 嗅探 mime),
-/// 供前端 <img> 直接使用。
+/// 谱面集封面。osu! 选歌卡用的是难度 `[Events]` 声明的背景图
+/// (`0,0,"bg.jpg"`),不是目录里最大的那张——故事板素材(MariannE 的
+/// `SB\blackbroke4.png`)经常比封面更大。声明的文件找不到时,退回
+/// 最大的非 `sb/` 图片,再退回最大的图片。
 pub fn cover_data_url(root: &Path, set: &LazerSet) -> Option<String> {
-    use base64::Engine as _;
-    let best = set
-        .files
-        .iter()
-        .filter(|f| {
-            let lower = f.filename.to_ascii_lowercase();
-            [".jpg", ".jpeg", ".png", ".webp"].iter().any(|e| lower.ends_with(e))
-        })
-        .max_by_key(|f| f.size)?;
-    if best.size == 0 {
-        return None;
-    }
+    let declared = declared_background(set, |sha2| {
+        std::fs::read_to_string(root.join("files").join(blob_relative_path(sha2))).ok()
+    });
+    let best = pick_cover_file(&set.files, declared.as_deref())?;
     let bytes = std::fs::read(root.join("files").join(blob_relative_path(&best.hash))).ok()?;
+    image_data_url(&bytes)
+}
+
+/// `[Events]` 第一条背景事件的文件名。路径可含逗号(引号包裹);
+/// 无引号时取到下一个逗号。只认 Events 节,避开 `[HitObjects]` 里
+/// 同样以 `0,0,` 开头的物件行。
+pub fn background_filename(osu_text: &str) -> Option<String> {
+    let text = osu_text.strip_prefix('\u{feff}').unwrap_or(osu_text);
+    let mut in_events = false;
+    for raw in text.lines() {
+        let line = raw.trim().trim_end_matches('\r');
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[') {
+            in_events = header.trim_end_matches(']').eq_ignore_ascii_case("Events");
+            continue;
+        }
+        if !in_events {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("0,0,") else { continue };
+        let rest = rest.trim();
+        let name = if let Some(inner) = rest.strip_prefix('"') {
+            inner.split('"').next().unwrap_or("").trim()
+        } else {
+            rest.split(',').next().unwrap_or("").trim()
+        };
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// 按难度顺序找第一张能解析出背景文件名的 .osu。`read_osu` 读失败则跳过。
+pub fn declared_background(set: &LazerSet, mut read_osu: impl FnMut(&str) -> Option<String>) -> Option<String> {
+    for beatmap in &set.beatmaps {
+        let Some(text) = read_osu(&beatmap.sha2) else { continue };
+        if let Some(name) = background_filename(&text) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn is_image_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [".jpg", ".jpeg", ".png", ".webp"].iter().any(|ext| lower.ends_with(ext))
+}
+
+fn norm_path(name: &str) -> String {
+    name.replace('\\', "/").to_ascii_lowercase()
+}
+
+/// 故事板素材目录。这些图经常比谱面背景更大,不能当封面。
+fn is_storyboard_asset(name: &str) -> bool {
+    let path = norm_path(name);
+    path.starts_with("sb/") || path.starts_with("storyboard/")
+}
+
+/// 从文件清单里挑封面。`declared` 是 .osu 背景文件名。
+pub fn pick_cover_file<'a>(files: &'a [LazerFile], declared: Option<&str>) -> Option<&'a LazerFile> {
+    let images: Vec<&LazerFile> = files.iter().filter(|f| f.size > 0 && is_image_name(&f.filename)).collect();
+    if let Some(name) = declared {
+        let want = norm_path(name);
+        if let Some(file) = images.iter().copied().find(|f| norm_path(&f.filename) == want) {
+            return Some(file);
+        }
+        let base = want.rsplit('/').next().unwrap_or(want.as_str());
+        let same_base: Vec<&LazerFile> = images
+            .iter()
+            .copied()
+            .filter(|f| norm_path(&f.filename).rsplit('/').next() == Some(base))
+            .collect();
+        if let Some(file) = same_base.iter().copied().find(|f| !is_storyboard_asset(&f.filename)) {
+            return Some(file);
+        }
+        if let Some(file) = same_base.into_iter().next() {
+            return Some(file);
+        }
+    }
+    images
+        .iter()
+        .copied()
+        .filter(|f| !is_storyboard_asset(&f.filename))
+        .max_by_key(|f| f.size)
+        .or_else(|| images.into_iter().max_by_key(|f| f.size))
+}
+
+pub fn image_data_url(bytes: &[u8]) -> Option<String> {
+    use base64::Engine as _;
     let mime = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
         "image/png"
     } else if bytes.starts_with(&[0xFF, 0xD8]) {
@@ -499,7 +584,7 @@ pub fn cover_data_url(root: &Path, set: &LazerSet) -> Option<String> {
     } else {
         return None;
     };
-    Some(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(&bytes)))
+    Some(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)))
 }
 
 // ---------- 谱面集点播(零拷贝) ----------
@@ -603,6 +688,46 @@ fn resolve_named_files(store: &mut RowStore<'_>, value: Option<&Value>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn file(filename: &str, size: u64) -> LazerFile {
+        LazerFile { filename: filename.to_string(), hash: String::new(), size }
+    }
+
+    #[test]
+    fn background_filename_is_the_events_image() {
+        let text = "\
+osu file format v14
+[Events]
+//Background and Video events
+0,0,\"SO57p38.jpg\",0,0
+//Storyboard Layer 0 (Background)
+Sprite,Background,Centre,\"SB\\Flashy.jpg\",320,240
+[HitObjects]
+0,0,40265,1,0,0:0:0:70:cymbol.wav
+";
+        assert_eq!(background_filename(text).as_deref(), Some("SO57p38.jpg"));
+    }
+
+    #[test]
+    fn cover_prefers_declared_background_over_larger_storyboard_art() {
+        let files = vec![
+            file("SB\\blackbroke4.png", 846_000),
+            file("SB\\Flashy.jpg", 370_000),
+            file("SO57p38.jpg", 548_000),
+        ];
+        let picked = pick_cover_file(&files, Some("SO57p38.jpg")).unwrap();
+        assert_eq!(picked.filename, "SO57p38.jpg");
+    }
+
+    #[test]
+    fn cover_without_declaration_skips_storyboard_directory() {
+        let files = vec![
+            file("sb/blackbroke4.png", 900_000),
+            file("bg.jpg", 100_000),
+        ];
+        let picked = pick_cover_file(&files, None).unwrap();
+        assert_eq!(picked.filename, "bg.jpg");
+    }
 
     /// 手动冒烟辅助(默认忽略):打印第一个"带真 storyboard + 音频"谱面集
     /// 的零拷贝 Load 命令 JSON,可管道给 `aria.exe --wallpaper`:

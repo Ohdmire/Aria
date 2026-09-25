@@ -8,7 +8,10 @@
 //! `%LOCALAPPDATA%\osu!` > 各固定盘根下的 `osu!` 目录;以 `osu!.db`
 //! 存在为准。
 
-use crate::lazer::{is_sb_video_name, LazerBeatmap, LazerCollection, LazerFile, LazerLibrary, LazerSet};
+use crate::lazer::{
+    declared_background, image_data_url, is_sb_video_name, pick_cover_file, LazerBeatmap, LazerCollection, LazerFile,
+    LazerLibrary, LazerSet,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -259,26 +262,21 @@ pub fn library(root: &Path) -> Result<LazerLibrary, String> {
     Ok(LazerLibrary { sets, collections, skins: Vec::new() })
 }
 
-/// stable 谱面集封面:目录里最大的图片(与 lazer 封面挑选同策略)。
+/// stable 谱面集封面:难度 `.osu` 声明的背景图。文件清单只有目录
+/// 顶层图片,子目录里的故事板素材不参与;声明路径仍按谱面集目录解析。
 pub fn cover_data_url(set: &LazerSet) -> Option<String> {
-    use base64::Engine as _;
     let dir = PathBuf::from(set.root.as_deref()?);
-    let best = set
-        .files
-        .iter()
-        .filter(|f| f.size > 0)
-        .max_by_key(|f| f.size)?;
+    let declared = declared_background(set, |name| std::fs::read_to_string(dir.join(name)).ok());
+    if let Some(name) = &declared {
+        if let Ok(bytes) = std::fs::read(dir.join(name)) {
+            if let Some(url) = image_data_url(&bytes) {
+                return Some(url);
+            }
+        }
+    }
+    let best = pick_cover_file(&set.files, declared.as_deref())?;
     let bytes = std::fs::read(dir.join(&best.filename)).ok()?;
-    let mime = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
-        "image/png"
-    } else if bytes.starts_with(&[0xFF, 0xD8]) {
-        "image/jpeg"
-    } else if bytes.starts_with(b"RIFF") && bytes.len() > 11 && &bytes[8..12] == b"WEBP" {
-        "image/webp"
-    } else {
-        return None;
-    };
-    Some(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(&bytes)))
+    image_data_url(&bytes)
 }
 
 #[cfg(test)]

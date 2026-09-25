@@ -56,3 +56,10 @@ opt-level = 1
 
 [profile.release]
 lto = "thin"
+
+# 本地故事板修复(前景层上槽 + 加色混合跟随背景亮度)。发布库跟上后可删。
+[patch."https://github.com/Ohdmire/osu-replay-render.git"]
+osu_replay_render = { path = "../osu-replay-render" }
+
+[patch."https://github.com/Ohdmire/osu-storyboard-render.git"]
+osu-storyboard-render = { path = "../osu-storyboard-render" }
