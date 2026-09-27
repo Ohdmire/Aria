@@ -519,6 +519,106 @@ unsafe fn find_progman() -> HWND {
 /// 带重试:shell 可能在附加瞬间重建桌面(实测 26200:Progman 句柄被换新,
 /// 旧句柄上的 SetParent 无声失败,GetLastError=0)—— 每轮重新发现全部
 /// 句柄再试,总计 3 轮。
+struct ClassicLayer {
+    defview: HWND,
+    owner: HWND,
+    worker: HWND,
+}
+
+/// Lively 的枚举:顶层窗口里谁直接挂着 SHELLDLL_DefView,它后面第一个
+/// shell 属主的 WorkerW 就是壁纸层。`skip` 是我们自己的窗口。
+unsafe fn locate_classic_layer(skip: HWND, shell_pid: u32) -> ClassicLayer {
+    struct Ctx {
+        skip: HWND,
+        shell_pid: u32,
+        defview: HWND,
+        owner: HWND,
+        worker: HWND,
+    }
+    unsafe extern "system" fn cb(hwnd: HWND, lp: LPARAM) -> BOOL {
+        let ctx = &mut *(lp.0 as *mut Ctx);
+        if hwnd == ctx.skip {
+            return BOOL(1);
+        }
+        let dv = FindWindowExW(Some(hwnd), None, w!("SHELLDLL_DefView"), PCWSTR::null())
+            .unwrap_or_default();
+        if dv.is_invalid() {
+            return BOOL(1);
+        }
+        ctx.defview = dv;
+        ctx.owner = hwnd;
+        let mut next =
+            FindWindowExW(None, Some(hwnd), w!("WorkerW"), PCWSTR::null()).unwrap_or_default();
+        while !next.is_invalid() {
+            if next != ctx.skip && pid_of(next) == ctx.shell_pid {
+                ctx.worker = next;
+                break;
+            }
+            next =
+                FindWindowExW(None, Some(next), w!("WorkerW"), PCWSTR::null()).unwrap_or_default();
+        }
+        BOOL(1)
+    }
+    let mut ctx = Ctx {
+        skip,
+        shell_pid,
+        defview: HWND::default(),
+        owner: HWND::default(),
+        worker: HWND::default(),
+    };
+    let _ = EnumWindows(Some(cb), LPARAM(&mut ctx as *mut Ctx as isize));
+    // Progman 的子 WorkerW(部分 Win10 把壁纸层挂在这里,而不是顶层兄弟)
+    if ctx.worker.is_invalid() {
+        let progman = find_progman();
+        let child_w = shell_workerw_child(progman);
+        if !child_w.is_invalid() && child_w != skip {
+            ctx.worker = child_w;
+        }
+    }
+    ClassicLayer {
+        defview: ctx.defview,
+        owner: ctx.owner,
+        worker: ctx.worker,
+    }
+}
+
+unsafe fn log_classic_candidates(skip: HWND, shell_pid: u32) {
+    let mut after: Option<HWND> = None;
+    let mut n = 0u32;
+    for _ in 0..32 {
+        let w = FindWindowExW(None, after, w!("WorkerW"), PCWSTR::null()).unwrap_or_default();
+        if w.is_invalid() {
+            break;
+        }
+        n += 1;
+        let dv = FindWindowExW(Some(w), None, w!("SHELLDLL_DefView"), PCWSTR::null())
+            .unwrap_or_default();
+        log::info!(
+            "[attach] 顶层 WorkerW #{n} {:?} pid={} shell={} 自己={} 含DefView={}",
+            w.0,
+            pid_of(w),
+            pid_of(w) == shell_pid,
+            w == skip,
+            !dv.is_invalid()
+        );
+        after = Some(w);
+    }
+    if n == 0 {
+        log::info!("[attach] 没有顶层 WorkerW");
+    }
+}
+
+/// 与探测程序相同:进窗口前声明 Per-Monitor V2,客户区按物理像素计算。
+pub fn enable_per_monitor_dpi() {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn SetProcessDpiAwarenessContext(value: *mut core::ffi::c_void) -> i32;
+    }
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(-4isize as *mut core::ffi::c_void);
+    }
+}
+
 pub fn attach(child: HWND, bounds: Option<MonitorBounds>) -> WallpaperHost {
     attach_impl(child, bounds, true)
 }
@@ -699,99 +799,42 @@ unsafe fn attach_once(child: HWND, bounds: Option<MonitorBounds>) -> WallpaperHo
         return host;
     }
 
-    // ── 经典布局:枚举顶层窗口,找"直接子级含 DefView"的容器,
-    //    壁纸层 = 容器之后(全局 Z 序更低)、**shell 属主**的第一个
-    //    顶层 WorkerW。属主校验必须做:桌面美化/壁纸软件会留下大量
-    //    属于第三方进程的顶层 WorkerW,SetParent 进去会被拒(实测
-    //    ERROR_INVALID_PARAMETER),旧版"任意 WorkerW"兜底正是
-    //    "壁纸层不可用"的来源。 ──
-    // 经典桌面才需要 0x052C 让 shell 生成壁纸 WorkerW(Lively 参数
-    // 0xD/0x1);raised 分支不发,见 attach_once 注释。
-    let mut result = 0usize;
-    let _ = SendMessageTimeoutW(
-        progman,
-        SPAWN_WORKER,
-        WPARAM(0xD),
-        LPARAM(0x1),
-        SMTO_NORMAL,
-        1000,
-        Some(&mut result),
-    );
+    // ── 经典布局,与 Lively SetupDesktopLayer 相同:
+    // 先 0x052C,再枚举顶层窗口,找到「直接子级是 SHELLDLL_DefView」的
+    // 那个窗口,取它后面(z 序更低)、shell 属主的第一个 WorkerW。
+    // 自己的 HWND 一律跳过:winit 的类名是 "Window Class",挂到 Progman
+    // 之后会出现在子窗口列表里,不能把它当成壳层。
+    // 找不到 WorkerW 就失败返回,不再挂 Progman 充数 —— 那一层没有
+    // 图标 DefView,画面出不来,外层还会把这次当成成功。
+    // 0x052C 走节流:reattach 只是补样式,不能再发,否则 shell 重排桌面。
     let shell_pid = pid_of(progman);
-    let mut find_container = || {
-        let dv = FindWindowExW(Some(progman), None, w!("SHELLDLL_DefView"), PCWSTR::null())
-            .unwrap_or_default();
-        if !dv.is_invalid() {
-            return progman;
-        }
-        let mut top_after: Option<HWND> = None;
-        for _ in 0..512 {
-            let wnd = FindWindowExW(None, top_after, None, PCWSTR::null()).unwrap_or_default();
-            if wnd.is_invalid() {
-                break;
-            }
-            let dv = FindWindowExW(Some(wnd), None, w!("SHELLDLL_DefView"), PCWSTR::null())
-                .unwrap_or_default();
-            if !dv.is_invalid() {
-                return wnd;
-            }
-            top_after = Some(wnd);
-        }
-        HWND::default()
-    };
-    let mut container = if !defview.is_invalid() {
-        progman
-    } else {
-        find_container()
-    };
-    if container.is_invalid() {
-        // 首次 0x052C 可能因 shell 忙而超时(1s),DefView 尚未就位:
-        // 加时重发一次再找。
-        let mut retry = 0usize;
-        let _ = SendMessageTimeoutW(
-            progman,
-            SPAWN_WORKER,
-            WPARAM(0xD),
-            LPARAM(0x1),
-            SMTO_NORMAL,
-            3000,
-            Some(&mut retry),
-        );
-        container = find_container();
+    let mut layer = locate_classic_layer(child, shell_pid);
+    if layer.worker.is_invalid() && spawn_workerw_throttled(progman) {
+        log::info!("[attach] 经典布局没有壁纸 WorkerW,已请求 shell 生成");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        layer = locate_classic_layer(child, shell_pid);
     }
-    let mut parent = HWND::default();
-    if !container.is_invalid() {
-        let mut cand =
-            FindWindowExW(None, Some(container), w!("WorkerW"), PCWSTR::null()).unwrap_or_default();
-        while !cand.is_invalid() {
-            if pid_of(cand) == shell_pid {
-                parent = cand;
-                break;
-            }
-            cand =
-                FindWindowExW(None, Some(cand), w!("WorkerW"), PCWSTR::null()).unwrap_or_default();
-        }
-        // 24H2+ 新布局:壁纸 WorkerW 是 Progman 的直接子窗口,顶层
-        // 枚举找不到 —— 补查一次
-        if parent.is_invalid() {
-            parent = shell_workerw_child(progman);
-        }
-    }
-    if parent.is_invalid() {
-        // 兜底:挂 DefView 容器本身并压底(HWND_BOTTOM 位于图标层
-        // 之下)。容器是 Progman(标准布局)或持有 DefView 的
-        // WorkerW(被第三方重排的布局)时都成立。绝不挂非 shell
-        // 属主的 WorkerW。
-        parent = if container.is_invalid() {
-            progman
-        } else {
-            container
-        };
+    log_classic_candidates(child, shell_pid);
+    if layer.worker.is_invalid() {
         log::warn!(
-            "未找到 shell 属主的壁纸 WorkerW,退回挂 DefView 容器压底 ({:?})",
-            parent.0
+            "[attach] 未找到 shell 壁纸 WorkerW (DefView={:?} 宿主={:?} {}),不挂 Progman",
+            layer.defview.0,
+            layer.owner.0,
+            if layer.owner.is_invalid() {
+                String::new()
+            } else {
+                class_name(layer.owner)
+            }
         );
+        return WallpaperHost::invalid();
     }
+    let parent = layer.worker;
+    log::info!(
+        "[attach] 经典布局 WorkerW {:?} (DefView {:?} 在 {:?} 之下)",
+        parent.0,
+        layer.defview.0,
+        layer.owner.0
+    );
 
     SetWindowLongPtrW(child, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT.0 as isize);
     SetWindowLongPtrW(child, GWL_STYLE, style);

@@ -123,6 +123,12 @@ fn parse_preview_from(args: &[String]) -> Option<(u32, u32)> {
 }
 
 pub fn main() -> i32 {
+    // 探测程序能铺满桌面的前提:物理像素,以及 DX12。父进程 spawn 时会设
+    // WGPU_BACKEND;直接 --wallpaper 启动时这里补上,避免落到 Vulkan。
+    win::enable_per_monitor_dpi();
+    if std::env::var_os("WGPU_BACKEND").is_none() {
+        unsafe { std::env::set_var("WGPU_BACKEND", "dx12") };
+    }
     let _ = crate::logging::init();
     let preview = parse_preview_args();
     if let Some((w, h)) = preview {

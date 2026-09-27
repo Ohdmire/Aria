@@ -218,6 +218,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-single-instance",
  "wasapi",
+ "wgpu",
  "windows 0.62.2",
  "winit",
  "winreg 0.56.0",

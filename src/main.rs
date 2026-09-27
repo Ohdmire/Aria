@@ -20,7 +20,8 @@ mod settings;
 mod soundtouch;
 mod stable;
 mod wall;
-mod win;
+
+pub use aria::win;
 
 use ipc::{Command, Event};
 use playlist::{PlayMode, Track};
