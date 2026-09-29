@@ -27,6 +27,7 @@ Release 下载安装 exe 即用
 ## 注意事项
 
 - 设置与播放列表保存在 `%APPDATA%\com.ohdmire.aria\`
+- 桌面挂接在 26200 上的实测和约束见 [docs/desktop-wallpaper.md](docs/desktop-wallpaper.md)
 
 ## 使用的开源库
 

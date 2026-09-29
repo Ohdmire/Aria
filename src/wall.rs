@@ -28,6 +28,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::platform::windows::WindowAttributesExtWindows;
 use winit::window::{Window, WindowAttributes};
 
 /// 壁纸窗口被外部销毁后,重挂桌面的等待间隔(给 explorer 重启留时间)。
@@ -1580,12 +1581,16 @@ impl WallApp {
     fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
         if !self.window_is_debug() {
             // ---- 壁纸形态:隐藏无装饰窗口 → 挂桌面 ----
-            let attrs = WindowAttributes::default()
+            let mut attrs = WindowAttributes::default()
                 .with_title("aria wallpaper")
                 .with_decorations(false)
                 .with_resizable(false)
                 .with_visible(false)
-                .with_inner_size(PhysicalSize::new(2560, 1440)); // 占位,attach 会重设
+                .with_inner_size(PhysicalSize::new(2560, 1440)) // 占位,attach 会重设
+                .with_no_redirection_bitmap(true);
+            if let Some(parent) = win::progman_raw_parent() {
+                attrs = unsafe { attrs.with_parent_window(Some(parent)) };
+            }
             let window = event_loop
                 .create_window(attrs)
                 .map_err(|e| format!("创建壁纸窗口失败: {e}"))?;
@@ -1600,6 +1605,8 @@ impl WallApp {
                 // set_visible 会重写 GWL_STYLE/EXSTYLE,清掉 WS_CHILD 和
                 // WS_EX_LAYERED。必须在它之后再封一次,GPU surface 才建在
                 // 桌面真正会合成的那层窗口上。
+                // 忽略鼠标:winit 会因此带上 WS_EX_LAYERED。事后自己 SetWindowLong
+                // 会被下一次样式刷新清掉,raised desktop 就不合成。
                 self.window.as_ref().unwrap().set_visible(true);
                 let sealed = win::reattach(hwnd, self.monitor);
                 if sealed.width > 0 && sealed.height > 0 {
@@ -1609,7 +1616,13 @@ impl WallApp {
                     log::warn!("[attach] 显示后重新封样式失败,壁纸可能不可见");
                 }
                 win::show_no_activate(hwnd);
-                log::info!("窗口就绪,已附加桌面: {}×{}", self.desk.0, self.desk.1);
+                let hit = self.window.as_ref().unwrap().set_cursor_hittest(false);
+                log::info!(
+                    "窗口就绪,已附加桌面: {}×{} layered_hittest={hit:?} ex={:#x}",
+                    self.desk.0,
+                    self.desk.1,
+                    win::ex_style(hwnd)
+                );
                 self.out.send(&Event::Ready {
                     width: self.desk.0,
                     height: self.desk.1,

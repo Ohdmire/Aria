@@ -26,12 +26,18 @@
 //! 浮上来会把画面整个盖住。
 
 use anyhow::{Result, bail};
-use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, RECT, SetLastError, WPARAM, WIN32_ERROR,
+};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW, MapWindowPoints,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowExW, FindWindowW, GA_PARENT, GWL_EXSTYLE, GWL_STYLE, GetAncestor,
+    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, EnumWindows, FindWindowExW,
+    FindWindowW, GA_PARENT, GWLP_HWNDPARENT, GWL_EXSTYLE, GWL_STYLE, RegisterClassExW, WNDCLASSEXW,
+    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+    GetAncestor,
+    GetDesktopWindow, GetParent,
     GetClientRect, GetWindowLongPtrW, GetWindowThreadProcessId, HWND_BOTTOM, IsIconic, IsWindow,
     IsWindowVisible, LWA_ALPHA, MONITORINFOF_PRIMARY, SMTO_NORMAL, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE, SendMessageTimeoutW,
@@ -320,18 +326,48 @@ pub fn window_hwnd(window: &impl raw_window_handle::HasWindowHandle) -> Result<H
 }
 
 /// 重定父(lively WindowUtil.TrySetParent 同款):裸 SetParent,失败即
-/// 失败 —— 没有 GWLP_HWNDPARENT 直写一类的绕过(直写内部句柄会被
-/// 安全软件的行为拦截判定为注入,得不偿失)。
 /// SetParent 返回的是"旧父句柄",存在 NULL 歧义(windows-rs 会把
 /// 成功误包装成 Err),故成败只认事后的真实父子关系。失败时打出
 /// 真实 GetLastError(5=权限拒绝,87=参数错误),供定位环境问题。
 unsafe fn reparent(child: HWND, parent: HWND) -> bool {
-    let _ = SetParent(child, Some(parent));
-    // GetLastError 必须在任何其他 Win32 调用(含下行的 GetAncestor)之前取走
+    let already = GetAncestor(child, GA_PARENT) == parent
+        || GetParent(child).unwrap_or_default() == parent;
+    if already {
+        return true;
+    }
+    SetLastError(WIN32_ERROR(0));
+    let ret = SetParent(child, Some(parent));
     let err = GetLastError().0;
-    let ok = GetAncestor(child, GA_PARENT) == parent;
+    let ancestor = GetAncestor(child, GA_PARENT);
+    let via_parent = GetParent(child).unwrap_or_default();
+    // 顶层窗口 SetParent 成功时,返回的旧父是 NULL,windows-rs 会包装成
+    // Err(操作成功完成)。GetAncestor 有时仍是桌面,GetParent 才是新父。
+    let mut ok = ancestor == parent || via_parent == parent;
     if !ok {
-        log::warn!("[attach] SetParent 挂 {parent:?} 失败 (GetLastError={err})");
+        // 26200 上 SetParent(Progman) 返回 NULL 且 GetLastError=0,父子关系
+        // 却不变。GWLP_HWNDPARENT 是这台机器上还能挂进去的写法。
+        SetWindowLongPtrW(child, GWLP_HWNDPARENT, parent.0 as isize);
+        let ancestor2 = GetAncestor(child, GA_PARENT);
+        let via2 = GetParent(child).unwrap_or_default();
+        ok = ancestor2 == parent || via2 == parent;
+        if ok {
+            log::info!("[attach] SetParent 未生效,已用 GWLP_HWNDPARENT 挂到 {parent:?}");
+        }
+    }
+    if !ok {
+        let mut child_pid = 0u32;
+        let mut parent_pid = 0u32;
+        let child_tid = GetWindowThreadProcessId(child, Some(&mut child_pid));
+        let parent_tid = GetWindowThreadProcessId(parent, Some(&mut parent_pid));
+        let here = windows::Win32::System::Threading::GetCurrentThreadId();
+        log::warn!(
+            "[attach] SetParent 挂 {parent:?} 失败 ret={ret:?} GetLastError={err} IsWindow={} ancestor={:?} getparent={:?} style={:#x} ex={:#x} 调用线程={here} 窗口线程={child_tid} 目标线程={parent_tid}",
+            IsWindow(Some(parent)).as_bool(),
+            ancestor.0,
+            via_parent.0,
+            GetWindowLongPtrW(child, GWL_STYLE),
+            GetWindowLongPtrW(child, GWL_EXSTYLE)
+        );
     }
     ok
 }
@@ -609,6 +645,129 @@ unsafe fn log_classic_candidates(skip: HWND, shell_pid: u32) {
 }
 
 /// 与探测程序相同:进窗口前声明 Per-Monitor V2,客户区按物理像素计算。
+/// 建窗口时就交给 `Progman` 当父窗口。26200 上事后 `SetParent` 会返回成功
+/// 但父子关系不变,`CreateWindowEx` 的 hwndParent 仍然有效。
+unsafe extern "system" fn wallpaper_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+) -> LRESULT {
+    DefWindowProcW(hwnd, msg, wp, lp)
+}
+
+fn module_instance() -> HINSTANCE {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleW(module: *const u16) -> *mut core::ffi::c_void;
+    }
+    HINSTANCE(unsafe { GetModuleHandleW(std::ptr::null()) })
+}
+
+/// 直接 CreateWindowEx 成 Progman 的子窗口,扩展样式在创建时就带
+/// WS_EX_LAYERED。事后 SetWindowLong 加这个位,这台 26200 会丢掉。
+pub fn create_layered_wallpaper_window(width: i32, height: i32) -> Result<HWND> {
+    unsafe {
+        let class_name: Vec<u16> = "AriaWallpaperHost\0".encode_utf16().collect();
+        SetLastError(WIN32_ERROR(0));
+        let atom = RegisterClassExW(&WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(wallpaper_wndproc),
+            hInstance: module_instance(),
+            lpszClassName: PCWSTR(class_name.as_ptr()),
+            ..Default::default()
+        });
+        log::info!(
+            "[attach] RegisterClass atom={atom} err={}",
+            GetLastError().0
+        );
+        let progman = find_progman();
+        if progman.is_invalid() {
+            bail!("未找到 Progman");
+        }
+        let (w, h) = client_size(progman);
+        let (w, h) = if w > 0 && h > 0 {
+            (w as i32, h as i32)
+        } else {
+            (width.max(1), height.max(1))
+        };
+        let hwnd = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            PCWSTR(class_name.as_ptr()),
+            w!("aria wallpaper"),
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+            0,
+            0,
+            w,
+            h,
+            Some(progman),
+            None,
+            Some(module_instance()),
+            None,
+        )
+        .map_err(|e| anyhow::anyhow!("CreateWindowEx: {e}"))?;
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        log::info!(
+            "[attach] 自建子窗口 {:?} 父={:?} 创建时 ex={:#x}",
+            hwnd.0,
+            GetAncestor(hwnd, GA_PARENT).0,
+            ex
+        );
+        SetLayeredWindowAttributes(hwnd, Default::default(), 255, LWA_ALPHA).log_unwrap();
+        let defview = FindWindowExW(Some(progman), None, w!("SHELLDLL_DefView"), PCWSTR::null())
+            .unwrap_or_default();
+        if !defview.is_invalid() {
+            let _ = SetWindowPos(hwnd, Some(defview), 0, 0, w, h, SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
+        log::info!(
+            "[attach] 自建子窗口定位后 ex={:#x} 父={:?}",
+            GetWindowLongPtrW(hwnd, GWL_EXSTYLE),
+            GetAncestor(hwnd, GA_PARENT).0
+        );
+        Ok(hwnd)
+    }
+}
+
+pub fn hwnd_raw(hwnd: HWND) -> Option<raw_window_handle::RawWindowHandle> {
+    let nz = std::num::NonZeroIsize::new(hwnd.0 as isize)?;
+    Some(raw_window_handle::RawWindowHandle::Win32(
+        raw_window_handle::Win32WindowHandle::new(nz),
+    ))
+}
+
+pub fn progman_raw_parent() -> Option<raw_window_handle::RawWindowHandle> {
+    let hwnd = unsafe { find_progman() };
+    let nz = std::num::NonZeroIsize::new(hwnd.0 as isize)?;
+    if hwnd.is_invalid() {
+        return None;
+    }
+    Some(raw_window_handle::RawWindowHandle::Win32(
+        raw_window_handle::Win32WindowHandle::new(nz),
+    ))
+}
+
+/// 挂接和 SetWindowPos 都做完之后再写分层样式。FrameChanged 会让 winit
+/// 按自己的 flags 把 EXSTYLE 写回 `0x10`,分层位留不住。
+pub fn ex_style(child: HWND) -> isize {
+    unsafe { GetWindowLongPtrW(child, GWL_EXSTYLE) }
+}
+
+pub fn ensure_layered(child: HWND) {
+    unsafe {
+        let mut ex = GetWindowLongPtrW(child, GWL_EXSTYLE);
+        ex |= WS_EX_LAYERED.0 as isize
+            | WS_EX_NOACTIVATE.0 as isize
+            | WS_EX_TOOLWINDOW.0 as isize;
+        SetWindowLongPtrW(child, GWL_EXSTYLE, ex);
+        SetLayeredWindowAttributes(child, Default::default(), 255, LWA_ALPHA).log_unwrap();
+        log::info!(
+            "[attach] ensure_layered ex={:#x}",
+            GetWindowLongPtrW(child, GWL_EXSTYLE)
+        );
+    }
+}
+
 pub fn enable_per_monitor_dpi() {
     #[link(name = "user32")]
     unsafe extern "system" {
@@ -723,19 +882,21 @@ unsafe fn attach_once(child: HWND, bounds: Option<MonitorBounds>) -> WallpaperHo
         // 注意顺序:样式与 LAYERED 属性必须在 SetParent 之前生效;
         // 挂接失败则回滚 WS_CHILD —— 留下"有子样式无父窗口"的
         // 半附加状态会让窗口掉进不可控的桌面层。
-        ex |= WS_EX_LAYERED.0 as isize;
-        SetWindowLongPtrW(child, GWL_EXSTYLE, ex);
-        style |= WS_CHILD.0 as isize;
-        SetWindowLongPtrW(child, GWL_STYLE, style);
-        SetLayeredWindowAttributes(child, Default::default(), 255, LWA_ALPHA).log_unwrap();
-        // Progman 挂不上时的保险:改挂 shell 自建的壁纸 WorkerW
-        //(24H2+ 它是 Progman 的直接子窗口,恒在 DefView 之下)——
-        // 同样处于图标层之下,只是改为盖住系统静态壁纸,本来就是
-        // 壁纸窗口的用途。两种挂法在健康桌面上实测都可行;失败
-        // 最常见的来路其实是句柄已死(桌面刚被 shell 重建),交外层
-        // 重试重新发现。
+        // 26200 上对已经存在的顶层窗口 SetParent(Progman) 不会改父窗口。
+        // 创建时指定 hwndParent 才能挂上。若还不是子窗口,再试 SetParent。
+        let born = GetAncestor(child, GA_PARENT) == progman
+            || GetParent(child).unwrap_or_default() == progman;
         let mut parent = progman;
-        if !reparent(child, progman) {
+        if born {
+            log::info!("[attach] 创建时已挂在 Progman 下,不再 SetParent");
+        } else {
+            ex |= WS_EX_LAYERED.0 as isize;
+            SetWindowLongPtrW(child, GWL_EXSTYLE, ex);
+            style |= WS_CHILD.0 as isize;
+            SetWindowLongPtrW(child, GWL_STYLE, style);
+            SetLayeredWindowAttributes(child, Default::default(), 255, LWA_ALPHA).log_unwrap();
+        }
+        if !born && !reparent(child, progman) {
             let ww = shell_workerw_child(progman);
             if ww.is_invalid() || !reparent(child, ww) {
                 style &= !(WS_CHILD.0 as isize);
@@ -780,6 +941,32 @@ unsafe fn attach_once(child: HWND, bounds: Option<MonitorBounds>) -> WallpaperHo
                 SWP_FRAMECHANGED | SWP_NOACTIVATE,
             );
         }
+        if GetWindowLongPtrW(child, GWL_EXSTYLE) & WS_EX_LAYERED.0 as isize == 0
+            && (GetAncestor(child, GA_PARENT) == parent || GetParent(child).unwrap_or_default() == parent)
+        {
+            // 只补扩展样式,不再 SetParent(NULL)。摘下来之后这台机器挂不回去。
+            let mut sealed = GetWindowLongPtrW(child, GWL_EXSTYLE);
+            sealed |= WS_EX_LAYERED.0 as isize
+                | WS_EX_NOACTIVATE.0 as isize
+                | WS_EX_TOOLWINDOW.0 as isize;
+            SetWindowLongPtrW(child, GWL_EXSTYLE, sealed);
+            let _ = SetWindowPos(
+                child,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+            SetLayeredWindowAttributes(child, Default::default(), 255, LWA_ALPHA).log_unwrap();
+            if GetAncestor(child, GA_PARENT) != parent && GetParent(child).unwrap_or_default() != parent
+            {
+                log::warn!("[attach] 补 WS_EX_LAYERED 后窗口脱离了父窗口");
+            }
+        }
+        ensure_layered(child);
+        let ex_final = GetWindowLongPtrW(child, GWL_EXSTYLE);
         host = WallpaperHost {
             parent,
             child,
@@ -787,11 +974,12 @@ unsafe fn attach_once(child: HWND, bounds: Option<MonitorBounds>) -> WallpaperHo
             height: h.max(1),
         };
         log::info!(
-            "raised desktop 附加: 父窗口 {:?} 客户区 {}×{},压在 DefView {:?} 之下",
+            "raised desktop 附加: 父窗口 {:?} 客户区 {}×{},压在 DefView {:?} 之下, ex={:#x}",
             parent,
             host.width,
             host.height,
-            defview.0
+            defview.0,
+            ex_final
         );
         if parent == progman {
             keep_workerw_under(child);

@@ -19,6 +19,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::platform::windows::WindowAttributesExtWindows;
 use winit::window::{Window, WindowAttributes};
 
 const HOLD: Duration = Duration::from_secs(3);
@@ -321,13 +322,19 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
 }
 "#;
 
-fn open_surface(window: &Window, width: u32, height: u32, image: &Image) -> Gpu {
+fn open_surface(
+    window: &Window,
+    target: raw_window_handle::RawWindowHandle,
+    width: u32,
+    height: u32,
+    image: &Image,
+) -> Gpu {
     // 与 osu_replay_render::surface::SurfaceRenderer::new 相同的实例、
     // 适配器选择和交换链格式。
     let mut descriptor = wgpu::InstanceDescriptor::default();
     descriptor.backends = wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all());
     let instance = wgpu::Instance::new(&descriptor);
-    let raw_window = window.window_handle().unwrap().as_raw();
+    let raw_window = target;
     let raw_display = window.display_handle().unwrap().as_raw();
     let surface = unsafe {
         instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
@@ -517,12 +524,16 @@ impl ApplicationHandler for App {
             return;
         }
         // wall.rs create_window 的窗口属性。
-        let attrs = WindowAttributes::default()
+        let mut attrs = WindowAttributes::default()
             .with_title("aria wallpaper")
             .with_decorations(false)
             .with_resizable(false)
             .with_visible(false)
-            .with_inner_size(PhysicalSize::new(2560, 1440));
+            .with_inner_size(PhysicalSize::new(2560, 1440))
+            .with_no_redirection_bitmap(true);
+        if let Some(parent) = aria::win::progman_raw_parent() {
+            attrs = unsafe { attrs.with_parent_window(Some(parent)) };
+        }
         let window = Arc::new(event_loop.create_window(attrs).expect("创建窗口"));
         let hwnd = aria::win::window_hwnd(window.as_ref()).expect("hwnd");
         let host = aria::win::attach(hwnd, None);
@@ -531,17 +542,27 @@ impl ApplicationHandler for App {
             event_loop.exit();
             return;
         }
-        // set_visible 会清掉 WS_CHILD / WS_EX_LAYERED,必须再封一次。
         window.set_visible(true);
         let host = {
             let again = aria::win::reattach(hwnd, None);
             if again.width > 0 { again } else { host }
         };
         aria::win::show_no_activate(hwnd);
-        log::info!("窗口就绪,已附加桌面: {}×{}", host.width, host.height);
+        log::info!(
+            "窗口就绪,已附加桌面: {}×{} ex={:#x}",
+            host.width,
+            host.height,
+            aria::win::ex_style(hwnd)
+        );
         log_diag(hwnd);
         let image = load_bg(&self.dir);
-        let gpu = open_surface(window.as_ref(), host.width, host.height, &image);
+        let gpu = open_surface(
+            window.as_ref(),
+            window.window_handle().unwrap().as_raw(),
+            host.width,
+            host.height,
+            &image,
+        );
         self.t0 = Some(Instant::now());
         self.gpu = Some(gpu);
         self.window = Some(window);
