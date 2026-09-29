@@ -789,6 +789,7 @@ details.grp > *:not(summary) { margin-top: 6px; }
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 4px 12px;
+  flex: none;
 }
 .info-item {
   display: flex;
@@ -811,6 +812,7 @@ details.grp > *:not(summary) { margin-top: 6px; }
 .info-item.span4 { grid-column: span 4; }
 .info-tags {
   display: flex;
+  flex: none;
   flex-wrap: wrap;
   align-content: flex-start;
   gap: 4px;

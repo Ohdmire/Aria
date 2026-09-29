@@ -86,6 +86,7 @@ fn main() {
             set_loop,
             unload,
             restart_wallpaper,
+            restart_explorer,
             get_status,
             set_autostart,
             set_log_enabled,
@@ -375,6 +376,27 @@ fn unload(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn restart_wallpaper(app: AppHandle) -> Result<(), String> {
     ctl::restart(&app)
+}
+
+/// 结束并重新启动 explorer.exe,让 shell 重建 Progman / DefView / WorkerW。
+/// 任务栏会闪一下。壁纸窗口若挂在 Progman 下,会随 explorer 退出而销毁。
+#[tauri::command]
+fn restart_explorer() -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let status = std::process::Command::new("taskkill")
+        .args(["/F", "/IM", "explorer.exe"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .map_err(|e| format!("结束 explorer 失败: {e}"))?;
+    if !status.success() {
+        return Err(format!("结束 explorer 失败,退出码 {}", status.code().unwrap_or(-1)));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::process::Command::new("explorer.exe")
+        .spawn()
+        .map_err(|e| format!("启动 explorer 失败: {e}"))?;
+    Ok(())
 }
 
 #[tauri::command]

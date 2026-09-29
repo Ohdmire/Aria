@@ -2384,6 +2384,16 @@ $('restart').addEventListener('click', async () => {
     toast(`重启失败：${e}`);
   }
 });
+$('restart-explorer').addEventListener('click', async () => {
+  if (!confirm('重启资源管理器？任务栏和桌面图标会短暂消失。')) return;
+  toast('正在重启资源管理器…');
+  try {
+    await invoke('restart_explorer');
+    toast('资源管理器已重启');
+  } catch (e) {
+    toast(`重启失败：${e}`);
+  }
+});
 $('quit').addEventListener('click', () => invoke('quit_app').catch(() => {}));
 
 // ---- 数据目录手动选择(lazer / stable) ----
