@@ -426,6 +426,10 @@ const STALL_JUMP: f32 = 500.0;
 /// (设备热拔/默认切换恢复路径的 panic 竞态),重建音频管线。kira 自身
 /// 的设备跟随轮询是 500ms,正常切换远小于本门限,不会误伤。
 const AUDIO_STALL: Duration = Duration::from_secs(2);
+/// 位置冻结但仍是 Playing 时,距曲终小于此值视为文件已经播完。
+/// kira 在容器帧数大于实际可解码帧时不会把状态打成 Stopped,位置停在
+/// 真实结尾。这个窗口里去重建管线只会从结尾再开一次,Ended 永远发不出。
+const AUDIO_EOF_SLACK: f32 = 15_000.0;
 /// 无输出设备时的重试间隔(插入新设备后 ≤3s 内恢复发声)。
 const AUDIO_PROBE: Duration = Duration::from_secs(3);
 /// 异步构建音频管线的超时:超时释放单飞锁,允许下一次重试(极少数
@@ -647,6 +651,12 @@ struct WallApp {
     /// 路径有 panic 竞态,死后无人推进位置三缓冲)—— 时钟会被冻结的
     /// 锚点反复拽回,画面即"卡死"。超时重建音频管线。
     audio_watch: (f64, Option<Instant>),
+    /// 流式 BGM 已到真实文件尾,但 kira 仍报 Playing。置位后不再把冻结
+    /// 位置当活音频,墙钟继续走到谱面结尾再发 Ended。
+    audio_eof: bool,
+    /// 同一位置连续冻结的次数。第一次按设备故障重建;重建后仍不动
+    /// 则流无法前进,与文件尾同一处理。
+    stall_strikes: u8,
     /// 异步构建状态:单飞标志 / 发起时刻 / 序号(作废在途结果)/
     /// 本轮构建目标设备。设备解析与 WASAPI 开流都可能长时间阻塞,
     /// 全部在后台线程,渲染线程零等待。
@@ -822,6 +832,8 @@ impl WallApp {
             audio: None,
             audio_device,
             audio_watch: (f64::NEG_INFINITY, None),
+            audio_eof: false,
+            stall_strikes: 0,
             audio_building: false,
             audio_build_at: Instant::now(),
             audio_build_seq: 0,
@@ -1131,6 +1143,9 @@ impl WallApp {
         self.looping = p.loop_playback;
         self.clock = Clock::new(p.start, self.track_rate * p.speed.clamp(0.05, 16.0));
         self.ended_sent = false;
+        self.audio_eof = false;
+        self.stall_strikes = 0;
+        self.audio_watch = (f64::NEG_INFINITY, None);
         self.hs_events = hs_events;
         self.loop_events = loop_events;
         self.hs_sounds = hs_sounds;
@@ -1834,6 +1849,22 @@ impl WallApp {
     /// 未加载)时跳过 GPU 部分,只换皮肤与后续加载参数。
     /// 失败语义:皮肤目录解析失败、或此前有背景现在却解码失败时报错
     /// 并完全保持现状(热换前不做任何变更)。
+    /// 只改 combo 着色开关:重涂物件颜色并丢掉皮肤色缓存。不重解皮肤、
+    /// 不重打包图集。图集重建会在渲染线程上再探一次 GPU 上限,切换这个
+    /// 开关时没必要,也会把画面卡住。
+    fn recolor_combo(&mut self, force_colours: bool) {
+        if let Some(load) = &mut self.last_load {
+            load.force_colours = force_colours;
+        }
+        let Some(resolved) = self.skin.as_ref() else { return };
+        if let Some(g) = self.game.as_mut().and_then(std::sync::Arc::get_mut) {
+            game::apply_skin_combo_colours(g, resolved, force_colours);
+        }
+        if let Some(scene) = &mut self.scene {
+            scene.invalidate_skin_cache();
+        }
+    }
+
     fn reswap_skin(&mut self, skin_path: Option<String>, force_colours: bool) {
         // ---- 前置解析(失败即返回,零副作用) ----
         let mut resolved = match skin::load_skin(skin_path.as_deref().map(std::path::Path::new)) {
@@ -2099,36 +2130,52 @@ impl WallApp {
         if self.audio_pending {
             return;
         }
-        let audio_pos = self.audio.as_ref().and_then(|a| a.position_ms());
+        let raw_pos = self.audio.as_ref().and_then(|a| a.position_ms());
+        // 文件尾被误报成仍在播放时,冻结位置不能再当主时钟,否则谱面
+        // 时间停在结尾,`t >= limit` 永远等不到。
+        let audio_pos = if self.audio_eof { None } else { raw_pos };
         self.clock.step(audio_pos);
         // 音频看门狗:见 WallApp::audio_watch 字段注释。暂停/曲终
         // (audio_pos = None)时清零,不参与判定。
-        if self.clock.playing {
-            if let Some(pos) = audio_pos {
-                let stalled = {
+        if self.clock.playing && !self.audio_eof {
+            if let Some(pos) = raw_pos {
+                let (stalled, advanced) = {
                     let (last, last_at) = &mut self.audio_watch;
                     if (*last - pos).abs() > 0.5 {
                         // 位置仍在前进(含 seek/循环回跳):重置观察窗
                         *last = pos;
                         *last_at = Some(Instant::now());
-                        false
+                        (false, true)
                     } else if last_at.is_none() {
                         *last_at = Some(Instant::now());
-                        false
+                        (false, false)
                     } else {
-                        last_at.is_some_and(|at| at.elapsed() >= AUDIO_STALL)
+                        (last_at.is_some_and(|at| at.elapsed() >= AUDIO_STALL), false)
                     }
                 };
+                if advanced {
+                    self.stall_strikes = 0;
+                }
                 if stalled && !self.audio_building {
-                    // 重建期间不再重复告警/重发(单飞锁也会拦,这里是
-                    // 把每帧一条的日志刷屏压成每轮一次)
-                    log::warn!("[audio] BGM 位置冻结超过 2s(设备热拔/流管理线程死亡),重建音频管线");
-                    self.rebuild_audio();
+                    let near_end = (pos as f32) + AUDIO_EOF_SLACK >= self.track_duration_ms
+                        || self.clock.t + AUDIO_EOF_SLACK >= self.limit();
+                    // 距结尾 15s 内的冻结就是文件尾。更早的冻结先重建一次;
+                    // 重建后仍停在原地,流已经无法前进,同样当成音频结束,
+                    // 否则看门狗会从结尾把歌反复重开,Ended 发不出去。
+                    if near_end || self.stall_strikes >= 1 {
+                        log::info!("[audio] BGM 不再前进,按音频结束处理");
+                        self.audio_eof = true;
+                        self.audio_watch = (f64::NEG_INFINITY, None);
+                    } else {
+                        self.stall_strikes = self.stall_strikes.saturating_add(1);
+                        log::warn!("[audio] BGM 位置冻结超过 2s(设备热拔/流管理线程死亡),重建音频管线");
+                        self.rebuild_audio();
+                    }
                 }
             } else {
                 self.audio_watch = (f64::NEG_INFINITY, None);
             }
-        } else {
+        } else if !self.clock.playing {
             self.audio_watch = (f64::NEG_INFINITY, None);
         }
         // 时钟硬跳(seek 落地 / 事件循环阻塞后的音频对齐):播放头直接跳
@@ -2145,18 +2192,24 @@ impl WallApp {
         self.fire_hitsounds();
         // 有音频在播时以"音频播完"为准;音频播完(position 不可用)后墙钟
         // 从歌末位置继续,自然进入循环/结束分支。
-        let audio_alive = audio_pos.is_some();
+        let audio_alive = !self.audio_eof && raw_pos.is_some();
         let limit = self.limit();
         if self.clock.playing && self.clock.t >= limit && !audio_alive {
-            if self.looping {
-                self.restart_from_zero();
-            } else {
-                self.clock.playing = false;
-                if !self.ended_sent {
-                    self.ended_sent = true;
-                    self.out.send(&Event::Ended);
-                }
-            }
+            self.finish_track();
+        }
+    }
+
+    /// 曲终:单曲循环则重开,否则停钟并通知父进程切下一首。
+    fn finish_track(&mut self) {
+        if self.looping {
+            self.restart_from_zero();
+            return;
+        }
+        self.clock.playing = false;
+        if !self.ended_sent {
+            self.ended_sent = true;
+            log::info!("[play] 曲终,请求下一首");
+            self.out.send(&Event::Ended);
         }
     }
 
@@ -2165,6 +2218,9 @@ impl WallApp {
     fn restart_from_zero(&mut self) {
         self.clock.seek(0.0);
         self.ended_sent = false;
+        self.audio_eof = false;
+        self.stall_strikes = 0;
+        self.audio_watch = (f64::NEG_INFINITY, None);
         let game_data = self.game.as_ref().unwrap();
         if self.window.is_some() {
             let (w, h) = self.scene_size;
@@ -2757,8 +2813,12 @@ impl WallApp {
                         sb.reset_video();
                     }
                 }
+                let was_eof = self.audio_eof;
                 self.clock.seek(ms);
                 self.ended_sent = false;
+                self.audio_eof = false;
+                self.stall_strikes = 0;
+                self.audio_watch = (f64::NEG_INFINITY, None);
                 let t = self.hs_time();
                 self.hs_cursor = self.hs_events.partition_point(|e| e.time <= t);
                 // SB 采样:seek 即停掉在播语音,游标按目标时刻重定位
@@ -2771,10 +2831,13 @@ impl WallApp {
                 // 流式声、从 seek 点续播(拖回重听)。不重建的话下一帧
                 // `t >= limit && !audio_alive` 立即再判曲终:BGM 一个音
                 // 都不放就跳下一首。
-                let stream_dead = self
-                    .audio
-                    .as_ref()
-                    .is_some_and(|a| a.position_ms().is_none());
+                // was_eof:句柄仍报 Playing,但解码已经停在文件尾,seek_to
+                // 救不回,必须按死流原位重建。
+                let stream_dead = was_eof
+                    || self
+                        .audio
+                        .as_ref()
+                        .is_some_and(|a| a.position_ms().is_none());
                 if stream_dead {
                     self.revive_bgm_at(ms);
                     if self.clock.playing && !self.user_paused {
@@ -2931,8 +2994,13 @@ impl WallApp {
                 }
             }
             Command::SetSkin { skin, force_colours } => {
-                self.reswap_skin(skin, force_colours);
-                self.clock.note_stall();
+                let same = self.last_load.as_ref().is_some_and(|l| l.skin == skin);
+                if same {
+                    self.recolor_combo(force_colours);
+                } else {
+                    self.reswap_skin(skin, force_colours);
+                    self.clock.note_stall();
+                }
             }
             Command::SetBgOpacity { v } => {
                 self.bg_opacity = v.clamp(0.0, 1.0);

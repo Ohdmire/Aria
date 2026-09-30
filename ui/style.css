@@ -782,7 +782,7 @@ details.grp > *:not(summary) { margin-top: 6px; }
 .info-card {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
+  overflow: hidden;
   gap: 8px;
 }
 .info-grid {
@@ -812,11 +812,13 @@ details.grp > *:not(summary) { margin-top: 6px; }
 .info-item.span4 { grid-column: span 4; }
 .info-tags {
   display: flex;
-  flex: none;
+  /* 吃掉信息卡在封面以下的剩余高度。最低约两行，避免矮窗口里被压成 0；
+     窗口拉高后继续往下排，只有仍然排不下才滚动。 */
+  flex: 1;
   flex-wrap: wrap;
   align-content: flex-start;
   gap: 4px;
-  max-height: 62px;
+  min-height: 62px;
   min-width: 0;
   overflow-y: auto;
 }

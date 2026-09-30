@@ -88,11 +88,6 @@ pub struct Settings {
     /// 手动指定的 ffprobe 完整路径(视频探测 + BGM 时长;None = PATH 查找)。
     #[serde(default)]
     pub ffprobe: Option<String>,
-    /// 旧版独立开关(已并入 render_mode;读取时迁移)。
-    #[serde(default)]
-    pub pure_audio: bool,
-    #[serde(default = "default_auto_pause")]
-    pub auto_pause_render: bool,
     /// 背景亮度(0.0–1.0;谱面背景图与 storyboard 的混合基准)。
     #[serde(default = "default_bg_opacity")]
     pub bg_opacity: f32,
@@ -194,10 +189,6 @@ fn default_hitsound() -> bool {
     true
 }
 
-fn default_auto_pause() -> bool {
-    true
-}
-
 fn default_render_mode() -> String {
     "always".to_string()
 }
@@ -266,8 +257,6 @@ impl Default for Settings {
             render_mode: default_render_mode(),
             ffmpeg: None,
             ffprobe: None,
-            pure_audio: false,
-            auto_pause_render: default_auto_pause(),
             bg_opacity: default_bg_opacity(),
             hidden: false,
             storyboard: default_on(),
@@ -298,38 +287,13 @@ pub fn load(app: &tauri::AppHandle) -> Settings {
     let Ok(dir) = app.path().app_data_dir() else {
         return Settings::default();
     };
-    // 项目更名(com.ohdmire.osu-player → com.ohdmire.aria):旧设置一次性
-    // 搬家,播放列表/上次曲目/全部偏好原样保留(skin-cache 可再生不搬)
     let file = dir.join("settings.json");
-    if !file.is_file() {
-        if let Some(old) = dir.parent().map(|p| p.join("com.ohdmire.osu-player").join("settings.json")) {
-            if old.is_file() {
-                let _ = std::fs::create_dir_all(&dir);
-                let _ = std::fs::copy(&old, &file);
-            }
-        }
-    }
     let mut s: Settings = std::fs::read_to_string(file)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_default();
-    // 旧版独立开关迁移到统一的 render_mode(一次性:迁移后写回)
-    if s.pure_audio {
-        s.render_mode = "off".into();
-        s.pure_audio = false;
-    } else if !s.auto_pause_render {
-        s.render_mode = "always".into();
-        s.auto_pause_render = true;
-    }
     if !matches!(s.render_mode.as_str(), "always" | "autopause" | "fs_pause" | "fs_sleep" | "off") {
         s.render_mode = default_render_mode();
-    }
-    // 皮肤存档清理:旧版曾把"导入缓存目录绝对路径"存进皮肤字段,该
-    // 功能不存在,置空回默认皮肤
-    if let Some(p) = &s.skin {
-        if p.contains("skin-cache") {
-            s.skin = None;
-        }
     }
     s
 }
@@ -346,8 +310,6 @@ pub fn save(app: &tauri::AppHandle, s: &Settings) {
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "Aria";
-/// 项目更名前的自启注册表值名:读写新值时顺手清掉,避免残留指向旧 exe
-const RUN_VALUE_LEGACY: &str = "osu-player";
 
 pub fn set_autostart(on: bool) -> Result<(), String> {
     use winreg::enums::{HKEY_CURRENT_USER, KEY_SET_VALUE};
@@ -361,9 +323,6 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
     } else if let Ok(key) = hkcu.open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE) {
         let _ = key.delete_value(RUN_VALUE);
     }
-    if let Ok(key) = hkcu.open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE) {
-        let _ = key.delete_value(RUN_VALUE_LEGACY);
-    }
     Ok(())
 }
 
@@ -373,8 +332,7 @@ pub fn autostart_enabled() -> bool {
     let key = RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey_with_flags(RUN_KEY, KEY_QUERY_VALUE);
     match key {
-        Ok(k) => k.get_value::<String, _>(RUN_VALUE).is_ok()
-            || k.get_value::<String, _>(RUN_VALUE_LEGACY).is_ok(),
+        Ok(k) => k.get_value::<String, _>(RUN_VALUE).is_ok(),
         Err(_) => false,
     }
 }
@@ -383,8 +341,7 @@ pub fn autostart_enabled() -> bool {
 mod tests {
     use super::*;
 
-    /// 谱面音效默认开;旧版 settings.json(无该字段)反序列化后同样
-    /// 保持默认开(serde default),升级用户行为不变。
+    /// 谱面音效默认开。settings.json 缺该字段时同样回落默认开。
     #[test]
     fn beatmap_hitsounds_defaults_on() {
         assert!(Settings::default().beatmap_hitsounds, "默认必须开启谱面音效");
@@ -392,7 +349,7 @@ mod tests {
             "{\"path\":null,\"diff\":null,\"fail\":false,\"speed\":1.0,\"autostart\":false,\"gameplay_hidden\":false}",
         )
         .unwrap();
-        assert!(legacy.beatmap_hitsounds, "旧配置缺字段应回落默认开");
+        assert!(legacy.beatmap_hitsounds, "缺字段应回落默认开");
         // 关闭后持久化为 false,重载读回仍为关
         let mut off = Settings::default();
         off.beatmap_hitsounds = false;
@@ -401,8 +358,8 @@ mod tests {
         assert!(!reread.beatmap_hitsounds, "显式关闭必须被持久化");
     }
 
-    /// 休息段背景变亮壁纸特设默认关(刻意与上游/lazer 的默认开不同);
-    /// 旧 settings.json(无该字段)同样回落默认关。
+    /// 休息段背景变亮壁纸特设默认关(刻意与上游/lazer 的默认开不同)。
+    /// settings.json 缺该字段时同样回落默认关。
     #[test]
     fn break_lighten_defaults_off() {
         assert!(!Settings::default().break_lighten, "壁纸特设:默认关");
@@ -410,6 +367,6 @@ mod tests {
             "{\"path\":null,\"diff\":null,\"fail\":false,\"speed\":1.0,\"autostart\":false,\"gameplay_hidden\":false}",
         )
         .unwrap();
-        assert!(!legacy.break_lighten, "旧配置缺字段应回落默认关");
+        assert!(!legacy.break_lighten, "缺字段应回落默认关");
     }
 }

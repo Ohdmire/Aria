@@ -41,8 +41,7 @@ pub enum Command {
     /// 枚举谱面难度(.osz 内的 .osu 列表;单个 .osu/.osb 为空表),回 [`Event::DiffList`]。
     Probe { path: String },
     /// 加载并播放;已有壁纸窗口时原位切换内容,没有则先创建窗口。
-    /// `fail` 为旧版 storyboard Pass/Fail 开关,autoplay 模式已忽略,
-    /// 保留字段兼容旧父进程。
+    /// `fail` 为 storyboard Pass/Fail 开关。autoplay 壁纸不使用它。
     /// `manifest`:lazer 虚拟文件表(Some = 零拷贝按名解析;None = `path`
     /// 所在目录即素材根,普通路径流)。
     /// `skin`:皮肤目录(lazer 已安装挂载 / stable Skins/ 目录;

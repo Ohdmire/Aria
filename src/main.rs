@@ -1523,13 +1523,16 @@ async fn set_skin(app: AppHandle, path: Option<String>) -> Result<(), String> {
 /// 变更后重载当前曲目。
 #[tauri::command]
 fn set_force_skin_colours(app: AppHandle, on: bool) -> Result<(), String> {
-    let dir = {
+    // 先放开设置锁再解析皮肤目录。resolve_skin_dir 内部会再锁一次
+    // settings,套在这次锁里就是同一线程的死锁,设置界面直接卡住。
+    let stored = {
         let state = app.state::<ctl::WallState>();
         let mut s = state.settings.lock().unwrap();
         s.force_skin_colours = on;
         settings::save(&app, &s);
-        ctl::resolve_skin_dir(&app, &s.skin).map(|p| p.to_string_lossy().into_owned())
+        s.skin.clone()
     };
+    let dir = ctl::resolve_skin_dir(&app, &stored).map(|p| p.to_string_lossy().into_owned());
     ctl::send_cmd(&app, Command::SetSkin { skin: dir, force_colours: on })
 }
 
@@ -1546,9 +1549,6 @@ fn set_render_mode(app: AppHandle, mode: String) -> Result<(), String> {
         let state = app.state::<ctl::WallState>();
         let mut s = state.settings.lock().unwrap();
         s.render_mode = mode.clone();
-        // 同步旧字段,保证下次读取的迁移逻辑推出相同模式
-        s.pure_audio = mode == "off";
-        s.auto_pause_render = mode != "always";
         settings::save(&app, &s);
     }
     ctl::send_cmd(&app, Command::SetRenderMode { mode })

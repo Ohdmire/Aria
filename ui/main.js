@@ -1568,7 +1568,7 @@ async function copyText(text) {
 }
 
 /// 信息条目(`AR 9.6` 一对);单击复制值(手动选中文本时不打扰)。
-/// payload 可选:复制的实际内容与显示值不同时使用(如 bid 复制完整链接)。
+/// payload 可选:复制的实际内容与显示值不同时使用。
 function makeInfoItem(label, value, span, payload) {
   const item = document.createElement('div');
   item.className = 'info-item' + (span > 1 ? ` span${span}` : '');
@@ -1613,7 +1613,7 @@ function renderBeatmapInfo(setId, sha2) {
     if (b.lengthMs > 0) frag.appendChild(makeInfoItem('时长', fmt(b.lengthMs)));
     if (set.creator) frag.appendChild(makeInfoItem('谱师', set.creator));
     if (b.onlineId > 0) {
-      frag.appendChild(makeInfoItem('bid', String(b.onlineId), 1, `https://osu.ppy.sh/b/${b.onlineId}`));
+      frag.appendChild(makeInfoItem('bid', String(b.onlineId)));
     }
   }
   if (set.source) frag.appendChild(makeInfoItem('来源', set.source, 4));

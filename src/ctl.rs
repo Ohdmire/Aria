@@ -303,12 +303,19 @@ fn spawn_child(app: &AppHandle) -> anyhow::Result<ChildCtl> {
 /// 曲目结束:曲库源且非单曲循环 → advance 下一首并加载。
 fn on_ended(app: &AppHandle) {
     if !app.state::<WallState>().from_library.load(Ordering::Relaxed) {
+        log::info!("[playlist] 曲终,但当前不是播放列表曲目,不自动切歌");
         return;
     }
     let next = app.state::<WallState>().playlist.lock().unwrap().advance();
-    if let Some(track) = next {
-        save_playlist(app);
-        let _ = load_track(app, &track);
+    match next {
+        Some(track) => {
+            log::info!("[playlist] 曲终,切到下一首 set={}", track.set_id);
+            save_playlist(app);
+            if let Err(e) = load_track(app, &track) {
+                log::warn!("[playlist] 下一首加载失败: {e}");
+            }
+        }
+        None => log::info!("[playlist] 曲终,没有下一首(单曲循环或列表为空)"),
     }
 }
 
