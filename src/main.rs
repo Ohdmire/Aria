@@ -127,6 +127,10 @@ fn main() {
             set_break_lighten,
             set_cursor,
             set_cursor_size,
+            set_snaking_in,
+            set_snaking_out,
+            set_cursor_trail,
+            set_cursor_ripples,
             set_fade_audio,
             set_gameplay_hidden,
             set_render_mode,
@@ -1273,6 +1277,54 @@ fn set_cursor(app: AppHandle, on: bool) -> Result<(), String> {
         settings::save(&app, &s);
     }
     ctl::send_cmd(&app, Command::SetCursor { on })
+}
+
+/// 滑条渐入(lazer Snaking in sliders,默认开)。实时生效。
+#[tauri::command]
+fn set_snaking_in(app: AppHandle, on: bool) -> Result<(), String> {
+    {
+        let state = app.state::<ctl::WallState>();
+        let mut s = state.settings.lock().unwrap();
+        s.snaking_in = on;
+        settings::save(&app, &s);
+    }
+    ctl::send_cmd(&app, Command::SetSnakingIn { on })
+}
+
+/// 滑条渐出(lazer Snaking out sliders,默认开)。实时生效。
+#[tauri::command]
+fn set_snaking_out(app: AppHandle, on: bool) -> Result<(), String> {
+    {
+        let state = app.state::<ctl::WallState>();
+        let mut s = state.settings.lock().unwrap();
+        s.snaking_out = on;
+        settings::save(&app, &s);
+    }
+    ctl::send_cmd(&app, Command::SetSnakingOut { on })
+}
+
+/// 光标轨迹(lazer Cursor trail,默认开)。关 = 只留光标。实时生效。
+#[tauri::command]
+fn set_cursor_trail(app: AppHandle, on: bool) -> Result<(), String> {
+    {
+        let state = app.state::<ctl::WallState>();
+        let mut s = state.settings.lock().unwrap();
+        s.cursor_trail = on;
+        settings::save(&app, &s);
+    }
+    ctl::send_cmd(&app, Command::SetCursorTrail { on })
+}
+
+/// 光标波纹(lazer Cursor ripples,默认关)。按下时扩出一圈。实时生效。
+#[tauri::command]
+fn set_cursor_ripples(app: AppHandle, on: bool) -> Result<(), String> {
+    {
+        let state = app.state::<ctl::WallState>();
+        let mut s = state.settings.lock().unwrap();
+        s.cursor_ripples = on;
+        settings::save(&app, &s);
+    }
+    ctl::send_cmd(&app, Command::SetCursorRipples { on })
 }
 
 /// 光标大小倍率(0.1–2.0,实时生效;光标与拖尾同步缩放)。

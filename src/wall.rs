@@ -145,7 +145,8 @@ pub fn main() -> i32 {
         }
     };
     let proxy = event_loop.create_proxy();
-    spawn_stdin_reader(proxy.clone());
+    let cmd_inbox = Arc::new(Mutex::new(Vec::<Command>::new()));
+    spawn_stdin_reader(proxy.clone(), cmd_inbox.clone());
 
     // 清理上次会话残留的预处理临时文件(崩溃/断电未及删除的)
     if let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) {
@@ -163,7 +164,7 @@ pub fn main() -> i32 {
     let audio_device = std::env::var("ARIA_AUDIO_DEVICE")
         .ok()
         .filter(|s| !s.is_empty());
-    let mut app = WallApp::new(out, proxy, audio_device, preview);
+    let mut app = WallApp::new(out, proxy, audio_device, preview, cmd_inbox);
     app.rebuild_audio();
     // 设备热拔插事件(kira → wasapi-rs → WASAPI):插回/默认切换即时
     // 响应;订阅失败时内部的轮询探测兜底仍在
@@ -241,6 +242,9 @@ fn write_wav_pcm16(path: &Path, samples: &[f32], sample_rate: u32) -> std::io::R
 /// AudioOut 不参与 serde 协议,不能塞进 [`Command`],单独包一层。
 enum UserEvent {
     Cmd(Command),
+    /// stdin 有命令进了 [`WallApp::cmd_inbox`]。一次唤醒可以排进多条,
+    /// 处理时整表取走,连续的 Load 只留最后一首。
+    CmdPending,
     /// 音频管线异步构建完成(挂到事件循环后接管播放)。
     /// `seq` = 构建序号:超时后重发的构建会作废在途结果。
     AudioBuilt { seq: u64, out: Option<AudioOut> },
@@ -248,7 +252,7 @@ enum UserEvent {
     AudioDevices(Vec<crate::audio::AudioDeviceEvent>),
 }
 
-fn spawn_stdin_reader(proxy: EventLoopProxy<UserEvent>) {
+fn spawn_stdin_reader(proxy: EventLoopProxy<UserEvent>, inbox: Arc<Mutex<Vec<Command>>>) {
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
@@ -259,7 +263,8 @@ fn spawn_stdin_reader(proxy: EventLoopProxy<UserEvent>) {
             }
             match serde_json::from_str::<Command>(line) {
                 Ok(cmd) => {
-                    if proxy.send_event(UserEvent::Cmd(cmd)).is_err() {
+                    inbox.lock().unwrap().push(cmd);
+                    if proxy.send_event(UserEvent::CmdPending).is_err() {
                         return;
                     }
                 }
@@ -699,6 +704,11 @@ struct WallApp {
     cursor_on: bool,
     /// 光标大小倍率(0.1–2.0)。
     cursor_size: f32,
+    /// 滑条渐入 / 渐出 / 光标轨迹 / 光标波纹(lazer 同名设置)。
+    snaking_in: bool,
+    snaking_out: bool,
+    cursor_trail: bool,
+    cursor_ripples: bool,
     /// 隐藏游玩画面模式(只渲染背景 + storyboard;音频/判定照常)。
     gameplay_hidden: bool,
     /// 背景亮度(0.0–1.0;谱面背景存在时生效,实时可调)。
@@ -799,6 +809,12 @@ struct WallApp {
     /// 序号,落地时与当前不符(已切歌/重载)即丢弃,防止旧曲数据热
     /// 替换到新曲上。
     load_seq: u64,
+    /// stdin 命令队列。读取线程只往里推,事件循环整表取走。连续 Load
+    /// 合并成最后一首,避免每首都走完谱面解析、音效解码和 GPU 构建。
+    cmd_inbox: Arc<Mutex<Vec<Command>>>,
+    /// 图集边长上限,首次切歌时探测一次。每次切歌都新建 wgpu Instance
+    /// 去问这个数,会把 DXGI 适配器枚举的开销叠上去。
+    atlas_limit: u32,
 }
 
 impl WallApp {
@@ -807,6 +823,7 @@ impl WallApp {
         proxy: EventLoopProxy<UserEvent>,
         audio_device: Option<String>,
         preview: Option<(u32, u32)>,
+        cmd_inbox: Arc<Mutex<Vec<Command>>>,
     ) -> WallApp {
         WallApp {
             out,
@@ -859,6 +876,10 @@ impl WallApp {
             break_lighten: false, // 壁纸特设:与上游默认相反
             cursor_on: true,
             cursor_size: 1.0,
+            snaking_in: true,
+            snaking_out: true,
+            cursor_trail: true,
+            cursor_ripples: false,
             gameplay_hidden: false,
             bg_opacity: 0.3,
             sb_enabled: true,
@@ -896,7 +917,60 @@ impl WallApp {
             preview_size: preview,
             debug_window: false,
             load_seq: 0,
+            cmd_inbox,
+            atlas_limit: 0,
         }
+    }
+
+    fn atlas_limit(&mut self) -> u32 {
+        if self.atlas_limit == 0 {
+            self.atlas_limit = osu_replay_render::render::Renderer::probe_max_texture_dimension_2d();
+        }
+        self.atlas_limit
+    }
+
+    /// 队列里是否已经有更新的 Load。用来在谱面解析或 GPU 构建前放弃
+    /// 已经被连点切掉的那一首。
+    fn newer_load_waiting(&self) -> bool {
+        self.cmd_inbox
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| matches!(c, Command::Load { .. }))
+    }
+
+    /// 取走当前积压的命令。连续 Load 只保留最后一条。
+    fn drain_commands(&mut self) -> Vec<Command> {
+        let batch = std::mem::take(&mut *self.cmd_inbox.lock().unwrap());
+        if batch.is_empty() {
+            return batch;
+        }
+        let mut out = Vec::with_capacity(batch.len());
+        let mut load: Option<Command> = None;
+        let mut skipped = 0u32;
+        for cmd in batch {
+            match cmd {
+                Command::Load { .. } => {
+                    if load.is_some() {
+                        skipped += 1;
+                    }
+                    load = Some(cmd);
+                }
+                other => {
+                    if let Some(pending) = load.take() {
+                        out.push(pending);
+                    }
+                    out.push(other);
+                }
+            }
+        }
+        if let Some(pending) = load {
+            out.push(pending);
+        }
+        if skipped > 0 {
+            log::info!("[load] 合并连续切歌,跳过中间 {skipped} 首");
+        }
+        out
     }
 
     /// 曲目时长(引擎最后快照 + 1s 收尾)。
@@ -908,6 +982,10 @@ impl WallApp {
     }
 
     fn apply_load(&mut self, event_loop: &ActiveEventLoop, p: LoadParams) {
+        if self.newer_load_waiting() {
+            log::info!("[load] 跳过已被后续切歌取代的加载");
+            return;
+        }
         let mut p = p;
         p.start = p.start.max(0.0);
         self.user_paused = false; // 换曲/重载 = 新的播放意图
@@ -973,6 +1051,10 @@ impl WallApp {
                 return;
             }
         };
+        if self.newer_load_waiting() {
+            log::info!("[load] 解析期间又切歌,放弃本次");
+            return;
+        }
         log::info!("[load] 音频/背景/storyboard 解析");
 
         // 相对名 → 实际路径:虚拟表按名解析(大小写不敏感);普通路径流
@@ -1047,6 +1129,10 @@ impl WallApp {
         // 留存槽位表:谱面音效运行期热切换按它整表重解析(含解析失败的
         // 槽位,开关换层后结论可能不同)
         self.hs_slots = slots.clone();
+        if self.sample_cache.len() > 192 {
+            let marker = p.path.as_str();
+            self.sample_cache.retain(|(k, _), _| k.contains(marker));
+        }
         let mut hs_sounds = HashMap::new();
         for slot in slots {
             let bytes = {
@@ -1083,6 +1169,10 @@ impl WallApp {
         // storyboard 解析/图集/GPU 构建可达数秒("execute" 一类巨型 SB),
         // 全部完成之前**不起播音频** —— 音乐 + 打击音效 + 画面同帧开始,
         // 不会出现"BGM 先响、音效迟半拍"。构建失败降级纯音频继续播。
+        if self.newer_load_waiting() {
+            log::info!("[load] 音效解码期间又切歌,放弃本次 GPU 构建");
+            return;
+        }
         game::apply_skin_combo_colours(&mut game_data, &resolved_skin, p.force_colours);
         self.clear_old_render();
         self.game = Some(Arc::new(game_data));
@@ -1197,9 +1287,6 @@ impl WallApp {
             w.request_redraw();
         }
 
-        // 加载路径的瞬态(字体光栅 × 5 套、背景 + 模糊副本、皮肤贴图解码、
-        // 快照重排)已死,修剪把堆保留页还给 OS
-        win::trim_working_set();
     }
 
     /// 曲终(BGM 流已终结)后的 seek 重建:按当前会话形态重启流式声 ——
@@ -1379,8 +1466,9 @@ impl WallApp {
             self.list.finish();
             surf.render(&self.list, CLEAR);
         }
+        // 窗口和 SurfaceRenderer 留下复用。每首重建 wgpu Instance / 设备
+        // 是连续切歌越来越卡的主要来源。
         self.sb_layer = None;
-        self.surf = None;
         self.atlas = None;
         self.fonts = None;
         self.scene = None;
@@ -1538,7 +1626,12 @@ impl WallApp {
             .window_handle()
             .map_err(|e| format!("window handle: {e}"))?
             .as_raw();
-        let Some(source) = self.source.as_ref() else { return Err("会话缺谱面来源".into()) };
+        let atlas_max = self.atlas_limit();
+        let existing_surf = self.surf.take();
+        let Some(source) = self.source.as_ref() else {
+            self.surf = existing_surf;
+            return Err("会话缺谱面来源".into());
+        };
         prep_render_session(
             game,
             skin,
@@ -1552,6 +1645,10 @@ impl WallApp {
             self.break_lighten,
             self.cursor_on,
             self.cursor_size,
+            self.snaking_in,
+            self.snaking_out,
+            self.cursor_trail,
+            self.cursor_ripples,
             self.gameplay_hidden,
             self.bg_opacity,
             self.sb_enabled,
@@ -1561,6 +1658,8 @@ impl WallApp {
             self.ffprobe_bin.as_deref(),
             self.upscale,
             start_ms,
+            existing_surf,
+            atlas_max,
         )
     }
 
@@ -2231,6 +2330,10 @@ impl WallApp {
             scene.break_lighten = self.break_lighten;
             scene.show_cursor = self.cursor_on;
             scene.cursor_size = self.cursor_size;
+            scene.snaking_in = self.snaking_in;
+            scene.snaking_out = self.snaking_out;
+            scene.show_cursor_trail = self.cursor_trail;
+            scene.show_cursor_ripples = self.cursor_ripples;
             scene.hud.ur_bar = false; // autoplay 无 UR/热图意义,恒关
             scene.hud.offset_heatmap = false;
             scene.gameplay_hidden = self.gameplay_hidden;
@@ -2456,6 +2559,10 @@ fn prep_render_session(
     break_lighten: bool,
     cursor_on: bool,
     cursor_size: f32,
+    snaking_in: bool,
+    snaking_out: bool,
+    cursor_trail: bool,
+    cursor_ripples: bool,
     gameplay_hidden: bool,
     bg_opacity: f32,
     storyboard: bool,
@@ -2465,6 +2572,8 @@ fn prep_render_session(
     ffprobe_bin: Option<&std::path::Path>,
     upscale: osu_replay_render::UpscaleMode,
     start_ms: f32,
+    existing_surf: Option<SurfaceRenderer>,
+    atlas_max_dim: u32,
 ) -> Result<RenderSession, String> {
     // 相对名解析(背景/storyboard 素材;来自保留的谱面来源)
     let resolve = |name: &str| -> Option<PathBuf> {
@@ -2558,7 +2667,6 @@ fn prep_render_session(
     // 写死 8192 时大皮肤(@2x,如 Bring it on)塞不下会整包 ×0.9 降采样,
     // note 贴图变小而滑条 body 是矢量不变,观感"note 小/滑条粗";
     // 8192 上限的设备自动保留 build_atlas 内的降采样兜底。
-    let atlas_max_dim = osu_replay_render::render::Renderer::probe_max_texture_dimension_2d();
     let (mut atlas, fonts) = build_atlas(
         bg_image,
         Some(w as f32 / h.max(1) as f32),
@@ -2575,9 +2683,18 @@ fn prep_render_session(
         atlas_max_dim
     );
 
-    // SurfaceRenderer:内部 16:9 场景 letterbox 到桌面比例
-    let surf = SurfaceRenderer::new(w, h, &atlas, raw_display, raw_window)
-        .map_err(|e| format!("初始化渲染失败: {e}"))?;
+    // 同一窗口、同一场景尺寸时复用设备和 surface。只换图集。
+    // 场景尺寸变了(换显示器)才整套重建。
+    let surf = match existing_surf {
+        Some(mut surf) if surf.scene_size() == (w, h) => {
+            log::info!("[load] 复用渲染设备,只换图集");
+            surf.set_atlas(&atlas);
+            surf.resize(desk.0, desk.1);
+            surf
+        }
+        _ => SurfaceRenderer::new(w, h, &atlas, raw_display, raw_window)
+            .map_err(|e| format!("初始化渲染失败: {e}"))?,
+    };
     // 像素已上传 GPU,释放 CPU 侧图集副本(4096² = 64MB;壁纸端不用
     // set_atlas 热换,区域矩形查询不受影响)
     atlas.release_cpu_copy();
@@ -2646,6 +2763,10 @@ fn prep_render_session(
     scene.break_lighten = break_lighten;
     scene.show_cursor = cursor_on;
     scene.cursor_size = cursor_size.clamp(0.1, 2.0);
+    scene.snaking_in = snaking_in;
+    scene.snaking_out = snaking_out;
+    scene.show_cursor_trail = cursor_trail;
+    scene.show_cursor_ripples = cursor_ripples;
     // autoplay 完美命中:UR 条与偏移热图永远无信息量,壁纸恒关
     //(上游默认 ur_bar 开,必须显式压掉)。
     scene.hud.ur_bar = false;
@@ -2673,6 +2794,21 @@ fn prep_render_session(
 }
 
 impl WallApp {
+    /// 处理 stdin 积压。连续 Load 在 [`Self::drain_commands`] 里已经并成
+    /// 最后一首;这里再套一层,加载过程中新到的切歌会让本次提前退出,
+    /// 回来立刻做最新的那首。
+    fn flush_commands(&mut self, event_loop: &ActiveEventLoop) {
+        loop {
+            let batch = self.drain_commands();
+            if batch.is_empty() {
+                break;
+            }
+            for cmd in batch {
+                self.handle_command(event_loop, cmd);
+            }
+        }
+    }
+
     /// stdin 命令分发。
     fn handle_command(&mut self, event_loop: &ActiveEventLoop, cmd: Command) {
         match cmd {
@@ -2993,6 +3129,30 @@ impl WallApp {
                     scene.cursor_size = self.cursor_size;
                 }
             }
+            Command::SetSnakingIn { on } => {
+                self.snaking_in = on;
+                if let Some(scene) = &mut self.scene {
+                    scene.snaking_in = on;
+                }
+            }
+            Command::SetSnakingOut { on } => {
+                self.snaking_out = on;
+                if let Some(scene) = &mut self.scene {
+                    scene.snaking_out = on;
+                }
+            }
+            Command::SetCursorTrail { on } => {
+                self.cursor_trail = on;
+                if let Some(scene) = &mut self.scene {
+                    scene.show_cursor_trail = on;
+                }
+            }
+            Command::SetCursorRipples { on } => {
+                self.cursor_ripples = on;
+                if let Some(scene) = &mut self.scene {
+                    scene.show_cursor_ripples = on;
+                }
+            }
             Command::SetSkin { skin, force_colours } => {
                 let same = self.last_load.as_ref().is_some_and(|l| l.skin == skin);
                 if same {
@@ -3102,6 +3262,7 @@ impl ApplicationHandler<UserEvent> for WallApp {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, ev: UserEvent) {
         match ev {
             UserEvent::Cmd(cmd) => self.handle_command(event_loop, cmd),
+            UserEvent::CmdPending => self.flush_commands(event_loop),
             UserEvent::AudioBuilt { seq, out } => self.attach_audio(seq, out),
             UserEvent::AudioDevices(evs) => self.on_device_events(&evs),
         }

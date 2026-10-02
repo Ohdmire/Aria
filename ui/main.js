@@ -1698,6 +1698,10 @@ window.__TAURI__.app?.getVersion?.()
     $('reduce-anim').checked = !!s.reduce_anim;
     $('break-lighten').checked = !!s.break_lighten;
     $('cursor').checked = s.cursor ?? true;
+    $('snaking-in').checked = s.snaking_in ?? true;
+    $('snaking-out').checked = s.snaking_out ?? true;
+    $('cursor-trail').checked = s.cursor_trail ?? true;
+    $('cursor-ripples').checked = !!s.cursor_ripples;
     const csz = s.cursor_size ?? 1;
     $('cursor-size').value = String(csz);
     $('cursor-size-val').textContent = `${Math.round(csz * 100)}%`;
@@ -2286,6 +2290,18 @@ $('break-lighten').addEventListener('change', () => {
 // 光标渲染(实时生效)
 $('cursor').addEventListener('change', () => {
   invoke('set_cursor', { on: $('cursor').checked }).catch((e) => toast(`${e}`));
+});
+$('snaking-in').addEventListener('change', () => {
+  invoke('set_snaking_in', { on: $('snaking-in').checked }).catch((e) => toast(`${e}`));
+});
+$('snaking-out').addEventListener('change', () => {
+  invoke('set_snaking_out', { on: $('snaking-out').checked }).catch((e) => toast(`${e}`));
+});
+$('cursor-trail').addEventListener('change', () => {
+  invoke('set_cursor_trail', { on: $('cursor-trail').checked }).catch((e) => toast(`${e}`));
+});
+$('cursor-ripples').addEventListener('change', () => {
+  invoke('set_cursor_ripples', { on: $('cursor-ripples').checked }).catch((e) => toast(`${e}`));
 });
 // 光标大小(实时生效)
 $('cursor-size').addEventListener('input', () => {

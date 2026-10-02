@@ -219,7 +219,7 @@ fn spawn_child(app: &AppHandle) -> anyhow::Result<ChildCtl> {
     let stdout = child.stdout.take().expect("piped stdout");
 
     // 先按保存的音量/HUD/渲染模式/背景亮度/总音量/日志/调试窗口设置子进程,再开始转发事件
-    let (bgm_vol, hits_on, hits_vol, hud, pp, hit_anim, brk_lighten, cursor_on, cursor_sz, render_mode, bg_opacity, master, offset, ghidden, fade, ffmpeg, ffprobe, log_on, debug_win) = {
+    let (bgm_vol, hits_on, hits_vol, hud, pp, hit_anim, brk_lighten, cursor_on, cursor_sz, snaking_in, snaking_out, cursor_trail, cursor_ripples, render_mode, bg_opacity, master, offset, ghidden, fade, ffmpeg, ffprobe, log_on, debug_win) = {
         let state = app.state::<WallState>();
         let s = state.settings.lock().unwrap();
         (
@@ -232,6 +232,10 @@ fn spawn_child(app: &AppHandle) -> anyhow::Result<ChildCtl> {
             s.break_lighten,
             s.cursor,
             s.cursor_size,
+            s.snaking_in,
+            s.snaking_out,
+            s.cursor_trail,
+            s.cursor_ripples,
             s.render_mode.clone(),
             s.bg_opacity,
             s.master_volume,
@@ -257,6 +261,10 @@ fn spawn_child(app: &AppHandle) -> anyhow::Result<ChildCtl> {
         let bl_cmd = serde_json::to_string(&Command::SetBreakLighten { on: brk_lighten }).unwrap();
         let cur_cmd = serde_json::to_string(&Command::SetCursor { on: cursor_on }).unwrap();
         let curs_cmd = serde_json::to_string(&Command::SetCursorSize { x: cursor_sz }).unwrap();
+        let snake_in_cmd = serde_json::to_string(&Command::SetSnakingIn { on: snaking_in }).unwrap();
+        let snake_out_cmd = serde_json::to_string(&Command::SetSnakingOut { on: snaking_out }).unwrap();
+        let trail_cmd = serde_json::to_string(&Command::SetCursorTrail { on: cursor_trail }).unwrap();
+        let ripple_cmd = serde_json::to_string(&Command::SetCursorRipples { on: cursor_ripples }).unwrap();
         let mode_cmd = serde_json::to_string(&Command::SetRenderMode { mode: render_mode }).unwrap();
         let dbg_cmd = serde_json::to_string(&Command::SetDebugWindow { on: debug_win }).unwrap();
         let bg_cmd = serde_json::to_string(&Command::SetBgOpacity { v: bg_opacity }).unwrap();
@@ -267,7 +275,7 @@ fn spawn_child(app: &AppHandle) -> anyhow::Result<ChildCtl> {
         let bins_cmd = serde_json::to_string(&Command::SetFfmpegBins { ffmpeg, ffprobe }).unwrap();
         let log_cmd = serde_json::to_string(&Command::SetLog { on: log_on }).unwrap();
         let _ = (&stdin).write_all(
-            format!("{vol_cmd}\n{hits_cmd}\n{hud_cmd}\n{pp_cmd}\n{ha_cmd}\n{bl_cmd}\n{cur_cmd}\n{curs_cmd}\n{mode_cmd}\n{dbg_cmd}\n{bg_cmd}\n{master_cmd}\n{offset_cmd}\n{gh_cmd}\n{fade_cmd}\n{bins_cmd}\n{log_cmd}\n").as_bytes(),
+            format!("{vol_cmd}\n{hits_cmd}\n{hud_cmd}\n{pp_cmd}\n{ha_cmd}\n{bl_cmd}\n{cur_cmd}\n{curs_cmd}\n{snake_in_cmd}\n{snake_out_cmd}\n{trail_cmd}\n{ripple_cmd}\n{mode_cmd}\n{dbg_cmd}\n{bg_cmd}\n{master_cmd}\n{offset_cmd}\n{gh_cmd}\n{fade_cmd}\n{bins_cmd}\n{log_cmd}\n").as_bytes(),
         );
     }
 

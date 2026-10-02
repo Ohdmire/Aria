@@ -131,6 +131,14 @@ pub enum Command {
     SetCursor { on: bool },
     /// 光标大小倍率(0.1–2.0,实时生效;光标与拖尾同步缩放)。
     SetCursorSize { x: f32 },
+    /// 滑条渐入(lazer SnakingInSliders,实时生效)。
+    SetSnakingIn { on: bool },
+    /// 滑条渐出(lazer SnakingOutSliders,实时生效)。
+    SetSnakingOut { on: bool },
+    /// 光标轨迹(lazer ShowCursorTrail,实时生效)。关 = 只留光标。
+    SetCursorTrail { on: bool },
+    /// 光标波纹(lazer ShowCursorRipples,实时生效)。
+    SetCursorRipples { on: bool },
     /// 皮肤热切换(不重载不重解析):重解皮肤 → 重打包图集 →
     /// set_atlas 热换 GPU 纹理 → 重置皮肤缓存 → 重涂 combo 色 →
     /// 热换打击音效采样。音频/时钟/判定/storyboard 全部保留;

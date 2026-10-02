@@ -76,6 +76,18 @@ pub struct Settings {
     /// 光标大小倍率(0.1–2.0,同上游 --cursor-size;光标与拖尾同步缩放)。
     #[serde(default = "default_cursor_size")]
     pub cursor_size: f32,
+    /// 滑条渐入(lazer Snaking in sliders,默认开)。
+    #[serde(default = "default_true")]
+    pub snaking_in: bool,
+    /// 滑条渐出(lazer Snaking out sliders,默认开)。
+    #[serde(default = "default_true")]
+    pub snaking_out: bool,
+    /// 光标轨迹(lazer Cursor trail,默认开)。关 = 只留光标。
+    #[serde(default = "default_true")]
+    pub cursor_trail: bool,
+    /// 光标波纹(lazer Cursor ripples,默认关)。按下时扩出一圈。
+    #[serde(default)]
+    pub cursor_ripples: bool,
     /// 隐藏游玩画面模式:只渲染背景 + storyboard(隐藏 note/光标等;音频照常)。
     pub gameplay_hidden: bool,
     /// 渲染模式:"always"(始终渲染)/ "autopause"(全屏/最大化遮挡时不渲染
@@ -253,6 +265,10 @@ impl Default for Settings {
             break_lighten: false,
             cursor: true,
             cursor_size: default_cursor_size(),
+            snaking_in: true,
+            snaking_out: true,
+            cursor_trail: true,
+            cursor_ripples: false,
             gameplay_hidden: false,
             render_mode: default_render_mode(),
             ffmpeg: None,
