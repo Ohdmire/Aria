@@ -42,6 +42,7 @@ osu! 是 Ppy Pty Ltd 的游戏;本项目与 ppy 无关 · MIT License
 
 ```bash
 cargo build --release
+pnpm build:setup:all
 ```
 
 ## 赞助
