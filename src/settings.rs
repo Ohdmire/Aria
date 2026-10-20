@@ -4,6 +4,36 @@
 use serde::{Deserialize, Serialize};
 
 use crate::playlist::PlayMode;
+use std::collections::HashMap;
+
+/// 单个谱面集(歌曲)的个性设置。None = 跟随全局;`enabled = false` 时整体
+/// 跟随全局(保留已填值,方便再次开启)。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SetOverride {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub storyboard: Option<bool>,
+    #[serde(default)]
+    pub audio_offset_ms: Option<f32>,
+    #[serde(default)]
+    pub bg_opacity: Option<f32>,
+    #[serde(default)]
+    pub hitsound: Option<bool>,
+    #[serde(default)]
+    pub beatmap_hitsounds: Option<bool>,
+}
+
+/// 某谱面集实际生效的播放参数(个性设置覆盖后的结果)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EffectiveMedia {
+    pub storyboard: bool,
+    pub beatmap_hitsounds: bool,
+    pub bg_opacity: f32,
+    pub audio_offset_ms: f32,
+    /// 已按打击音效开关折算(关 = 0)。
+    pub hits_volume: f32,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -164,6 +194,24 @@ pub struct Settings {
     /// 快速导入应用的默认 mods(osu! legacy 位,0 = 无)。
     #[serde(default)]
     pub quick_mods: u32,
+    /// 曲名 / 作者优先显示 Unicode 原名(默认开;关 = 罗马音 / 英文)。
+    #[serde(default = "default_true")]
+    pub display_unicode: bool,
+    /// 全局快捷键总开关(默认关:不开机注册任何热键)。
+    #[serde(default)]
+    pub hotkeys_enabled: bool,
+    /// 上一首组合键(如 `Ctrl+Alt+Left`;None/空 = 不绑定,默认留空)。
+    #[serde(default)]
+    pub hotkey_prev: Option<String>,
+    /// 播放/暂停组合键(默认留空)。
+    #[serde(default)]
+    pub hotkey_toggle: Option<String>,
+    /// 下一首组合键(默认留空)。
+    #[serde(default)]
+    pub hotkey_next: Option<String>,
+    /// 谱面集个性设置(set_id → override);只包含用户改过的集。
+    #[serde(default)]
+    pub set_overrides: HashMap<String, SetOverride>,
     /// 播放列表持久化(用户手动增删的队列 + 当前位置)。
     #[serde(default)]
     pub playlist: Vec<SavedTrack>,
@@ -292,8 +340,42 @@ impl Default for Settings {
             dblclick_add: false,
             quick_add: true,
             quick_mods: 0,
+            display_unicode: true,
+            hotkeys_enabled: false,
+            hotkey_prev: None,
+            hotkey_toggle: None,
+            hotkey_next: None,
+            set_overrides: HashMap::new(),
             playlist: Vec::new(),
             playlist_pos: 0,
+        }
+    }
+}
+
+impl Settings {
+    /// 某谱面集实际生效的播放参数:个性设置开启时逐项覆盖全局,
+    /// 未填(None)的项继续跟随全局。数值统一钳位,避免坏存档。
+    pub fn effective_for(&self, set_id: &str) -> EffectiveMedia {
+        let over = self.set_overrides.get(set_id).filter(|o| o.enabled);
+        let storyboard = over.and_then(|o| o.storyboard).unwrap_or(self.storyboard);
+        let beatmap_hitsounds = over
+            .and_then(|o| o.beatmap_hitsounds)
+            .unwrap_or(self.beatmap_hitsounds);
+        let hitsound = over.and_then(|o| o.hitsound).unwrap_or(self.hitsound);
+        let bg_opacity = over.and_then(|o| o.bg_opacity).unwrap_or(self.bg_opacity);
+        let audio_offset_ms = over
+            .and_then(|o| o.audio_offset_ms)
+            .unwrap_or(self.audio_offset_ms);
+        EffectiveMedia {
+            storyboard,
+            beatmap_hitsounds,
+            bg_opacity: bg_opacity.clamp(0.0, 1.0),
+            audio_offset_ms: audio_offset_ms.clamp(-1000.0, 1000.0),
+            hits_volume: if hitsound {
+                self.hits_volume.clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
         }
     }
 }
@@ -384,5 +466,84 @@ mod tests {
         )
         .unwrap();
         assert!(!legacy.break_lighten, "缺字段应回落默认关");
+    }
+
+    /// 全局快捷键默认关闭,且不预设任何组合(留给用户自行填写)。
+    #[test]
+    fn hotkeys_default_off_and_empty() {
+        let d = Settings::default();
+        assert!(!d.hotkeys_enabled, "快捷键默认必须关闭");
+        assert_eq!(d.hotkey_prev, None);
+        assert_eq!(d.hotkey_toggle, None);
+        assert_eq!(d.hotkey_next, None);
+        let legacy = serde_json::from_str::<Settings>(
+            "{\"path\":null,\"diff\":null,\"fail\":false,\"speed\":1.0,\"autostart\":false,\"gameplay_hidden\":false}",
+        )
+        .unwrap();
+        assert!(!legacy.hotkeys_enabled, "缺字段应回落默认关");
+        assert_eq!(legacy.hotkey_next, None, "缺字段不指定默认快捷键");
+    }
+
+    /// 曲名默认按 Unicode 原名显示(旧设置缺字段时同样默认勾选)。
+    #[test]
+    fn display_unicode_defaults_on() {
+        assert!(Settings::default().display_unicode, "Unicode 显示默认开");
+        let legacy = serde_json::from_str::<Settings>(
+            "{\"path\":null,\"diff\":null,\"fail\":false,\"speed\":1.0,\"autostart\":false,\"gameplay_hidden\":false}",
+        )
+        .unwrap();
+        assert!(legacy.display_unicode, "缺字段应回落默认开");
+    }
+
+    /// 谱面集个性设置:关闭时整体跟随全局;开启后逐项覆盖,未填项回退全局。
+    #[test]
+    fn set_override_effective_media() {
+        let mut s = Settings::default();
+        s.storyboard = true;
+        s.beatmap_hitsounds = true;
+        s.hitsound = true;
+        s.hits_volume = 0.8;
+        s.bg_opacity = 0.7;
+        s.audio_offset_ms = 0.0;
+
+        // 无条目 / enabled=false:完全跟随全局
+        let base = s.effective_for("s1");
+        assert_eq!(base.storyboard, true);
+        assert_eq!(base.hits_volume, 0.8);
+        s.set_overrides.insert(
+            "s1".into(),
+            SetOverride {
+                enabled: false,
+                storyboard: Some(false),
+                audio_offset_ms: Some(120.0),
+                bg_opacity: Some(0.2),
+                hitsound: Some(false),
+                beatmap_hitsounds: Some(false),
+            },
+        );
+        assert_eq!(s.effective_for("s1"), base, "未开启时忽略全部覆盖");
+
+        // 开启后:覆盖项生效,未填项跟随全局
+        s.set_overrides.get_mut("s1").unwrap().enabled = true;
+        let over = s.effective_for("s1");
+        assert!(!over.storyboard);
+        assert!(!over.beatmap_hitsounds);
+        assert_eq!(over.bg_opacity, 0.2);
+        assert_eq!(over.audio_offset_ms, 120.0);
+        assert_eq!(over.hits_volume, 0.0, "关闭打击音效 = 音量 0");
+
+        // 只覆盖部分字段:其余仍用全局
+        s.set_overrides.insert(
+            "s2".into(),
+            SetOverride {
+                enabled: true,
+                bg_opacity: Some(1.5),
+                ..Default::default()
+            },
+        );
+        let partial = s.effective_for("s2");
+        assert!(partial.storyboard, "未覆盖 storyboard 跟随全局");
+        assert_eq!(partial.bg_opacity, 1.0, "坏值钳位");
+        assert_eq!(partial.audio_offset_ms, 0.0);
     }
 }

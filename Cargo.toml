@@ -1,6 +1,6 @@
 [package]
 name = "aria"
-version = "1.3.6"
+version = "1.3.7"
 edition = "2024"
 license = "MIT"
 description = "Aria(ATRI rhythm interactive animation)—— osu! storyboard 桌面动态壁纸播放器"
@@ -43,6 +43,7 @@ tauri-plugin-dialog = "2"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
     "Win32_System_Threading",

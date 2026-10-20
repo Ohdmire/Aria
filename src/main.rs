@@ -10,6 +10,7 @@
 
 mod audio;
 mod ctl;
+mod hotkeys;
 mod ipc;
 mod lazer;
 mod loader;
@@ -96,6 +97,10 @@ fn main() {
             set_dblclick_add,
             set_quick_add,
             set_quick_mods,
+            set_display_unicode,
+            set_set_override,
+            clear_set_overrides,
+            set_hotkeys,
             quit_app,
             library_refresh,
             source_set,
@@ -194,7 +199,12 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     if st.log_enabled {
         logging::set_enabled(true);
     }
+    // 全局快捷键:默认关闭/无默认组合;已保存并启用的组合在专用线程注册
+    // (先托管 WallState:快捷键线程可能立即分发动作,需要读播放列表状态)
     app.manage(ctl::WallState::new(st));
+    let hotkey_settings = app.state::<ctl::WallState>().settings.lock().unwrap().clone();
+    let hotkey_manager = hotkeys::init(app.handle().clone(), &hotkey_settings);
+    app.manage(hotkey_manager);
 
     build_tray(app)?;
 
@@ -556,7 +566,10 @@ async fn source_set(app: AppHandle, source: String) -> Result<(), String> {
 async fn queue(app: AppHandle) -> Result<Vec<QueueItem>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<ctl::WallState>();
-        let target = state.settings.lock().unwrap().target_star;
+        let (target, unicode) = {
+            let s = state.settings.lock().unwrap();
+            (s.target_star, s.display_unicode)
+        };
         let lib = ctl::library_cached(&app);
         let playlist = state.playlist.lock().unwrap();
         let current = playlist.current();
@@ -591,14 +604,15 @@ async fn queue(app: AppHandle) -> Result<Vec<QueueItem>, String> {
                 .as_ref()
                 .and_then(|s| set.beatmaps.iter().find(|b| b.sha2 == *s))
                 .unwrap_or_else(|| playlist::pick_diff(set, playlist::policy_of(target)));
+            let (title, artist) = playlist::display_meta(set, unicode);
             items.push(QueueItem {
                 qid: track.qid,
                 set_id: track.set_id.clone(),
                 sha2: diff.sha2.clone(),
                 mods: track.mods,
                 locked: track.sha2.is_some(),
-                title: if set.title_unicode.is_empty() { set.title.clone() } else { set.title_unicode.clone() },
-                artist: if set.artist_unicode.is_empty() { set.artist.clone() } else { set.artist_unicode.clone() },
+                title,
+                artist,
                 diff: diff.name.clone(),
                 star: diff.star_rating,
                 length_ms: diff.length_ms,
@@ -645,11 +659,15 @@ pub struct BatchAdd {
     pub target: Option<f64>,
 }
 
-/// 入列条目的显示快照(标题/艺术家按 Unicode 优先;时长取指定难度,
-/// 谱面集级条目按目标星级解析 —— 与播放/队列显示同一口径)。
-fn track_display_meta(set: &lazer::LazerSet, sha2: Option<&str>, target: Option<f64>) -> (String, String, f64) {
-    let title = if set.title_unicode.is_empty() { set.title.clone() } else { set.title_unicode.clone() };
-    let artist = if set.artist_unicode.is_empty() { set.artist.clone() } else { set.artist_unicode.clone() };
+/// 入列条目的显示快照(标题/艺术家按当前 Unicode 显示偏好;时长取指定
+/// 难度,谱面集级条目按目标星级解析 —— 与播放/队列显示同一口径)。
+fn track_display_meta(
+    set: &lazer::LazerSet,
+    sha2: Option<&str>,
+    target: Option<f64>,
+    unicode: bool,
+) -> (String, String, f64) {
+    let (title, artist) = playlist::display_meta(set, unicode);
     let diff = sha2
         .and_then(|s| set.beatmaps.iter().find(|b| b.sha2 == s))
         .unwrap_or_else(|| playlist::pick_diff(set, playlist::policy_of(target)));
@@ -674,14 +692,17 @@ async fn playlist_add(
         let state = app2.state::<ctl::WallState>();
         let source = state.settings.lock().unwrap().source.clone();
         let lib = ctl::library(&app2, &source, false)?;
-        let target = state.settings.lock().unwrap().target_star;
+        let (target, unicode) = {
+            let s = state.settings.lock().unwrap();
+            (s.target_star, s.display_unicode)
+        };
         let Some(set) = lib.sets.iter().find(|s| s.id == set_id) else {
             return Err::<_, String>("谱面集不在曲库中".into());
         };
         // 显式 sha2(难度 chip 右键)优先;否则按策略挑最相近锁定
         let sha2 = sha2
             .or_else(|| Some(playlist::pick_diff(set, playlist::policy_of(target)).sha2.clone()));
-        let (title, artist, length_ms) = track_display_meta(set, sha2.as_deref(), target);
+        let (title, artist, length_ms) = track_display_meta(set, sha2.as_deref(), target, unicode);
         let mut playlist = state.playlist.lock().unwrap();
         let added = playlist.add(set_id.clone(), sha2, mods, title, artist, length_ms);
         let current_hit =
@@ -706,7 +727,10 @@ async fn playlist_add_batch(app: AppHandle, items: Vec<BatchAdd>) -> Result<usiz
         let state = app2.state::<ctl::WallState>();
         let source = state.settings.lock().unwrap().source.clone();
         let lib = ctl::library(&app2, &source, false)?;
-        let target = state.settings.lock().unwrap().target_star;
+        let (target, unicode) = {
+            let s = state.settings.lock().unwrap();
+            (s.target_star, s.display_unicode)
+        };
         let mut added = 0usize;
         {
             let mut playlist = state.playlist.lock().unwrap();
@@ -719,7 +743,7 @@ async fn playlist_add_batch(app: AppHandle, items: Vec<BatchAdd>) -> Result<usiz
                     Some(playlist::pick_diff(set, playlist::policy_of(item.target)).sha2.clone())
                 });
                 let (title, artist, length_ms) =
-                    track_display_meta(set, sha2.as_deref(), target);
+                    track_display_meta(set, sha2.as_deref(), target, unicode);
                 playlist.add(item.set_id.clone(), sha2, item.mods, title, artist, length_ms);
                 added += 1;
             }
@@ -996,6 +1020,18 @@ fn set_audio_device(app: AppHandle, id: Option<String>) -> Result<(), String> {
     Ok(())
 }
 
+/// 当前正在播放的曲库谱面集实际生效参数(个性设置覆盖后);没有曲库曲目
+/// / 手动文件播放时返回 None(调用方用全局值)。
+fn current_effective(app: &AppHandle) -> Option<settings::EffectiveMedia> {
+    let state = app.state::<ctl::WallState>();
+    if !state.from_library.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let s = state.settings.lock().unwrap();
+    let set_id = s.lazer_set.as_deref()?;
+    Some(s.effective_for(set_id))
+}
+
 /// 打击音效开关(关 = 音量 0)。
 #[tauri::command]
 fn set_hitsound(app: AppHandle, on: bool) -> Result<(), String> {
@@ -1006,35 +1042,42 @@ fn set_hitsound(app: AppHandle, on: bool) -> Result<(), String> {
         settings::save(&app, &s);
         if on { s.hits_volume } else { 0.0 }
     };
+    // 当前谱面集有 hitsound 个性设置时,以它的实际生效值为准
+    let v = current_effective(&app).map(|e| e.hits_volume).unwrap_or(v);
     ctl::send_cmd(&app, Command::SetHitsVolume { v })
 }
 
 /// 打击音效音量(仅在开关开启时生效)。
 #[tauri::command]
 fn set_hits_volume(app: AppHandle, v: f32) -> Result<(), String> {
-    let send = {
+    let (send, v) = {
         let state = app.state::<ctl::WallState>();
         let mut s = state.settings.lock().unwrap();
         s.hits_volume = v.clamp(0.0, 1.0);
         settings::save(&app, &s);
-        s.hitsound
+        (s.hitsound, v.clamp(0.0, 1.0))
     };
-    if send {
-        ctl::send_cmd(&app, Command::SetHitsVolume { v: v.clamp(0.0, 1.0) })?;
-    }
-    Ok(())
+    // 当前谱面集个性设置可能改写了开关(甚至开/关与全局相反)
+    let v = match current_effective(&app) {
+        Some(e) => e.hits_volume,
+        None if send => v,
+        None => return Ok(()),
+    };
+    ctl::send_cmd(&app, Command::SetHitsVolume { v })
 }
 
 /// 音效偏移(ms):正值 = 提前,负值 = 延后;实时生效。
 #[tauri::command]
 fn set_audio_offset(app: AppHandle, ms: f32) -> Result<(), String> {
-    {
+    let ms = {
         let state = app.state::<ctl::WallState>();
         let mut s = state.settings.lock().unwrap();
         s.audio_offset_ms = ms.clamp(-1000.0, 1000.0);
         settings::save(&app, &s);
-    }
-    ctl::send_cmd(&app, Command::SetOffset { ms: ms.clamp(-1000.0, 1000.0) })
+        s.audio_offset_ms
+    };
+    let ms = current_effective(&app).map(|e| e.audio_offset_ms).unwrap_or(ms);
+    ctl::send_cmd(&app, Command::SetOffset { ms })
 }
 
 /// 总音量(主增益):同时作用于音乐与打击音效。
@@ -1111,14 +1154,16 @@ fn set_target_star(app: AppHandle, star: Option<f64>) -> Result<(), String> {
     Ok(())
 }
 
-/// 实际正在播放的曲库曲目(含手动选定难度;谱面集级/策略挑选 = sha2 None)。
-/// `load_track` 每次载入都同步 lazer_set/lazer_sha2,这里即播放真相:
-/// 前端 loaded 事件以此对齐,难度下拉跟随真实播放(手动改难度只作用
-/// 当前曲目,队列自动切歌后回到「自动」)。
+/// 实际正在播放的曲库曲目(含策略解析后的真实难度;谱面集级条目也会
+/// 带上本次实际挑中的 sha2)。`load_track` 每次载入都同步 lazer_set 与
+/// 运行期的 loaded_sha2,这里即播放真相:前端 loaded 事件/轮询兜底以
+/// 此对齐,难度下拉跟随真实播放。
 #[tauri::command]
 fn playing_track(app: AppHandle) -> Option<crate::playlist::Track> {
-    let s = app.state::<ctl::WallState>().settings.lock().unwrap().clone();
-    s.lazer_set.map(|set_id| crate::playlist::Track { set_id, sha2: s.lazer_sha2, qid: 0, ..Default::default() })
+    let state = app.state::<ctl::WallState>();
+    let set_id = state.settings.lock().unwrap().lazer_set.clone();
+    let sha2 = state.loaded_sha2.lock().unwrap().clone();
+    set_id.map(|set_id| crate::playlist::Track { set_id, sha2, qid: 0, ..Default::default() })
 }
 
 /// 曲库全局星级下限(0 = 不过滤)。
@@ -1609,13 +1654,16 @@ fn set_render_mode(app: AppHandle, mode: String) -> Result<(), String> {
 /// 背景亮度(0.0–1.0),实时生效。
 #[tauri::command]
 fn set_bg_opacity(app: AppHandle, v: f32) -> Result<(), String> {
-    {
+    let v = {
         let state = app.state::<ctl::WallState>();
         let mut s = state.settings.lock().unwrap();
         s.bg_opacity = v.clamp(0.0, 1.0);
         settings::save(&app, &s);
-    }
-    ctl::send_cmd(&app, Command::SetBgOpacity { v: v.clamp(0.0, 1.0) })
+        s.bg_opacity
+    };
+    // 当前谱面集覆盖了背景亮度时,全局改动不打断它的生效值
+    let v = current_effective(&app).map(|e| e.bg_opacity).unwrap_or(v);
+    ctl::send_cmd(&app, Command::SetBgOpacity { v })
 }
 
 /// 加载期开关(HD/storyboard/视频)变更后:正在播曲库曲目则立即重载
@@ -1632,8 +1680,38 @@ fn reload_current_track(app: &AppHandle) {
     let state = app.state::<ctl::WallState>();
     let s = state.settings.lock().unwrap();
     if let Some(set_id) = s.lazer_set.clone() {
+        let sha2 = s.lazer_sha2.clone();
         drop(s);
-        let _ = ctl::load_track_at(app, &playlist::Track { set_id, sha2: None, qid: 0, ..Default::default() }, t);
+        let _ = ctl::load_track_at(
+            app,
+            &playlist::Track { set_id, sha2, qid: 0, ..Default::default() },
+            t,
+        );
+    }
+}
+
+/// 谱面集 override 变化后的即时生效:storyboard 是加载期参数需要原位
+/// 重载,其余实时项只发改动值(避免无谓的采样表重建)。
+fn apply_effective_transition(
+    app: &AppHandle,
+    old: settings::EffectiveMedia,
+    new: settings::EffectiveMedia,
+) {
+    if new.storyboard != old.storyboard {
+        reload_current_track(app);
+        return;
+    }
+    if new.bg_opacity != old.bg_opacity {
+        let _ = ctl::send_cmd(app, Command::SetBgOpacity { v: new.bg_opacity });
+    }
+    if new.audio_offset_ms != old.audio_offset_ms {
+        let _ = ctl::send_cmd(app, Command::SetOffset { ms: new.audio_offset_ms });
+    }
+    if new.hits_volume != old.hits_volume {
+        let _ = ctl::send_cmd(app, Command::SetHitsVolume { v: new.hits_volume });
+    }
+    if new.beatmap_hitsounds != old.beatmap_hitsounds {
+        let _ = ctl::send_cmd(app, Command::SetBeatmapHitsounds { on: new.beatmap_hitsounds });
     }
 }
 
@@ -1751,12 +1829,15 @@ fn set_upscale(app: AppHandle, mode: String, quality: Option<String>) -> Result<
 /// 不重载不打断;下次载入曲目按设置走对应层。
 #[tauri::command]
 fn set_beatmap_hitsounds(app: AppHandle, on: bool) -> Result<(), String> {
-    {
+    let on = {
         let state = app.state::<ctl::WallState>();
         let mut s = state.settings.lock().unwrap();
         s.beatmap_hitsounds = on;
         settings::save(&app, &s);
-    }
+        s.beatmap_hitsounds
+    };
+    // 当前谱面集覆盖了该项时,保持它的实际生效值
+    let on = current_effective(&app).map(|e| e.beatmap_hitsounds).unwrap_or(on);
     ctl::send_cmd(&app, Command::SetBeatmapHitsounds { on })
 }
 
@@ -1810,6 +1891,191 @@ fn set_quick_mods(app: AppHandle, mods: u32) -> Result<(), String> {
     s.quick_mods = mods;
     settings::save(&app, &s);
     Ok(())
+}
+
+/// 保存/删除单个谱面集的个性设置(over = None 表示恢复全局)。若该集
+/// 正在播放,立即按新参数生效:实时项直接下发,storyboard 加载期项则
+/// 原位重载当前曲目。
+#[tauri::command]
+async fn set_set_override(
+    app: AppHandle,
+    set_id: String,
+    over: Option<settings::SetOverride>,
+) -> Result<Option<settings::SetOverride>, String> {
+    let set_id = set_id.trim().to_string();
+    if set_id.is_empty() {
+        return Err("谱面集 id 为空".into());
+    }
+    let over = over.map(|mut o| {
+        o.audio_offset_ms = o.audio_offset_ms.map(|v| v.clamp(-1000.0, 1000.0));
+        o.bg_opacity = o.bg_opacity.map(|v| v.clamp(0.0, 1.0));
+        o
+    });
+    // 先记录旧的实际生效值(只关心当前正在播的集)
+    let current = {
+        let state = app.state::<ctl::WallState>();
+        state.from_library.load(std::sync::atomic::Ordering::Relaxed)
+            && state.settings.lock().unwrap().lazer_set.as_deref() == Some(set_id.as_str())
+    };
+    let old = if current {
+        let state = app.state::<ctl::WallState>();
+        let s = state.settings.lock().unwrap();
+        Some(s.effective_for(&set_id))
+    } else {
+        None
+    };
+    {
+        let state = app.state::<ctl::WallState>();
+        let mut s = state.settings.lock().unwrap();
+        match &over {
+            Some(o) => {
+                s.set_overrides.insert(set_id.clone(), o.clone());
+            }
+            None => {
+                s.set_overrides.remove(&set_id);
+            }
+        }
+        settings::save(&app, &s);
+    }
+    let Some(old) = old else {
+        return Ok(over);
+    };
+    let new = {
+        let state = app.state::<ctl::WallState>();
+        let s = state.settings.lock().unwrap();
+        s.effective_for(&set_id)
+    };
+    apply_effective_transition(&app, old, new);
+    Ok(over)
+}
+
+/// 一键清空所有谱面集的个性设置,返回清空条数。当前正在播放的集若受
+/// 影响,立即恢复全局值(storyboard 变化则原位重载)。
+#[tauri::command]
+async fn clear_set_overrides(app: AppHandle) -> Result<usize, String> {
+    // 先记录当前曲目的旧生效值(清空后需要对比)
+    let current = {
+        let state = app.state::<ctl::WallState>();
+        if state.from_library.load(std::sync::atomic::Ordering::Relaxed) {
+            let s = state.settings.lock().unwrap();
+            s.lazer_set
+                .clone()
+                .map(|id| (id.clone(), s.effective_for(&id)))
+        } else {
+            None
+        }
+    };
+    let cleared = {
+        let state = app.state::<ctl::WallState>();
+        let mut s = state.settings.lock().unwrap();
+        let n = s.set_overrides.len();
+        if n > 0 {
+            s.set_overrides.clear();
+            settings::save(&app, &s);
+        }
+        n
+    };
+    if cleared > 0 {
+        if let Some((set_id, old)) = current {
+            let new = {
+                let state = app.state::<ctl::WallState>();
+                let s = state.settings.lock().unwrap();
+                s.effective_for(&set_id)
+            };
+            apply_effective_transition(&app, old, new);
+        }
+    }
+    Ok(cleared)
+}
+
+/// 曲名/作者是否优先显示 Unicode 原名(默认开)。切换后重写播放列表
+/// 显示快照,曲库未解析时的启动秒显也不会停留在旧语言。
+#[tauri::command]
+fn set_display_unicode(app: AppHandle, on: bool) -> Result<(), String> {
+    {
+        let state = app.state::<ctl::WallState>();
+        let mut s = state.settings.lock().unwrap();
+        s.display_unicode = on;
+        settings::save(&app, &s);
+    }
+    let Some(lib) = ctl::library_cached(&app) else {
+        return Ok(());
+    };
+    let by_id: std::collections::HashMap<&str, &lazer::LazerSet> =
+        lib.sets.iter().map(|s| (s.id.as_str(), s)).collect();
+    let state = app.state::<ctl::WallState>();
+    state
+        .playlist
+        .lock()
+        .unwrap()
+        .refresh_display_meta(|set_id| by_id.get(set_id).map(|set| playlist::display_meta(set, on)));
+    ctl::save_playlist(&app);
+    Ok(())
+}
+
+/// 全局快捷键设置回执(规范化后的组合文本,供 UI 回显)。
+#[derive(serde::Serialize)]
+struct HotkeyConfig {
+    enabled: bool,
+    prev: Option<String>,
+    toggle: Option<String>,
+    next: Option<String>,
+}
+
+fn norm_hotkey_text(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// 保存并立即应用全局快捷键。默认关闭;关闭时不校验文本(方便直接关掉),
+/// 开启时先解析、再注册,注册冲突会原样报错且不落盘。
+#[tauri::command]
+async fn set_hotkeys(
+    app: AppHandle,
+    enabled: bool,
+    prev: Option<String>,
+    toggle: Option<String>,
+    next: Option<String>,
+) -> Result<HotkeyConfig, String> {
+    let (prev, toggle, next) = (
+        norm_hotkey_text(prev),
+        norm_hotkey_text(toggle),
+        norm_hotkey_text(next),
+    );
+    let manager = app.state::<hotkeys::HotkeyManager>().inner().clone();
+    if !enabled {
+        // 关闭:尽力注销,失败(快捷键线程异常)也不该挡住关闭开关
+        let _ = tauri::async_runtime::spawn_blocking(move || manager.register(Vec::new())).await;
+        {
+            let state = app.state::<ctl::WallState>();
+            let mut s = state.settings.lock().unwrap();
+            s.hotkeys_enabled = false;
+            s.hotkey_prev = prev.clone();
+            s.hotkey_toggle = toggle.clone();
+            s.hotkey_next = next.clone();
+            settings::save(&app, &s);
+        }
+        return Ok(HotkeyConfig { enabled: false, prev, toggle, next });
+    }
+    let parsed = hotkeys::parse_inputs(prev.as_deref(), toggle.as_deref(), next.as_deref())?;
+    let bindings = parsed.bindings.clone();
+    tauri::async_runtime::spawn_blocking(move || manager.register(bindings))
+        .await
+        .map_err(|e| e.to_string())??;
+    {
+        let state = app.state::<ctl::WallState>();
+        let mut s = state.settings.lock().unwrap();
+        s.hotkeys_enabled = true;
+        s.hotkey_prev = parsed.prev.clone();
+        s.hotkey_toggle = parsed.toggle.clone();
+        s.hotkey_next = parsed.next.clone();
+        settings::save(&app, &s);
+    }
+    Ok(HotkeyConfig {
+        enabled: true,
+        prev: parsed.prev,
+        toggle: parsed.toggle,
+        next: parsed.next,
+    })
 }
 
 #[tauri::command]

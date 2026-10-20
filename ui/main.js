@@ -26,6 +26,14 @@ const state = {
   quickAdd: true,    // 单击封面快速导入(不弹对话框)
   quickMods: 0,      // 快速导入应用的默认 mods 位
   dblAdd: false,       // 双击曲库行加入播放列表(默认关 = 双击播放)
+  // 曲名/作者优先显示 Unicode 原名(默认开;关 = 罗马音/英文)
+  displayUnicode: true,
+  // 谱面集个性设置:set_id → { enabled, storyboard, audio_offset_ms, ... }
+  setOverrides: {},
+  sideSetId: null,       // 右侧当前显示的谱面集(预览优先)
+  overrideDraft: null,   // 个性设置弹窗的编辑上下文
+  // 全局快捷键(默认关、无默认组合;开启后任意窗口可控制播放)
+  hotkeys: { enabled: false, prev: '', toggle: '', next: '' },
 };
 
 const fmt = (ms) => {
@@ -94,6 +102,12 @@ function switchTab(name) {
     $(`tab-${page}`).classList.toggle('on', name === page);
   }
   if (name === 'library' && starRange.dirty) srRender();
+  // 切回播放列表时把「正在播放」那行滚到视野内(自动切歌后左栏也能跟上)
+  if (name === 'queue') {
+    requestAnimationFrame(() => {
+      $('queue-list').querySelector('.queue-row.on')?.scrollIntoView({ block: 'center' });
+    });
+  }
   // 每次进设置页刷新设备列表:热拔插后列表即时反映现状
   if (name === 'settings') refreshAudioDevices();
 }
@@ -172,13 +186,26 @@ function setNowPlaying(title, sub) {
   $('pb-sub').textContent = sub;
 }
 
+/// 谱面集显示名:按「以 Unicode 显示歌曲」偏好选原名或罗马音/英文,
+/// 空侧自动回退(与后端 playlist::display_meta 同口径)。
+function dispTitle(set) {
+  if (!set) return '';
+  if (state.displayUnicode) return set.titleUnicode || set.title || '';
+  return set.title || set.titleUnicode || '';
+}
+function dispArtist(set) {
+  if (!set) return '';
+  if (state.displayUnicode) return set.artistUnicode || set.artist || '';
+  return set.artist || set.artistUnicode || '';
+}
+
 /// 从曲库数据找当前曲目信息(难度缺省时以最难档近似,wall://track 会带
 /// 实际解析结果覆盖)
 function describeTrack(setId, sha2) {
   const set = state.lib?.find((s) => s.id === setId);
   if (!set) return null;
-  const title = set.titleUnicode || set.title;
-  const artist = set.artistUnicode || set.artist;
+  const title = dispTitle(set);
+  const artist = dispArtist(set);
   let b = sha2 ? set.beatmaps.find((x) => x.sha2 === sha2) : null;
   if (!b && set.beatmaps.length) {
     b = set.beatmaps.reduce((m, x) => (x.starRating > m.starRating ? x : m), set.beatmaps[0]);
@@ -281,16 +308,13 @@ function onEvent(ev) {
       // /策略挑选回到「自动」;手动文件播放 = None 走文件名兜底
       invoke('playing_track')
         .then((cur) => {
-          state.nowTrack = cur?.setId ? { setId: cur.setId, sha2: cur.sha2 ?? null } : null;
-          const info = describeTrack(state.nowTrack?.setId, state.nowTrack?.sha2);
-          if (info) {
-            setNowPlaying(info.title, subOf(info));
+          if (cur?.setId) {
+            applyNowTrack(cur.setId, cur.sha2 ?? null, cur.qid);
           } else {
+            state.nowTrack = null;
             setNowPlaying(basename(ev.path), (ev.diff ? basename(ev.diff) + ' · ' : '') + (ev.hasAudio ? '有声' : '无声'));
             refreshNowPlaying();
           }
-          setNowPlayingCover(state.nowTrack?.setId);
-          updateDiffSelect(state.nowTrack?.setId, state.nowTrack?.sha2);
         })
         .catch(() => {});
       updatePlayUi();
@@ -315,7 +339,8 @@ function onEvent(ev) {
       setBadge(false, '空闲');
       setNowPlaying('未播放', '');
       applyNowMods(0);
-      state.preview = null;
+      clearPreview();
+      state.nowTrack = null;
       $('pb-cover').hidden = true;
       $('pb-time-cur').textContent = '0:00';
       $('pb-time-total').textContent = '0:00';
@@ -471,7 +496,7 @@ function sortSets(sets) {
   }
   const valueOf = (s) => {
     switch (key) {
-      case 'title': return (s.titleUnicode || s.title).toLowerCase();
+      case 'title': return dispTitle(s).toLowerCase();
       case 'creator': return (s.creator || '').toLowerCase();
       case 'date_added': return s.dateAddedMs || 0;
       case 'star': return s.beatmaps.reduce((m, b) => Math.max(m, b.starRating || 0), 0);
@@ -485,7 +510,7 @@ function sortSets(sets) {
         }
         return best;
       }
-      default: return (s.artistUnicode || s.artist).toLowerCase();
+      default: return dispArtist(s).toLowerCase();
     }
   };
   const factor = libSort.desc ? -1 : 1;
@@ -630,8 +655,8 @@ const libScrollObserver = new IntersectionObserver((entries) => {
 });
 
 function buildLibRow(set) {
-  const title = set.titleUnicode || set.title;
-  const artist = set.artistUnicode || set.artist;
+  const title = dispTitle(set);
+  const artist = dispArtist(set);
   const allDiffs = [...set.beatmaps].sort((a, b) => a.starRating - b.starRating);
   // 星级过滤生效时,展示口径跟随过滤:区间/难度 chips/计数只算范围内的
   // 难度(如全集 1~10 过滤 1~5,最高难度 7.5 被筛掉 → 显示 1~4.2);
@@ -663,7 +688,7 @@ function buildLibRow(set) {
   head.innerHTML =
     `<img class="lib-cover loading" alt="" data-cover="${set.id}" />` +
     `<div class="lib-meta">` +
-    `<span class="lib-title">${isPlayingSet ? '▶ ' : ''}${esc(title)} <span class="dim">— ${esc(artist)}</span></span>` +
+    `<span class="lib-title"><span class="lib-now"${isPlayingSet ? '' : ' hidden'}>▶ </span>${esc(title)} <span class="dim">— ${esc(artist)}</span></span>` +
     `<span class="lib-artist">${diffCount} 难度 · ${esc(set.creator)}</span>` +
     `</div>` +
     `<span class="lib-stars"${starTip ? ` title="${esc(starTip)}"` : ''}>${starSpan}</span>`;
@@ -1084,7 +1109,7 @@ function openModsModal(ctx) {
     ? `所选 ${ctx.count} 个条目将统一应用`
     : isBatch
       ? `${ctx.count} 个谱面集将加入播放列表`
-      : (ctx.title || (set ? (set.titleUnicode || set.title) : '') || '');
+      : (ctx.title || (set ? dispTitle(set) : '') || '');
   setModsUi(ctx.mods || 0);
   // 难度策略行常驻(单曲/批量):最难/最容易/自定义(内联星级输入)。
   // 难度 chip 右键时置顶插入「所选难度」项;编辑(逐难度下拉)与
@@ -1336,6 +1361,12 @@ $('qsel-menu-edit-open').addEventListener('click', () => {
     title: item.title,
   });
 });
+// 常态页「个性设置…」→ 该条目的谱面集 override
+$('qsel-menu-edit-override').addEventListener('click', () => {
+  const item = qeditCtx;
+  closeQSelMenu();
+  if (item) openSetOverride(item.setId);
+});
 // 常态页「移除」→ 与行内 ✕ 同一单条移除
 $('qsel-menu-edit-remove').addEventListener('click', async () => {
   const item = qeditCtx;
@@ -1413,6 +1444,7 @@ window.addEventListener('keydown', (ev) => {
   if (ev.key !== 'Escape') return;
   if (!$('clear-modal').hidden) $('clear-modal').hidden = true;
   if (!$('mods-modal').hidden) closeModsModal();
+  if (!$('set-override-modal').hidden) closeSetOverride();
   if (!$('qsel-menu').hidden) closeQSelMenu();
 });
 
@@ -1473,10 +1505,26 @@ function sideTarget() {
   return { setId: state.nowTrack?.setId ?? null, sha2: state.nowTrack?.sha2 ?? null };
 }
 
+/// 右侧「个性设置」入口状态:有无可编辑的谱面集 + 是否已启用。
+function syncOverrideBadge() {
+  const id = state.sideSetId;
+  $('set-override-open').disabled = !id;
+  $('set-override-badge').hidden = !(id && state.setOverrides?.[id]?.enabled);
+}
+
+/// 设置→播放 里的全局计数与「全部清空」按钮可用态。
+function syncSetOverrideCount() {
+  const n = Object.keys(state.setOverrides ?? {}).length;
+  $('set-overrides-count').textContent = n ? `已设置 ${n} 个谱面集` : '暂无';
+  $('clear-set-overrides').disabled = n === 0;
+}
+
 /// 右侧(大封面 + 标题 + 信息卡)渲染;seq 防止快速连点时旧响应覆盖新内容
 let sideRenderSeq = 0;
 async function renderSide(setId, sha2) {
   const seq = ++sideRenderSeq;
+  state.sideSetId = setId ?? null;
+  syncOverrideBadge();
   const big = $('big-cover');
   const empty = $('big-cover-empty');
   const cap = $('cover-cap');
@@ -1519,24 +1567,232 @@ function previewSet(setId, sha2) {
 }
 
 /// 播放条小封面 + 右侧(预览优先)。正在播放变化时调用。
+let pbCoverSeq = 0;
 async function setNowPlayingCover(setId) {
+  const seq = ++pbCoverSeq;
   const img = $('pb-cover');
   const url = await coverOf(setId);
+  if (seq !== pbCoverSeq) return;
   img.src = url ?? '';
   img.hidden = !url;
   const t = sideTarget();
   await renderSide(t.setId, t.sha2);
 }
 
-// 点播放条封面:右侧切回正在播放的曲目(清除预览选中态)
-$('pb-cover').addEventListener('click', () => {
-  if (!state.preview) return;
+/// 清掉单击预览(右侧回到正在播放,左侧去掉预览选中态)。
+function clearPreview() {
+  if (!state.preview) return false;
   state.preview = null;
   for (const list of [$('lib-list'), $('queue-list')]) {
     list.querySelectorAll('.previewing').forEach((el) => el.classList.remove('previewing'));
   }
+  return true;
+}
+
+/// 曲库列表的「正在播放」标记就地同步:自动切歌时只挪 ▶/高亮,不整表
+/// 重渲染 —— 否则用户正在翻曲库会被弹回列表顶部。
+function syncLibPlaying() {
+  const setId = state.nowTrack?.setId ?? null;
+  const sha2 = state.nowTrack?.sha2 ?? null;
+  for (const row of $('lib-list').querySelectorAll('.lib-row')) {
+    const on = row.dataset.set === setId;
+    row.classList.toggle('playing', on);
+    row.querySelector('.lib-now')?.toggleAttribute('hidden', !on);
+    for (const chip of row.querySelectorAll('.chip')) {
+      chip.classList.toggle('on', on && chip.dataset.sha2 === sha2);
+    }
+  }
+}
+
+/// 统一应用「当前播放曲目」:播放条 / 右侧封面与信息卡 / 左侧播放列表
+/// 高亮与选中全部跟随。自动切歌、托盘/快捷键切歌、恢复与手动点播共用。
+/// 曲目真的换了就清掉旧的单击预览 —— 否则右侧会一直停在预览的那首。
+function applyNowTrack(setId, sha2, qid) {
+  const prev = state.nowTrack;
+  const nextSha2 = sha2 ?? null;
+  const sameTrack =
+    !!prev && prev.setId === setId && (prev.sha2 ?? null) === nextSha2;
+  const changed = !sameTrack;
+  state.nowTrack = setId
+    ? { setId, sha2: nextSha2, qid: qid || (sameTrack ? prev.qid : 0) || 0 }
+    : null;
+  if (changed) clearPreview();
+  const info = describeTrack(setId, nextSha2);
+  if (info) setNowPlaying(info.title, subOf(info));
+  setNowPlayingCover(setId);
+  updateDiffSelect(setId, nextSha2);
+  syncLibPlaying();
+  refreshQueue();
+}
+
+// 点播放条封面:右侧切回正在播放的曲目(清除预览选中态)
+$('pb-cover').addEventListener('click', () => {
+  if (!clearPreview()) return;
   const t = sideTarget();
   renderSide(t.setId, t.sha2);
+});
+
+// ---- 谱面集个性设置:按集 override 全局的加载/实时参数 ----
+// 入口:右侧封面下方「个性设置…」+ 播放列表右键「个性设置…」。
+function setTri(id, val) {
+  $(id).value = val == null ? '' : val ? 'on' : 'off';
+}
+function getTri(id) {
+  const v = $(id).value;
+  return v === '' ? null : v === 'on';
+}
+function syncOverrideFields() {
+  $('so-fields').disabled = !$('so-enabled').checked;
+}
+function closeSetOverride() {
+  $('set-override-modal').hidden = true;
+  state.overrideDraft = null;
+}
+
+async function openSetOverride(setId) {
+  if (!setId) return;
+  let s;
+  try {
+    // 现取一次全局设置:弹窗里的「跟随全局」提示与 override 都是最新值
+    s = await invoke('get_settings');
+  } catch (e) {
+    toast(`读取设置失败：${e}`);
+    return;
+  }
+  state.setOverrides = s.set_overrides ?? {};
+  syncSetOverrideCount();
+  const set = state.lib?.find((x) => x.id === setId);
+  const ov = state.setOverrides[setId] ?? {};
+  state.overrideDraft = {
+    setId,
+    globals: {
+      storyboard: s.storyboard ?? true,
+      audio_offset_ms: s.audio_offset_ms ?? 0,
+      bg_opacity: s.bg_opacity ?? 0.7,
+      hitsound: s.hitsound ?? true,
+      beatmap_hitsounds: s.beatmap_hitsounds ?? true,
+    },
+  };
+  $('so-sub').textContent = set ? dispTitle(set) : setId;
+  $('so-enabled').checked = !!ov.enabled;
+  setTri('so-storyboard', ov.storyboard);
+  setTri('so-hitsound', ov.hitsound);
+  setTri('so-beatmap-hits', ov.beatmap_hitsounds);
+  const g = state.overrideDraft.globals;
+  $('so-storyboard').options[0].textContent = `跟随全局(${g.storyboard ? '开' : '关'})`;
+  $('so-hitsound').options[0].textContent = `跟随全局(${g.hitsound ? '开' : '关'})`;
+  $('so-beatmap-hits').options[0].textContent = `跟随全局(${g.beatmap_hitsounds ? '开' : '关'})`;
+
+  const offsetInherit = ov.audio_offset_ms == null;
+  $('so-offset-inherit').checked = offsetInherit;
+  $('so-offset').value = offsetInherit ? '' : String(ov.audio_offset_ms);
+  $('so-offset').placeholder = `全局 ${g.audio_offset_ms >= 0 ? '+' : ''}${g.audio_offset_ms}ms`;
+  $('so-offset').disabled = offsetInherit;
+
+  const bgInherit = ov.bg_opacity == null;
+  const bg = bgInherit ? g.bg_opacity : ov.bg_opacity;
+  $('so-bg-inherit').checked = bgInherit;
+  $('so-bg').value = String(bg);
+  $('so-bg-val').textContent = `${Math.round(bg * 100)}%`;
+  $('so-bg').disabled = bgInherit;
+
+  syncOverrideFields();
+  $('set-override-modal').hidden = false;
+}
+
+async function saveSetOverride() {
+  const ctx = state.overrideDraft;
+  if (!ctx) return;
+  const enabled = $('so-enabled').checked;
+  let offset = null;
+  if (!$('so-offset-inherit').checked) {
+    const raw = $('so-offset').value.trim();
+    const v = Number(raw);
+    if (!raw || !Number.isFinite(v)) {
+      toast('请输入有效的音效偏移数值');
+      return;
+    }
+    offset = v;
+  }
+  const over = {
+    enabled,
+    storyboard: getTri('so-storyboard'),
+    audio_offset_ms: offset,
+    bg_opacity: $('so-bg-inherit').checked ? null : Number($('so-bg').value),
+    hitsound: getTri('so-hitsound'),
+    beatmap_hitsounds: getTri('so-beatmap-hits'),
+  };
+  try {
+    const saved = await invoke('set_set_override', { setId: ctx.setId, over });
+    if (saved) state.setOverrides[ctx.setId] = saved;
+    else delete state.setOverrides[ctx.setId];
+    closeSetOverride();
+    syncOverrideBadge();
+    syncSetOverrideCount();
+    toast(saved?.enabled ? '已启用本谱面集个性设置' : '个性设置已保存');
+  } catch (e) {
+    toast(`保存失败：${e}`);
+  }
+}
+
+async function resetSetOverride() {
+  const ctx = state.overrideDraft;
+  if (!ctx) return;
+  try {
+    await invoke('set_set_override', { setId: ctx.setId, over: null });
+    delete state.setOverrides[ctx.setId];
+    closeSetOverride();
+    syncOverrideBadge();
+    syncSetOverrideCount();
+    toast('已恢复全局设置');
+  } catch (e) {
+    toast(`恢复失败：${e}`);
+  }
+}
+
+$('set-override-open').addEventListener('click', () => {
+  const t = sideTarget();
+  if (t.setId) openSetOverride(t.setId);
+});
+$('so-enabled').addEventListener('change', syncOverrideFields);
+$('so-offset-inherit').addEventListener('change', () => {
+  const inherit = $('so-offset-inherit').checked;
+  $('so-offset').disabled = inherit;
+  if (!inherit && !$('so-offset').value) {
+    $('so-offset').value = String(state.overrideDraft?.globals.audio_offset_ms ?? 0);
+  }
+});
+$('so-bg-inherit').addEventListener('change', () => {
+  const inherit = $('so-bg-inherit').checked;
+  $('so-bg').disabled = inherit;
+  if (inherit) {
+    const g = state.overrideDraft?.globals.bg_opacity ?? 0.7;
+    $('so-bg').value = String(g);
+    $('so-bg-val').textContent = `${Math.round(g * 100)}%`;
+  }
+});
+$('so-bg').addEventListener('input', () => {
+  $('so-bg-val').textContent = `${Math.round(Number($('so-bg').value) * 100)}%`;
+});
+$('so-save').addEventListener('click', saveSetOverride);
+$('so-cancel').addEventListener('click', closeSetOverride);
+$('so-reset').addEventListener('click', resetSetOverride);
+
+// 设置→播放:一键清空所有谱面个性设置(不可撤销)
+$('clear-set-overrides').addEventListener('click', async () => {
+  const n = Object.keys(state.setOverrides ?? {}).length;
+  if (!n) return;
+  if (!confirm(`清空全部 ${n} 个谱面集的个性设置?此操作无法撤销。`)) return;
+  try {
+    const cleared = await invoke('clear_set_overrides');
+    state.setOverrides = {};
+    syncSetOverrideCount();
+    syncOverrideBadge();
+    if (!$('set-override-modal').hidden) closeSetOverride();
+    toast(`已清空 ${cleared} 个谱面集的个性设置`);
+  } catch (e) {
+    toast(`清空失败：${e}`);
+  }
 });
 
 // ---- 谱面信息卡(封面下方):AR/CS/OD/HP/BPM/时长/谱师/bid + tags;
@@ -1652,11 +1908,7 @@ function esc(s) {
 async function playSet(setId, sha2) {
   try {
     await invoke('library_play', { setId, sha2: sha2 ?? null });
-    state.nowTrack = { setId, sha2: sha2 ?? null };
-    setNowPlayingCover(setId);
-    updateDiffSelect(setId, sha2 ?? null);
-    renderLibList();
-    refreshQueue();
+    applyNowTrack(setId, sha2 ?? null, 0);
   } catch (e) {
     toast(`播放失败：${e}`);
   }
@@ -1753,25 +2005,33 @@ window.__TAURI__.app?.getVersion?.()
     $('quick-add').checked = state.quickAdd;
     state.quickMods = s.quick_mods ?? 0;
     applyQaModsUi(state.quickMods);
+    // 曲名/作者显示语言:默认勾选 Unicode 原名
+    state.displayUnicode = s.display_unicode ?? true;
+    $('display-unicode').checked = state.displayUnicode;
+    // 谱面集个性设置(后端只会返回用户改过的集)
+    state.setOverrides = s.set_overrides ?? {};
+    syncSetOverrideCount();
     syncQaPolicyUi();
     state.libMode = s.play_mode === 'random' ? 'random' : 'list_order';
     setModeLabel(state.libMode);
     state.libCollection = s.collection ?? '';
+    // 全局快捷键:默认关、默认留空(全部由用户自己填写)
+    applyHotkeyUi({
+      enabled: !!s.hotkeys_enabled,
+      prev: s.hotkey_prev ?? '',
+      toggle: s.hotkey_toggle ?? '',
+      next: s.hotkey_next ?? '',
+    });
   } catch (e) {
     toast(`读取设置失败：${e}`);
   }
 
   await listen('wall://event', ({ payload }) => onEvent(payload));
   await listen('wall://track', ({ payload }) => {
-    // 自动切歌 / 启动恢复 / 难度切换时父进程广播当前曲目(难度已解析)
+    // 自动切歌 / 启动恢复 / 托盘与快捷键切歌 / 难度切换时父进程广播当前
+    // 曲目(难度已解析):右侧面板与左侧列表选中一起跟随。
     if (payload?.setId) {
-      state.nowTrack = { setId: payload.setId, sha2: payload.sha2 ?? null, qid: payload.qid };
-      const info = describeTrack(payload.setId, payload.sha2);
-      if (info) setNowPlaying(info.title, subOf(info));
-      setNowPlayingCover(payload.setId);
-      updateDiffSelect(payload.setId, payload.sha2);
-      renderLibList();
-      refreshQueue();
+      applyNowTrack(payload.setId, payload.sha2 ?? null, payload.qid);
     }
   });
 
@@ -1791,6 +2051,15 @@ window.__TAURI__.app?.getVersion?.()
     try {
       const ev = await invoke('get_status');
       if (ev) onEvent(ev);
+      // 已停用/已退出:不要拿旧的 playing_track 把"未播放"又顶回播放中
+      if (ev?.event === 'unloaded' || ev?.event === 'exited') return;
+      // 事件丢失兜底(窗口隐藏期间自动切歌等):发现播放曲目变了就把
+      // 右侧面板与左侧列表选中一起补切过去
+      const cur = await invoke('playing_track').catch(() => null);
+      const now = state.nowTrack;
+      if (cur?.setId && (!now || now.setId !== cur.setId)) {
+        applyNowTrack(cur.setId, cur.sha2 ?? null, cur.qid);
+      }
     } catch { /* 忽略 */ }
   }, 1500);
 })();
@@ -1877,6 +2146,26 @@ $('quick-add').addEventListener('change', () => {
   invoke('set_quick_add', { on: state.quickAdd }).catch((e) => toast(`${e}`));
 });
 
+// 曲名/作者显示语言(Unicode 原名 vs 罗马音/英文):切换后重绘所有列表
+// 与右侧/播放条;后端同时重写播放列表快照,启动秒显也不会用旧语言。
+$('display-unicode').addEventListener('change', async () => {
+  const on = $('display-unicode').checked;
+  state.displayUnicode = on;
+  try {
+    await invoke('set_display_unicode', { on });
+    renderLibList();
+    refreshQueue();
+    const info = describeTrack(state.nowTrack?.setId, state.nowTrack?.sha2);
+    if (info) setNowPlaying(info.title, subOf(info));
+    const t = sideTarget();
+    renderSide(t.setId, t.sha2);
+  } catch (e) {
+    state.displayUnicode = !on;
+    $('display-unicode').checked = !on;
+    toast(`切换失败：${e}`);
+  }
+});
+
 // 快速导入的默认 mods(设置区按钮组,互斥逻辑同导入对话框)
 function applyQaModsUi(bits) {
   document.querySelectorAll('#qa-mods .seg-btn').forEach((b) => {
@@ -1930,6 +2219,142 @@ $('qa-star').addEventListener('keydown', (ev) => {
     commitQaStar();
   }
 });
+
+// ---- 全局快捷键(默认关;组合由用户现场按下录制,Esc 退出输入) ----
+const HOTKEY_FIELDS = [
+  ['prev', 'hotkey-prev', '上一首'],
+  ['toggle', 'hotkey-toggle', '播放 / 暂停'],
+  ['next', 'hotkey-next', '下一首'],
+];
+
+/// 回填快捷键设置(读取存档与保存回执共用;后端返回规范化组合)
+function applyHotkeyUi(cfg) {
+  state.hotkeys = {
+    enabled: !!cfg?.enabled,
+    prev: cfg?.prev ?? '',
+    toggle: cfg?.toggle ?? '',
+    next: cfg?.next ?? '',
+  };
+  $('hotkeys-enabled').checked = state.hotkeys.enabled;
+  for (const [key, id] of HOTKEY_FIELDS) {
+    $(id).value = state.hotkeys[key];
+    // 空行禁用「清除」,避免无效点击;有值才可清
+    document.querySelector(`.hotkey-clear[data-hotkey="${key}"]`).disabled = !state.hotkeys[key];
+  }
+}
+
+let hotkeySaveSeq = 0;
+/// 保存并立即应用;失败时回滚到上一次成功保存的值(注册冲突等会报出来)
+async function saveHotkeys(quiet, okMsg) {
+  const seq = ++hotkeySaveSeq;
+  const enabled = $('hotkeys-enabled').checked;
+  const payload = {
+    enabled,
+    prev: $('hotkey-prev').value.trim() || null,
+    toggle: $('hotkey-toggle').value.trim() || null,
+    next: $('hotkey-next').value.trim() || null,
+  };
+  try {
+    const cfg = await invoke('set_hotkeys', payload);
+    if (seq !== hotkeySaveSeq) return;
+    applyHotkeyUi(cfg);
+    if (okMsg) toast(okMsg);
+    else if (!quiet) toast(enabled ? '全局快捷键已更新' : '已关闭全局快捷键');
+  } catch (e) {
+    if (seq !== hotkeySaveSeq) return;
+    toast(`快捷键设置失败：${e}`);
+    applyHotkeyUi(state.hotkeys);
+  }
+}
+
+/// 键盘事件 → 规范化组合文本(与后端解析器同一套词表)
+function hotkeyKeyName(ev) {
+  const code = ev.code || '';
+  if (/^Key[A-Z]$/.test(code)) return code.slice(3);
+  if (/^Digit[0-9]$/.test(code)) return code.slice(5);
+  if (/^Numpad[0-9]$/.test(code)) return `Numpad${code.slice(6)}`;
+  if (/^F([1-9]|1[0-9]|2[0-4])$/.test(code)) return code;
+  return {
+    ArrowLeft: 'Left', ArrowRight: 'Right', ArrowUp: 'Up', ArrowDown: 'Down',
+    Space: 'Space', Enter: 'Enter', NumpadEnter: 'Enter', Tab: 'Tab',
+    Backspace: 'Backspace', Delete: 'Delete', Insert: 'Insert',
+    Home: 'Home', End: 'End', PageUp: 'PageUp', PageDown: 'PageDown',
+    Escape: 'Escape', Pause: 'Pause', PrintScreen: 'PrintScreen',
+    CapsLock: 'CapsLock', NumLock: 'NumLock', ScrollLock: 'ScrollLock',
+    Minus: 'Minus', Equal: 'Plus', Comma: 'Comma', Period: 'Period',
+    Slash: 'Slash', Backslash: 'Backslash', Semicolon: 'Semicolon',
+    Quote: 'Quote', Backquote: 'Backquote',
+    BracketLeft: 'BracketLeft', BracketRight: 'BracketRight',
+    MediaPlayPause: 'MediaPlayPause', MediaTrackNext: 'MediaNext',
+    MediaTrackPrevious: 'MediaPrev', MediaStop: 'MediaStop',
+  }[code] || null;
+}
+
+function hotkeyMods(ev) {
+  const mods = [];
+  if (ev.ctrlKey) mods.push('Ctrl');
+  if (ev.altKey) mods.push('Alt');
+  if (ev.shiftKey) mods.push('Shift');
+  if (ev.metaKey) mods.push('Win');
+  return mods;
+}
+
+for (const [key, id, label] of HOTKEY_FIELDS) {
+  const input = $(id);
+  // 聚焦即录制:按键被拦截并格式化成组合,不触发全局快捷键设置
+  input.addEventListener('focus', () => {
+    input.value = state.hotkeys[key] ?? '';
+    input.classList.add('recording');
+    input.select();
+  });
+  input.addEventListener('keydown', (ev) => {
+    // Esc 退出输入:还原已保存组合并失焦,不保存半截输入
+    if (ev.key === 'Escape') {
+      ev.preventDefault();
+      ev.stopPropagation();
+      input.value = state.hotkeys[key] ?? '';
+      input.blur();
+      return;
+    }
+    // Tab 让位给键盘导航
+    if (ev.key === 'Tab') {
+      input.value = state.hotkeys[key] ?? '';
+      input.blur();
+      return;
+    }
+    ev.preventDefault();
+    ev.stopPropagation();
+    const mods = hotkeyMods(ev);
+    const keyName = hotkeyKeyName(ev);
+    if (!keyName) {
+      // 只按下修饰键:先预览,等待主键
+      input.value = mods.length ? mods.join('+') + '+' : '';
+      return;
+    }
+    if (!mods.length && !/^F\d+$/.test(keyName) && !keyName.startsWith('Media')) {
+      toast('该按键需要配合 Ctrl / Alt / Shift / Win 使用');
+      input.value = '';
+      return;
+    }
+    input.value = [...mods, keyName].join('+');
+    saveHotkeys(true);
+    input.blur();
+  });
+  input.addEventListener('blur', () => {
+    input.classList.remove('recording');
+    // 只按了修饰键就点走:恢复已保存值,不留半截组合
+    if (!input.value || input.value.endsWith('+')) input.value = state.hotkeys[key] ?? '';
+  });
+  input.addEventListener('click', () => input.select());
+  // 清除改为显式按钮:不再靠 Esc / Backspace 的隐式行为
+  const clearBtn = document.querySelector(`.hotkey-clear[data-hotkey="${key}"]`);
+  clearBtn.addEventListener('click', () => {
+    if (!state.hotkeys[key] && !input.value) return;
+    input.value = '';
+    saveHotkeys(true, `已清除「${label}」快捷键`);
+  });
+}
+$('hotkeys-enabled').addEventListener('change', () => saveHotkeys());
 
 // ---- 播放器条 ----
 $('toggle').addEventListener('click', () => invoke('toggle_play').catch((e) => toast(`${e}`)));

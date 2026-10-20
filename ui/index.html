@@ -106,6 +106,7 @@
             <span class="dim" style="flex:none">主题色</span>
             <div class="accent-row" id="accent-row"></div>
           </div>
+          <label class="check-inline" title="勾选 = 优先显示谱面自带的 Unicode 标题 / 作者(如日文原名);取消 = 优先显示罗马音 / 英文"><input type="checkbox" id="display-unicode" checked /> 以 Unicode 显示歌曲</label>
         </details>
         <details class="grp">
           <summary>画面</summary>
@@ -221,6 +222,30 @@
             </select>
             <input type="text" id="qa-star" class="policy-star" inputmode="decimal" placeholder="星级" title="目标星级" hidden />
           </div>
+          <div class="row">
+            <span class="dim">谱面个性设置</span>
+            <span class="dim grow" id="set-overrides-count">暂无</span>
+            <button id="clear-set-overrides" class="btn ghost danger small" title="删除所有谱面集的个性设置,全部恢复跟随全局" disabled>全部清空</button>
+          </div>
+        </details>
+        <details class="grp">
+          <summary>快捷键</summary>
+          <label class="check-inline" title="开启后,下面的组合键在任意窗口(游戏 / 全屏应用)里都能控制壁纸播放"><input type="checkbox" id="hotkeys-enabled" /> 启用全局快捷键</label>
+          <div class="row">
+            <span class="dim hotkey-label">上一首</span>
+            <input type="text" id="hotkey-prev" class="input hotkey-input grow" placeholder="未设置" spellcheck="false" autocomplete="off" />
+            <button type="button" class="btn ghost small hotkey-clear" data-hotkey="prev" title="清除「上一首」快捷键">清除</button>
+          </div>
+          <div class="row">
+            <span class="dim hotkey-label">播放 / 暂停</span>
+            <input type="text" id="hotkey-toggle" class="input hotkey-input grow" placeholder="未设置" spellcheck="false" autocomplete="off" />
+            <button type="button" class="btn ghost small hotkey-clear" data-hotkey="toggle" title="清除「播放 / 暂停」快捷键">清除</button>
+          </div>
+          <div class="row">
+            <span class="dim hotkey-label">下一首</span>
+            <input type="text" id="hotkey-next" class="input hotkey-input grow" placeholder="未设置" spellcheck="false" autocomplete="off" />
+            <button type="button" class="btn ghost small hotkey-clear" data-hotkey="next" title="清除「下一首」快捷键">清除</button>
+          </div>
         </details>
         <details class="grp">
           <summary>皮肤</summary>
@@ -332,6 +357,10 @@
             <div class="meta-line dim" id="meta-artist"></div>
             <div class="meta-line dim" id="meta-diff"></div>
           </div>
+        </div>
+        <div class="cover-actions">
+          <span class="dim" id="set-override-badge" hidden>已启用个性设置</span>
+          <button id="set-override-open" class="btn ghost small" disabled title="为当前显示的谱面集单独设置 storyboard / 偏移 / 亮度 / 音效">个性设置…</button>
         </div>
       </section>
       <!-- 谱面信息卡:AR/CS/OD/HP/BPM/时长等 + tags;所有条目单击即复制 -->
@@ -461,6 +490,7 @@
   <div id="qsel-menu" hidden>
     <div id="qsel-menu-edit" hidden>
       <button type="button" id="qsel-menu-edit-open">修改…</button>
+      <button type="button" id="qsel-menu-edit-override">个性设置…</button>
       <button type="button" id="qsel-menu-edit-remove" class="danger">移除</button>
     </div>
     <div id="qsel-menu-main" hidden>
@@ -476,6 +506,57 @@
         <button type="button" id="qsel-star-apply">自定义星级 · 应用</button>
       </div>
       <button type="button" id="qsel-diff-back" class="back">‹ 返回</button>
+    </div>
+  </div>
+  <!-- 谱面集个性设置:仅当前显示的谱面集(预览优先),开启后逐项覆盖全局 -->
+  <div id="set-override-modal" class="close-modal" hidden>
+    <div class="close-card">
+      <div class="close-title">谱面集个性设置</div>
+      <div class="dim" id="so-sub"></div>
+      <label class="check-inline" style="margin-top:10px"><input type="checkbox" id="so-enabled" /> 启用本谱面集的个性设置</label>
+      <fieldset id="so-fields" class="set-override-fields" disabled>
+        <div class="row">
+          <span class="dim so-label">故事板</span>
+          <select id="so-storyboard" class="grow">
+            <option value="">跟随全局</option>
+            <option value="on">开启</option>
+            <option value="off">关闭</option>
+          </select>
+        </div>
+        <div class="row">
+          <span class="dim so-label">音效偏移</span>
+          <label class="check-inline"><input type="checkbox" id="so-offset-inherit" checked /> 跟随全局</label>
+          <input type="number" id="so-offset" class="input w-auto" min="-1000" max="1000" step="1" />
+          <span class="dim">ms</span>
+        </div>
+        <div class="row">
+          <span class="dim so-label">背景亮度</span>
+          <label class="check-inline"><input type="checkbox" id="so-bg-inherit" checked /> 跟随全局</label>
+          <input type="range" id="so-bg" class="grow" min="0" max="1" step="0.05" value="0.7" />
+          <span class="val" id="so-bg-val">70%</span>
+        </div>
+        <div class="row">
+          <span class="dim so-label">打击音效</span>
+          <select id="so-hitsound" class="grow">
+            <option value="">跟随全局</option>
+            <option value="on">开启</option>
+            <option value="off">关闭</option>
+          </select>
+        </div>
+        <div class="row">
+          <span class="dim so-label">谱面音效</span>
+          <select id="so-beatmap-hits" class="grow">
+            <option value="">跟随全局</option>
+            <option value="on">开启</option>
+            <option value="off">关闭</option>
+          </select>
+        </div>
+      </fieldset>
+      <div class="row wrap" style="justify-content:center;margin-top:14px">
+        <button id="so-save" class="btn primary">保存</button>
+        <button id="so-cancel" class="btn ghost">取消</button>
+        <button id="so-reset" class="btn ghost danger">恢复全局</button>
+      </div>
     </div>
   </div>
   <div id="toast" hidden></div>

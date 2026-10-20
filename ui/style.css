@@ -209,6 +209,7 @@ main {
 .btn.danger { color: var(--danger); border-color: var(--danger-line); }
 .btn.icon { padding: 7px 11px; font-size: 15px; }
 .btn.small { padding: 5px 10px; font-size: 12px; }
+.btn:disabled { opacity: 0.4; cursor: default; pointer-events: none; }
 
 /* 分段按钮(倍速预设等;竖排容器自带布局) */
 .seg-btn {
@@ -255,6 +256,20 @@ select, .input {
 select:disabled { opacity: 0.45; }
 .input { width: 100%; }
 .input:focus { outline: none; border-color: var(--accent-dim); }
+
+/* 全局快捷键录制框:聚焦即进入录制态(按键被 JS 拦截),Esc 退出 */
+.hotkey-label { flex: none; width: 84px; }
+.hotkey-input {
+  cursor: pointer;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.3px;
+}
+.hotkey-input.recording {
+  border-color: var(--accent);
+  background: var(--hover);
+  cursor: text;
+}
+.hotkey-input.recording::placeholder { color: var(--accent-hover); }
 
 input[type="range"] {
   appearance: none;
@@ -448,6 +463,23 @@ input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent);
   box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
 }
 .close-title { font-size: 15px; font-weight: 600; margin-bottom: 6px; }
+
+/* 谱面集个性设置弹窗:比通用询问卡片宽一些,左对齐便于逐项阅读 */
+#set-override-modal .close-card { width: min(460px, 92vw); text-align: left; }
+#set-override-modal .close-title,
+#set-override-modal #so-sub { text-align: center; }
+.set-override-fields {
+  border: 0;
+  margin: 10px 0 0;
+  padding: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.set-override-fields:disabled { opacity: 0.55; }
+.so-label { flex: none; width: 78px; }
+#so-offset { width: 96px; flex: none; }
 
 /* ── 源切换(header segmented) ── */
 .src-switch {
@@ -752,6 +784,15 @@ details.grp > *:not(summary) { margin-top: 6px; }
 .cover-cap {
   width: 100%;
   text-align: center;
+}
+/* 当前显示谱面集的个性设置入口(封面下方,预览/播放共用) */
+.cover-actions {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 2px;
 }
 .cover-title {
   font-weight: 600;

@@ -302,6 +302,20 @@ impl Playlist {
         }
     }
 
+    /// 按新的显示偏好重写全部条目快照(切 Unicode 开关时),让启动秒显 /
+    /// 曲库未解析时的列表也跟着换语言。`meta` 返回 None 的条目原样保留。
+    pub fn refresh_display_meta<F>(&mut self, mut meta: F)
+    where
+        F: FnMut(&str) -> Option<(String, String)>,
+    {
+        for t in &mut self.tracks {
+            if let Some((title, artist)) = meta(&t.set_id) {
+                t.title = title;
+                t.artist = artist;
+            }
+        }
+    }
+
     /// 清理当前曲库中已不存在的曲目(切源恢复后调用:持久化列表可能
     /// 混着另一个源的曲目 id,点播必报"谱面集不在曲库中")。
     pub fn prune_missing(&mut self, lib: &LazerLibrary) {
@@ -443,6 +457,22 @@ pub fn policy_of(target: Option<f64>) -> PickPolicy {
     }
 }
 
+/// 谱面集显示名:按偏好选 Unicode 原名或罗马音/英文,空侧自动回退。
+/// 曲库列表、播放列表快照、右侧信息卡都走这一口径。
+pub fn display_meta(set: &LazerSet, unicode: bool) -> (String, String) {
+    if unicode {
+        (
+            if set.title_unicode.is_empty() { set.title.clone() } else { set.title_unicode.clone() },
+            if set.artist_unicode.is_empty() { set.artist.clone() } else { set.artist_unicode.clone() },
+        )
+    } else {
+        (
+            if set.title.is_empty() { set.title_unicode.clone() } else { set.title.clone() },
+            if set.artist.is_empty() { set.artist_unicode.clone() } else { set.artist.clone() },
+        )
+    }
+}
+
 pub fn pick_diff<'a>(set: &'a LazerSet, policy: PickPolicy) -> &'a LazerBeatmap {
     let mut best = &set.beatmaps[0];
     match policy {
@@ -495,6 +525,30 @@ pub fn pick_cached_diff<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_meta_prefers_selected_language_with_fallback() {
+        let set = LazerSet {
+            id: "s".into(),
+            online_id: 0,
+            date_added_ms: 0,
+            artist: "Artist".into(),
+            artist_unicode: "歌手".into(),
+            title: "Song".into(),
+            title_unicode: String::new(),
+            creator: String::new(),
+            tags: String::new(),
+            source: String::new(),
+            root: None,
+            sb_video: false,
+            beatmaps: Vec::new(),
+            files: Vec::new(),
+        };
+        // Unicode 优先,空侧回退到罗马音
+        assert_eq!(display_meta(&set, true), ("Song".into(), "歌手".into()));
+        // 非 Unicode 优先,空侧回退到 Unicode
+        assert_eq!(display_meta(&set, false), ("Song".into(), "Artist".into()));
+    }
 
     #[test]
     fn add_remove_clear_current() {

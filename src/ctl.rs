@@ -26,6 +26,9 @@ pub struct WallState {
     pub playlist: std::sync::Mutex<Playlist>,
     /// 当前播放是否来自曲库(决定 Ended 后是否自动切歌)。
     pub from_library: AtomicBool,
+    /// 最近一次实际载入的难度标识(**策略解析后的真实值**,非条目上锁定的
+    /// sha2):UI 轮询兜底/恢复显示时据此对齐难度选择器。
+    pub loaded_sha2: std::sync::Mutex<Option<String>>,
     /// 谱面集封面 data URL 缓存(None = 无封面,避免重复读盘)。
     pub cover_cache: std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
 }
@@ -39,6 +42,7 @@ impl WallState {
             lib_cache: std::sync::Mutex::new(None),
             playlist: std::sync::Mutex::new(Playlist::default()),
             from_library: AtomicBool::new(false),
+            loaded_sha2: std::sync::Mutex::new(None),
             cover_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -446,8 +450,20 @@ fn dispatch_load(
     length_ms: f64,
     start: f32,
 ) -> Result<(), String> {
-    // 视频/故事板单一开关(lazer ShowStoryboard:关 = 精灵与视频一起关)
-    let (fail, speed, loop_playback, skin_stored, force_colours, hidden, storyboard, beatmap_hitsounds, upscale, upscale_quality, monitor) = {
+    // 视频/故事板单一开关(lazer ShowStoryboard:关 = 精灵与视频一起关)。
+    // 谱面集个性设置开启时逐项覆盖全局(仅本曲目/本谱面集)。
+    let (
+        fail,
+        speed,
+        loop_playback,
+        skin_stored,
+        force_colours,
+        hidden,
+        upscale,
+        upscale_quality,
+        monitor,
+        eff,
+    ) = {
         let state = app.state::<WallState>();
         let s = state.settings.lock().unwrap();
         (
@@ -457,16 +473,21 @@ fn dispatch_load(
             s.skin.clone(),
             s.force_skin_colours,
             s.hidden,
-            s.storyboard,
-            s.beatmap_hitsounds,
             effective_upscale(&s.upscale, &s.upscale_quality),
             s.upscale_quality.clone(),
             monitor_bounds_of(&s.monitor),
+            s.effective_for(&track.set_id),
         )
     };
     // 皮肤身份值 → 实际目录(realm 挂载/缓存定位;失效回默认皮肤)
     let skin = resolve_skin_dir(app, &skin_stored).map(|p| p.to_string_lossy().into_owned());
     app.state::<WallState>().from_library.store(true, Ordering::Relaxed);
+    // 真实载入的难度(策略挑选后的值):UI 轮询兜底据此还原右侧难度显示
+    app.state::<WallState>()
+        .loaded_sha2
+        .lock()
+        .unwrap()
+        .replace(sha2.clone());
     // 单一真相源:每次实际载入都记住当前曲目(点播/托盘切歌/自动连播/
     // 设置重载统一走这里)。
     {
@@ -484,6 +505,11 @@ fn dispatch_load(
         drop(state);
         save_playlist(app);
     }
+    // 逐曲目的实时参数先落账,再下发 Load:子进程用它们初始化新会话。
+    // (打击音效开关折算进 hits_volume;关 = 0。)
+    send_cmd(app, Command::SetBgOpacity { v: eff.bg_opacity })?;
+    send_cmd(app, Command::SetOffset { ms: eff.audio_offset_ms })?;
+    send_cmd(app, Command::SetHitsVolume { v: eff.hits_volume })?;
     send_cmd(
         app,
         Command::Load {
@@ -498,9 +524,9 @@ fn dispatch_load(
             skin,
             force_colours,
             hidden,
-            storyboard,
-            video: storyboard,
-            beatmap_hitsounds,
+            storyboard: eff.storyboard,
+            video: eff.storyboard,
+            beatmap_hitsounds: eff.beatmap_hitsounds,
             upscale,
             upscale_quality,
             monitor,
@@ -517,8 +543,13 @@ fn dispatch_load(
 /// [`load_track`] + 起始位置(设置开关后原位重载用:storyboard/皮肤等
 /// 加载期选项变更不回到开头)。
 pub fn load_track_at(app: &AppHandle, track: &Track, start: f32) -> Result<(), String> {
-    // 播放时难度解析:指定难度 > 目标星级(改设置后重播/切歌即生效)
-    let target = app.state::<WallState>().settings.lock().unwrap().target_star;
+    // 播放时难度解析:指定难度 > 目标星级(改设置后重播/切歌即生效);
+    // Unicode 显示偏好只影响回填快照/标题,不影响选难度
+    let (target, unicode) = {
+        let state = app.state::<WallState>();
+        let s = state.settings.lock().unwrap();
+        (s.target_star, s.display_unicode)
+    };
 
     // ---- 快路径:路径缓存命中 → 零数据库直接下发(托盘切歌/启动恢复
     // 秒切;数据库只在打开曲库时才解析)----
@@ -617,8 +648,7 @@ pub fn load_track_at(app: &AppHandle, track: &Track, start: f32) -> Result<(), S
             },
         );
     }
-    let title = if set.title_unicode.is_empty() { set.title.clone() } else { set.title_unicode.clone() };
-    let artist = if set.artist_unicode.is_empty() { set.artist.clone() } else { set.artist_unicode.clone() };
+    let (title, artist) = crate::playlist::display_meta(set, unicode);
     let length_ms = set.beatmaps.iter().find(|b| b.sha2 == sha2).map(|b| b.length_ms).unwrap_or(0.0);
     dispatch_load(
         app,
