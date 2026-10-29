@@ -4,6 +4,10 @@
 //! 由调用方管理生命周期,经 `play_effect` 起播。无音频设备时
 //! `AudioOut::new` 返回 None,壁纸照常。
 //!
+//! 一次性打击音有**同采样并发上限**(lazer 同款 [`SAMPLE_CONCURRENCY`],
+//! 单实例复用的采样只有 1 个槽,见 [`AudioOut::fire`]):谱面把大量同槽位
+//! 事件压进同一毫秒时(aspire 的 65 连零长滑条),不限制会直接叠成爆音。
+//!
 //! 变速不变调由宿主**离线预处理**实现(wall.rs:SoundTouch tempo 全曲
 //! 处理成临时 WAV 后 1.0× 播放)——播放链路上没有实时效果器,**零管线
 //! 延迟**,音效/画面/BGM 同轴。变调路径(Nightcore / 预处理失败回退)
@@ -24,6 +28,30 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use osu_replay_render::hitsound::{HitsoundEvent, SampleSlot};
+
+/// lazer `OsuGameBase.SAMPLE_CONCURRENCY` → `ISample.PlaybackConcurrency`:
+/// 同一个采样文件最多几个实例同时发声。游戏里 BASS 以
+/// `BassFlags.SampleOverrideLongestPlaying` 装载,第 7 个同时播放会顶掉
+/// **播得最久**的那个。
+const SAMPLE_CONCURRENCY: usize = 6;
+
+/// 被顶掉实例的停止补间(ms)。BASS 是在同一时刻硬停(波形跳变 = "咔哒");
+/// 这里保持**切断时刻完全一致**,只把边沿做成 2ms 线性淡出,消掉咔哒。
+const STEAL_FADE_MS: f64 = 2.0;
+
+/// 一条打击音事件允许的并发实例数(与 `osu-replay-render` 的
+/// `HitSample::voice_cap` 以及 lazer 一致):
+///
+/// - 普通采样 = [`SAMPLE_CONCURRENCY`](6);
+/// - `spinnerbonus-max`(`DrawableSpinner.maxBonusSample`)与
+///   `combobreak`(`ComboEffects.comboBreakSample`)由**同一个**
+///   `SkinnableSound` 实例复用,`Play()` 等价 `Stop(); Play();`,只有 1 个槽。
+fn hitsound_concurrency(name: &str) -> usize {
+    match name {
+        "spinnerbonus-max" | "combobreak" => 1,
+        _ => SAMPLE_CONCURRENCY,
+    }
+}
 
 /// 枚举系统输出设备(id 用于设置/命令,名字给 UI 显示)。id 为
 /// DeviceId 的 Display 形态(可持久化/跨进程传,kira 侧同源)。
@@ -240,6 +268,10 @@ pub struct AudioOut {
     hits_volume: f32,
     /// 总音量(主增益):实际音量 = master × 各分量。
     master: f32,
+    /// 在播的一次性打击音句柄,按**池**(槽位 + `layered`)分组 —— 并发上限
+    /// 的账本,见 [`AudioOut::fire`]。kira 的句柄只是控制柄,丢弃不会停声,
+    /// 所以必须留着才能"顶掉最久的那个"。
+    hits_active: HashMap<(SampleSlot, bool), Vec<StaticSoundHandle>>,
 }
 
 impl AudioOut {
@@ -262,6 +294,7 @@ impl AudioOut {
                     bgm_volume: 0.6,
                     hits_volume: 0.6,
                     master: 0.6,
+                    hits_active: HashMap::new(),
                 })
             }
             Err(e) => {
@@ -296,6 +329,9 @@ impl AudioOut {
         if let Some(mut h) = self.bgm.take() {
             let _ = h.stop(if fade_ms > 0.0 { fade_tween(120.0) } else { Tween::default() });
         }
+        // 旧谱面还在响的一次性打击音同样让位(和新 BGM 同一条淡出曲线),
+        // 否则换曲后残留的打击音会盖到新曲开头
+        self.stop_hits(if fade_ms > 0.0 { 120.0 } else { 0.0 });
         self.timeline_scale = timeline_scale.max(1e-6);
         match StreamingSoundData::from_file(bgm_path) {
             Ok(data) => {
@@ -345,10 +381,23 @@ impl AudioOut {
 
     /// 触发一次性打击音效:事件音量 × 音效主音量
     /// + 位置声像。采样在加载时预解码,此处仅克隆 settings 起播。表的
-    /// key 是槽位(bank/name/customIndex 或谱面显式文件名)。
+    /// key 是槽位(bank/name/customIndex 或谱面显式文件名)加 `layered`
+    /// 位:同一槽位可能来自普通采样,也可能来自自动附带的 layered
+    /// hitnormal,而 `LayeredHitSounds: 0` 只静音后者。
+    ///
+    /// **同采样并发上限**(lazer 同款,见 [`hitsound_concurrency`]):每个池
+    /// 最多 `cap` 个实例同时发声,再多就顶掉**播得最久**的那个。没有这层
+    /// 限制时,谱面把大量同槽位事件压进同一毫秒就会叠成爆音 —— 例如
+    /// aspire 图 5839931(`Camellia - FM Synthesis Experiment`)第 5774 行的
+    /// `398,380,124774,6,0,L|399:381,65,2147483647`:`slides=65` 的零长度
+    /// 滑条让 64 个 repeat 全判在同一毫秒,同一发 `soft-hitnormal`(85%)
+    /// 要叠 65 层 ≈ +36 dB,直接削顶;游戏里 BASS 只留 6 个,所以不会这样。
+    /// 池按 `(槽位, layered)` 分:BASS 是按**文件**分池的,若谱面里两个
+    /// 槽位恰好解析到同一个文件会有两个池(只是这种谱面才有的近似,两个
+    /// 池各自最多 6 个,总量仍被限制住,不会再现 65 层)。
     pub fn fire(
         &mut self,
-        sounds: &HashMap<SampleSlot, StaticSoundData>,
+        sounds: &HashMap<(SampleSlot, bool), StaticSoundData>,
         event: &HitsoundEvent,
     ) {
         // 用 hits_volume()(master × hits_volume)而非原始字段——
@@ -356,13 +405,27 @@ impl AudioOut {
         if self.hits_volume() <= 0.0 {
             return;
         }
-        let Some(data) = sounds.get(&event.slot()) else { return };
+        let slot = event.slot();
+        let Some(data) = sounds.get(&(slot.clone(), event.layered)) else { return };
         let volume = event.volume.max(5) as f32 / 100.0 * self.hits_volume();
         let mut data = data.clone();
         data.settings = StaticSoundSettings::new()
             .volume(amplitude_to_decibels(volume))
             .panning(Panning(osu_panning(event.pan_x)));
-        let _ = self.manager.play(data);
+
+        let cap = hitsound_concurrency(event.name);
+        let pool = self.hits_active.entry((slot, event.layered)).or_default();
+        // 先清掉已经播完的(账本只留活着的,否则句柄无限增长)
+        pool.retain(|h| !matches!(h.state(), PlaybackState::Stopped));
+        // 满了就顶掉队首(最早起播 = 播得最久),与
+        // `SampleOverrideLongestPlaying` 同一时刻、同一个受害者
+        while pool.len() >= cap {
+            let mut oldest = pool.remove(0);
+            let _ = oldest.stop(fade_tween(STEAL_FADE_MS));
+        }
+        if let Ok(handle) = self.manager.play(data) {
+            pool.push(handle);
+        }
     }
 
     /// 循环音(滑条/转盘)起播:调用方持有句柄管理生命周期。
@@ -375,10 +438,24 @@ impl AudioOut {
         self.master * self.hits_volume
     }
 
+    /// 收掉在播的一次性打击音(换曲/停止/重建会话时调用)。
+    ///
+    /// kira 的 `StaticSoundHandle` 只是控制柄:句柄丢弃**不会**停止声音,
+    /// 所以这些实例必须由本结构显式 `stop`,否则换曲后旧谱面的打击音还会
+    /// 继续响完,且账本里留下再也无法回收的死句柄。
+    fn stop_hits(&mut self, ms: f64) {
+        for (_, pool) in self.hits_active.drain() {
+            for mut h in pool {
+                let _ = h.stop(if ms > 0.0 { fade_tween(ms) } else { Tween::default() });
+            }
+        }
+    }
+
     pub fn stop(&mut self) {
         if let Some(mut h) = self.bgm.take() {
             let _ = h.stop(Tween::default());
         }
+        self.stop_hits(0.0);
         // 循环音句柄由调用方持有并停止
     }
 
@@ -466,5 +543,35 @@ mod tests {
         }
         assert!(device_by_id("").is_none(), "空 id 不应解析出设备");
         assert!(device_by_id("不存在的设备id").is_none());
+    }
+
+    /// 并发池容量与 lazer(`osu-replay-render::hitsound` 的
+    /// `HitSample::voice_cap`)一致:普通采样 6,单实例复用的
+    /// `spinnerbonus-max` / `combobreak` 只 1 个槽。
+    #[test]
+    fn hitsound_concurrency_matches_lazer() {
+        assert_eq!(hitsound_concurrency("hitnormal"), SAMPLE_CONCURRENCY);
+        assert_eq!(hitsound_concurrency("hitclap"), SAMPLE_CONCURRENCY);
+        assert_eq!(hitsound_concurrency("slidertick"), SAMPLE_CONCURRENCY);
+        assert_eq!(hitsound_concurrency("spinnerbonus"), SAMPLE_CONCURRENCY);
+        assert_eq!(hitsound_concurrency("spinnerbonus-max"), 1);
+        assert_eq!(hitsound_concurrency("combobreak"), 1);
+        assert_eq!(SAMPLE_CONCURRENCY, 6, "OsuGameBase.SAMPLE_CONCURRENCY");
+    }
+
+    /// 声像必须夹在 [0,1]:aspire 的 `pixelLength = i32::MAX` 滑条会把
+    /// 路径位置放大到 ~1.5e9(见 `osu-replay-render` 的 `balance`),不夹
+    /// 的话 kira 会收到越界 panning。
+    #[test]
+    fn osu_panning_clamps_out_of_range_positions() {
+        assert!((osu_panning(0.0) - 0.1).abs() < 1e-6, "最左:bal=-0.8 → 0.1");
+        assert!((osu_panning(512.0) - 0.9).abs() < 1e-6, "最右:bal=+0.8 → 0.9");
+        assert_eq!(osu_panning(256.0), 0.5);
+        for x in [1518500608.0f32, -1518500608.0, 1.0e30, -1.0e30] {
+            let p = osu_panning(x);
+            assert!((0.0..=1.0).contains(&p), "osu_panning({x}) = {p} 必须落在 [0,1]");
+        }
+        assert_eq!(osu_panning(1518500608.0), 1.0, "越界 → 硬右");
+        assert_eq!(osu_panning(-1518500608.0), 0.0, "越界 → 硬左");
     }
 }

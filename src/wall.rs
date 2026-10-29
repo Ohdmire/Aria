@@ -676,7 +676,10 @@ struct WallApp {
     vol_hits: f32,
     /// 打击音效:事件表(按时间排序)+ 采样预载 + 播放头游标。
     hs_events: Vec<osu_replay_render::hitsound::HitsoundEvent>,
-    hs_sounds: HashMap<osu_replay_render::hitsound::SampleSlot, kira::sound::static_sound::StaticSoundData>,
+    hs_sounds: HashMap<
+        (osu_replay_render::hitsound::SampleSlot, bool),
+        kira::sound::static_sound::StaticSoundData,
+    >,
     /// SB 声音采样(lazer StoryboardSampleInfo):按播放头跨过触发。
     sb_samples: Vec<(f32, f32, kira::sound::static_sound::StaticSoundData)>,
     sb_sample_cursor: usize,
@@ -688,7 +691,7 @@ struct WallApp {
     loop_playbacks: Vec<(usize, usize, kira::sound::static_sound::StaticSoundHandle)>,
     /// 本次会话的打击音效槽位表(含解析失败的槽位;热切换时按它整表
     /// 重解析 —— 仅看 hs_sounds 的 key 会漏掉"权威静音"的槽位)。
-    hs_slots: Vec<osu_replay_render::hitsound::SampleSlot>,
+    hs_slots: Vec<(osu_replay_render::hitsound::SampleSlot, bool)>,
     /// 谱面自带音效开关(运行期可热切换,仅重建采样表)。
     beatmap_hitsounds: bool,
     /// HUD(计分板等)开关,壁纸默认关闭。
@@ -1119,22 +1122,23 @@ impl WallApp {
             } else {
                 None
             };
-        let mut slots: Vec<osu_replay_render::hitsound::SampleSlot> = hs_events
+        let mut slots: Vec<(osu_replay_render::hitsound::SampleSlot, bool)> = hs_events
             .iter()
-            .map(|e| e.slot())
-            .chain(loop_events.iter().map(|e| e.slot()))
+            .map(|e| (e.slot(), e.layered))
+            .chain(loop_events.iter().map(|e| (e.slot(), e.layered)))
             .collect();
-        slots.sort_by_key(|s| format!("{s:?}"));
+        slots.sort_by_key(|(s, layered)| format!("{s:?}{layered}"));
         slots.dedup();
         // 留存槽位表:谱面音效运行期热切换按它整表重解析(含解析失败的
-        // 槽位,开关换层后结论可能不同)
+        // 槽位,开关换层后结论可能不同)。`layered` 一起留存:同一槽位在
+        // `LayeredHitSounds: 0` 下普通/附带两版结论不同。
         self.hs_slots = slots.clone();
         if self.sample_cache.len() > 192 {
             let marker = p.path.as_str();
             self.sample_cache.retain(|(k, _), _| k.contains(marker));
         }
         let mut hs_sounds = HashMap::new();
-        for slot in slots {
+        for (slot, layered) in slots {
             let bytes = {
                 let mut cache = std::mem::take(&mut self.sample_cache);
                 // 谱面身份入 key:采样解析现在依赖谱面文件(同槽位不同
@@ -1144,6 +1148,7 @@ impl WallApp {
                     p.skin.as_deref(),
                     p.path.as_str(),
                     &slot,
+                    layered,
                     beatmap_store.as_deref(),
                     &resolved_skin,
                 );
@@ -1154,7 +1159,7 @@ impl WallApp {
                 if let Ok(data) = kira::sound::static_sound::StaticSoundData::from_cursor(
                     std::io::Cursor::new(bytes),
                 ) {
-                    hs_sounds.insert(slot, data);
+                    hs_sounds.insert((slot, layered), data);
                 }
             }
         }
@@ -1921,7 +1926,7 @@ impl WallApp {
             let event = &self.loop_events[i];
             let Some(game) = self.game.as_ref() else { break };
             let (rate, amp, pan_x) = event.params_at(run, t, true, game);
-            let Some(data) = self.hs_sounds.get(&event.slot()) else { continue };
+            let Some(data) = self.hs_sounds.get(&(event.slot(), event.layered)) else { continue };
             let mut data = data.clone();
             // 0 帧采样(ArgonPro 滑条循环是空文件)配 loop_region 会让
             // kira 音频线程死循环,跳过
@@ -2133,19 +2138,20 @@ impl WallApp {
         let mut fresh = HashMap::new();
         {
             let mut cache = std::mem::take(&mut self.sample_cache);
-            for slot in &slots {
+            for (slot, layered) in &slots {
                 if let Some(bytes) = resolve_slot_sample(
                     &mut cache,
                     load.skin.as_deref(),
                     load.path.as_str(),
                     slot,
+                    *layered,
                     store.as_deref(),
                     &skin,
                 ) {
                     if let Ok(data) = kira::sound::static_sound::StaticSoundData::from_cursor(
                         std::io::Cursor::new(bytes),
                     ) {
-                        fresh.insert(slot.clone(), data);
+                        fresh.insert((slot.clone(), *layered), data);
                     }
                 }
             }
@@ -2484,12 +2490,15 @@ impl osu_replay_render::hitsound::BeatmapSampleStore for VirtualSampleStore {
 
 /// 打击音效槽位 → wav 字节,按 lazer 层级解析:谱面自带文件
 /// (LegacyBeatmapSkin,`beatmap` = None 时跳过该层)→ 皮肤 → 内置
-/// 默认。结果按 (皮肤, 槽位) 缓存,换歌零重解。
+/// 默认。`layered` 交给库里的 `LayeredHitSounds: 0` 闸门(只静音
+/// 用户皮肤层,谱面文件仍优先)。结果按 (皮肤, 槽位, layered) 缓存,
+/// 换歌零重解。
 fn resolve_slot_sample(
     cache: &mut HashMap<(String, String), Option<Vec<u8>>>,
     skin_path: Option<&str>,
     map_path: &str,
     slot: &osu_replay_render::hitsound::SampleSlot,
+    layered: bool,
     beatmap: Option<&dyn osu_replay_render::hitsound::BeatmapSampleStore>,
     skin: &skin::ResolvedSkin,
 ) -> Option<Vec<u8>> {
@@ -2498,7 +2507,7 @@ fn resolve_slot_sample(
     // 没生效"。
     let key = (
         format!("{}/{map_path}#bm{}", skin_path.unwrap_or_default(), beatmap.is_some() as u8),
-        slot_cache_key(slot),
+        slot_cache_key(slot, layered),
     );
     if let Some(hit) = cache.get(&key) {
         return hit.clone();
@@ -2512,17 +2521,18 @@ fn resolve_slot_sample(
         }
     };
     let resolved = osu_replay_render::hitsound::resolve_sample_parts(
-        bank, name, custom, filename, beatmap, skin,
+        bank, name, custom, filename, layered, beatmap, skin,
     );
     cache.insert(key, resolved.clone());
     resolved
 }
 
-/// 槽位缓存键:bank/name/customIndex 或显式文件名,序列化成字符串。
-fn slot_cache_key(slot: &osu_replay_render::hitsound::SampleSlot) -> String {
+/// 槽位缓存键:bank/name/customIndex 或显式文件名,再加上 `layered`
+/// (`LayeredHitSounds: 0` 下普通与附带两版的结论不同)。
+fn slot_cache_key(slot: &osu_replay_render::hitsound::SampleSlot, layered: bool) -> String {
     match slot {
         osu_replay_render::hitsound::SampleSlot::Bank { bank, name, custom } => {
-            format!("{bank}-{name}@{custom}")
+            format!("{bank}-{name}@{custom}L{layered}")
         }
         osu_replay_render::hitsound::SampleSlot::File { filename } => format!("file:{filename}"),
     }
@@ -3473,16 +3483,16 @@ mod hits_cache_tests {
         };
 
         let mut cache: HashMap<(String, String), Option<Vec<u8>>> = HashMap::new();
-        let on = resolve_slot_sample(&mut cache, None, "map.osu", &slot, Some(&store), &skin)
+        let on = resolve_slot_sample(&mut cache, None, "map.osu", &slot, false, Some(&store), &skin)
             .expect("开状态应命中谱面文件");
         assert_eq!(on.len(), wav.len(), "谱面 wav 原样透传");
-        let off = resolve_slot_sample(&mut cache, None, "map.osu", &slot, None, &skin)
+        let off = resolve_slot_sample(&mut cache, None, "map.osu", &slot, false, None, &skin)
             .expect("关状态应回退内置默认");
         assert_ne!(off.len(), on.len(), "关状态不得沿用开状态的缓存字节");
 
         // 来回切换:各自缓存项命中,结果稳定
-        let on2 = resolve_slot_sample(&mut cache, None, "map.osu", &slot, Some(&store), &skin).unwrap();
-        let off2 = resolve_slot_sample(&mut cache, None, "map.osu", &slot, None, &skin).unwrap();
+        let on2 = resolve_slot_sample(&mut cache, None, "map.osu", &slot, false, Some(&store), &skin).unwrap();
+        let off2 = resolve_slot_sample(&mut cache, None, "map.osu", &slot, false, None, &skin).unwrap();
         assert_eq!(on2.len(), on.len());
         assert_eq!(off2.len(), off.len());
         let _ = std::fs::remove_dir_all(&dir);
