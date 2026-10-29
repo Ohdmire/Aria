@@ -60,3 +60,4 @@ pnpm build:setup:all
 - pxyxy —— 5元赞助~
 - [telecomadm1145](https://osu.ppy.sh/users/30656658) —— 5元赞助~
 - 有人 —— 5元赞助~
+- 七海灯子 —— 30元赞助~ ```许愿一个cinema mod```
