@@ -2287,6 +2287,12 @@ impl WallApp {
             self.sb_sample_cursor =
                 self.sb_samples.partition_point(|(t0, _, _)| *t0 as f64 <= t);
             self.stop_loops();
+            // 场景里按"计数变化"触发的动画(转盘 MAX 回弹等)必须在新时刻
+            // 重新播种,否则拖回去后缓存的 CompletedFullSpins 还停在未来值,
+            // 下一圈不再算"新的一圈",MAX 永远不弹。
+            if let Some(scene) = &mut self.scene {
+                scene.reset_animations();
+            }
         }
         self.fire_hitsounds();
         // 有音频在播时以"音频播完"为准;音频播完(position 不可用)后墙钟
