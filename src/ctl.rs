@@ -244,7 +244,7 @@ fn spawn_child(app: &AppHandle) -> anyhow::Result<ChildCtl> {
             s.bg_opacity,
             s.master_volume,
             s.audio_offset_ms,
-            s.gameplay_hidden,
+            s.effective_for(s.lazer_set.as_deref().unwrap_or("")).gameplay_hidden,
             s.fade_audio,
             s.ffmpeg.clone().or_else(|| bundled_bin(app, "ffmpeg.exe")),
             s.ffprobe.clone().or_else(|| bundled_bin(app, "ffprobe.exe")),
@@ -510,6 +510,7 @@ fn dispatch_load(
     send_cmd(app, Command::SetBgOpacity { v: eff.bg_opacity })?;
     send_cmd(app, Command::SetOffset { ms: eff.audio_offset_ms })?;
     send_cmd(app, Command::SetHitsVolume { v: eff.hits_volume })?;
+    send_cmd(app, Command::SetGameplayHidden { on: eff.gameplay_hidden })?;
     send_cmd(
         app,
         Command::Load {

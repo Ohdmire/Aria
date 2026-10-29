@@ -1671,6 +1671,7 @@ async function openSetOverride(setId) {
       bg_opacity: s.bg_opacity ?? 0.7,
       hitsound: s.hitsound ?? true,
       beatmap_hitsounds: s.beatmap_hitsounds ?? true,
+      gameplay_hidden: !!s.gameplay_hidden,
     },
   };
   $('so-sub').textContent = set ? dispTitle(set) : setId;
@@ -1678,10 +1679,13 @@ async function openSetOverride(setId) {
   setTri('so-storyboard', ov.storyboard);
   setTri('so-hitsound', ov.hitsound);
   setTri('so-beatmap-hits', ov.beatmap_hitsounds);
+  // 存的是「隐藏」;界面按「游玩画面」来选,显示 = 不隐藏
+  setTri('so-gameplay', ov.gameplay_hidden == null ? null : !ov.gameplay_hidden);
   const g = state.overrideDraft.globals;
   $('so-storyboard').options[0].textContent = `跟随全局(${g.storyboard ? '开' : '关'})`;
   $('so-hitsound').options[0].textContent = `跟随全局(${g.hitsound ? '开' : '关'})`;
   $('so-beatmap-hits').options[0].textContent = `跟随全局(${g.beatmap_hitsounds ? '开' : '关'})`;
+  $('so-gameplay').options[0].textContent = `跟随全局(${g.gameplay_hidden ? '隐藏' : '显示'})`;
 
   const offsetInherit = ov.audio_offset_ms == null;
   $('so-offset-inherit').checked = offsetInherit;
@@ -1721,6 +1725,10 @@ async function saveSetOverride() {
     bg_opacity: $('so-bg-inherit').checked ? null : Number($('so-bg').value),
     hitsound: getTri('so-hitsound'),
     beatmap_hitsounds: getTri('so-beatmap-hits'),
+    gameplay_hidden: (() => {
+      const show = getTri('so-gameplay');
+      return show == null ? null : !show;
+    })(),
   };
   try {
     const saved = await invoke('set_set_override', { setId: ctx.setId, over });

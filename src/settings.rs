@@ -22,6 +22,9 @@ pub struct SetOverride {
     pub hitsound: Option<bool>,
     #[serde(default)]
     pub beatmap_hitsounds: Option<bool>,
+    /// 隐藏游玩画面(只留背景与故事板)。None = 跟随全局。
+    #[serde(default)]
+    pub gameplay_hidden: Option<bool>,
 }
 
 /// 某谱面集实际生效的播放参数(个性设置覆盖后的结果)。
@@ -33,6 +36,8 @@ pub struct EffectiveMedia {
     pub audio_offset_ms: f32,
     /// 已按打击音效开关折算(关 = 0)。
     pub hits_volume: f32,
+    /// 隐藏游玩画面:只渲染背景与故事板。
+    pub gameplay_hidden: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -366,11 +371,15 @@ impl Settings {
         let audio_offset_ms = over
             .and_then(|o| o.audio_offset_ms)
             .unwrap_or(self.audio_offset_ms);
+        let gameplay_hidden = over
+            .and_then(|o| o.gameplay_hidden)
+            .unwrap_or(self.gameplay_hidden);
         EffectiveMedia {
             storyboard,
             beatmap_hitsounds,
             bg_opacity: bg_opacity.clamp(0.0, 1.0),
             audio_offset_ms: audio_offset_ms.clamp(-1000.0, 1000.0),
+            gameplay_hidden,
             hits_volume: if hitsound {
                 self.hits_volume.clamp(0.0, 1.0)
             } else {
@@ -519,6 +528,7 @@ mod tests {
                 bg_opacity: Some(0.2),
                 hitsound: Some(false),
                 beatmap_hitsounds: Some(false),
+                gameplay_hidden: Some(true),
             },
         );
         assert_eq!(s.effective_for("s1"), base, "未开启时忽略全部覆盖");
@@ -531,6 +541,7 @@ mod tests {
         assert_eq!(over.bg_opacity, 0.2);
         assert_eq!(over.audio_offset_ms, 120.0);
         assert_eq!(over.hits_volume, 0.0, "关闭打击音效 = 音量 0");
+        assert!(over.gameplay_hidden, "覆盖开启隐藏游玩画面");
 
         // 只覆盖部分字段:其余仍用全局
         s.set_overrides.insert(
@@ -543,6 +554,7 @@ mod tests {
         );
         let partial = s.effective_for("s2");
         assert!(partial.storyboard, "未覆盖 storyboard 跟随全局");
+        assert!(!partial.gameplay_hidden, "未覆盖隐藏游玩画面跟随全局");
         assert_eq!(partial.bg_opacity, 1.0, "坏值钳位");
         assert_eq!(partial.audio_offset_ms, 0.0);
     }

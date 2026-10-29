@@ -1405,6 +1405,8 @@ fn set_gameplay_hidden(app: AppHandle, on: bool) -> Result<(), String> {
         s.gameplay_hidden = on;
         settings::save(&app, &s);
     }
+    // 当前谱面集覆盖了该项时,保持它的实际生效值
+    let on = current_effective(&app).map(|e| e.gameplay_hidden).unwrap_or(on);
     ctl::send_cmd(&app, Command::SetGameplayHidden { on })
 }
 
@@ -1712,6 +1714,9 @@ fn apply_effective_transition(
     }
     if new.beatmap_hitsounds != old.beatmap_hitsounds {
         let _ = ctl::send_cmd(app, Command::SetBeatmapHitsounds { on: new.beatmap_hitsounds });
+    }
+    if new.gameplay_hidden != old.gameplay_hidden {
+        let _ = ctl::send_cmd(app, Command::SetGameplayHidden { on: new.gameplay_hidden });
     }
 }
 
