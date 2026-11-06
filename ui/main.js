@@ -136,6 +136,9 @@ function applyTheme(mode, accent) {
   try {
     window.__TAURI__.window.getCurrentWindow().setTheme(mode === 'light' ? 'light' : 'dark');
   } catch { /* 非窗口环境忽略 */ }
+  // 原生 <select> 弹出列表/滚动条由 GTK 绘制,不会跟着网页 CSS 变:
+  // 同步告诉后端切换 gtk-application-prefer-dark-theme
+  invoke('set_ui_theme', { dark: mode !== 'light' }).catch(() => {});
   try {
     localStorage.setItem(THEME_KEY, JSON.stringify({ mode, accent }));
   } catch { /* 忽略 */ }
@@ -2989,3 +2992,24 @@ try {
     if (saved.has(name)) d.open = true;
   });
 } catch {}
+
+// ---- 平台差异:Windows 专属功能在 Linux 上隐藏/禁用 ----
+invoke('platform').then((p) => {
+  if (p === 'windows') return;
+  const re = $('restart-explorer');
+  if (re) re.hidden = true;
+  // Wayland 没有全局快捷键协议:入口禁用并说明原因
+  const hk = $('hotkeys-enabled');
+  if (hk) {
+    hk.disabled = true;
+    hk.checked = false;
+    const label = hk.closest('label');
+    if (label) {
+      label.title = 'Wayland 不允许应用注册全局快捷键;请用托盘菜单或设置窗口切歌';
+      label.append(' (Wayland 不支持)');
+    }
+    document.querySelectorAll('.hotkey-input, .hotkey-clear').forEach((el) => {
+      el.disabled = true;
+    });
+  }
+}).catch(() => {});

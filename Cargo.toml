@@ -1,6 +1,6 @@
 [package]
 name = "aria"
-version = "1.3.9"
+version = "1.4.0"
 edition = "2024"
 license = "MIT"
 description = "Aria(ATRI rhythm interactive animation)—— osu! storyboard 桌面动态壁纸播放器"
@@ -12,7 +12,6 @@ cc = "1"
 [dependencies]
 osu_replay_render = { git = "https://github.com/Ohdmire/osu-replay-render.git", branch = "master" }
 
-winit = "0.30"
 raw-window-handle = "0.6"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 
@@ -26,10 +25,6 @@ serde_json = "1"
 # 谱面音频 + 打击音效
 kira = "0.12"
 symphonia = { version = "0.6", default-features = false, features = ["id3v2", "id3v1"] }
-# 设备热拔插事件(IMMNotificationClient 封装):默认设备切换/加入/移除,
-# 事件级响应代替轮询。设备枚举/按 id 开流经 kira 的 cpal re-export,
-# 不直接依赖 cpal(kira → wasapi-rs → WASAPI)
-wasapi = "0.24"
 
 # osu!lazer client.realm 只读解析
 realm-db-reader = { git = "https://github.com/Ohdmire/realm-db-reader", branch = "main" }
@@ -39,7 +34,16 @@ osu-db = "0.2.1"
 
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
+base64 = "0.23"
+tauri-plugin-single-instance = "2.4.4"
 
+# ---------- Windows:桌面挂接 + WASAPI 设备事件 ----------
+[target.'cfg(windows)'.dependencies]
+winit = "0.30"
+# 设备热拔插事件(IMMNotificationClient 封装):默认设备切换/加入/移除,
+# 事件级响应代替轮询。设备枚举/按 id 开流经 kira 的 cpal re-export,
+# 不直接依赖 cpal(kira → wasapi-rs → WASAPI)
+wasapi = "0.24"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
@@ -50,8 +54,34 @@ windows = { version = "0.62", features = [
     "Win32_System_Com",
 ] }
 winreg = "0.56"
-base64 = "0.23"
-tauri-plugin-single-instance = "2.4.4"
+
+# ---------- Linux/Wayland:layer-shell 壁纸层 + 调试窗口 ----------
+[target.'cfg(target_os = "linux")'.dependencies]
+# 只要 Wayland:显式关掉 x11 后端(裸 X11/XWayland 不在支持范围内)。
+# wayland-csd-decoration 供调试窗口的客户端装饰使用。
+winit = { version = "0.30", default-features = false, features = [
+    "wayland",
+    "wayland-dlopen",
+    "wayland-csd-adwaita",
+    "rwh_06",
+] }
+# 壁纸层:wlr-layer-shell-unstable-v1(KWin / wlroots 系合成器);
+# 键盘输入用不到,去掉 xkbcommon 特性,免装 libxkbcommon 开发头文件。
+smithay-client-toolkit = { version = "0.21", default-features = false, features = ["calloop"] }
+wayland-client = "0.31"
+calloop = "0.14"
+calloop-wayland-source = "0.4"
+# KDE 壁纸插件桥:POSIX 共享内存(shm_open/mmap)
+libc = "0.2"
+# 让 WebKitGTK 的原生控件(<select> 弹出列表等)跟随应用内明暗主题
+gtk = "0.18"
+# SIGTERM/SIGINT 时还原桌面壁纸(否则被 kill 后桌面停在最后一帧)
+signal-hook = "0.3"
+# dmabuf 零拷贝输出(Vulkan external memory)
+ash = "0.38"
+# 与 wgpu 同版本的 wgpu-types:hal 纹理描述里的 TextureUses
+wgpu-types = "25"
+
 
 [profile.dev]
 opt-level = 1

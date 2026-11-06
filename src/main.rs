@@ -12,6 +12,10 @@ mod audio;
 mod ctl;
 mod hotkeys;
 mod ipc;
+#[cfg(target_os = "linux")]
+mod kde;
+#[cfg(target_os = "linux")]
+mod dmabuf;
 mod lazer;
 mod loader;
 mod logging;
@@ -22,7 +26,10 @@ mod soundtouch;
 mod stable;
 mod wall;
 
+#[cfg(windows)]
 pub use aria::win;
+#[cfg(target_os = "linux")]
+pub use aria::wayland as win;
 
 use ipc::{Command, Event};
 use playlist::{PlayMode, Track};
@@ -30,10 +37,30 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
+/// 应用正在退出:看门狗据此停止重拉壁纸子进程。
+static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn main() {
     // 壁纸渲染子进程模式:不初始化 Tauri/WebView2(自己的日志在 wall::main 里)
     if std::env::args().any(|a| a == "--wallpaper") {
         std::process::exit(wall::main());
+    }
+
+    // 救急:`aria --restore-wallpaper` 把桌面壁纸从 Aria 插件还原回原壁纸。
+    // 进程被 kill -9 / 崩溃时来不及还原,桌面会停在最后一帧;下次正常
+    // 启动也会自动还原并重新接管,这个命令给不想启动应用的人用。
+    #[cfg(target_os = "linux")]
+    if std::env::args().any(|a| a == "--restore-wallpaper") {
+        match kde::restore_wallpaper() {
+            Ok(()) => {
+                eprintln!("已还原桌面壁纸");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("还原桌面壁纸失败:{e}");
+                std::process::exit(1);
+            }
+        }
     }
 
     // 父进程 stderr 日志 + 可选文件记录(设置界面"日志记录"开关;
@@ -101,6 +128,8 @@ fn main() {
             set_set_override,
             clear_set_overrides,
             set_hotkeys,
+            platform,
+            set_ui_theme,
             quit_app,
             library_refresh,
             source_set,
@@ -175,6 +204,7 @@ fn main() {
                 }
             }
             tauri::RunEvent::Exit => {
+                QUITTING.store(true, std::sync::atomic::Ordering::Relaxed);
                 if let Some(mut c) = app.state::<ctl::WallState>().ctl.lock().unwrap().take() {
                     let _ = c.send(&Command::Quit);
                     let _ = c.child.kill();
@@ -195,6 +225,37 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(dir) = &st.stable_dir {
         let _ = stable::set_custom_stable_dir(Some(std::path::Path::new(dir)));
     }
+    // 壁纸子进程看门狗:子进程崩溃/被外部杀掉时自动重拉并恢复当前曲目。
+    // 否则桌面会停在最后一帧;plasmashell 一重启就直接黑屏(壁纸插件还在
+    // 等一个不存在的帧源)。
+    {
+        let handle = app.handle().clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            if QUITTING.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            let dead = {
+                let st = handle.state::<ctl::WallState>();
+                let mut guard = st.ctl.lock().unwrap();
+                match guard.as_mut() {
+                    Some(c) => !c.alive(),
+                    None => false,
+                }
+            };
+            if !dead {
+                continue;
+            }
+            log::warn!("[ctl] 壁纸子进程意外退出,自动重拉");
+            if let Err(e) = ctl::ensure_child(&handle) {
+                log::warn!("[ctl] 重拉失败: {e}");
+                continue;
+            }
+            if let Some(track) = current_playing_track(&handle) {
+                let _ = ctl::load_track(&handle, &track);
+            }
+        });
+    }
     // 上次保存的日志记录开关(子进程侧在 spawn 后由 SetLog 下发)
     if st.log_enabled {
         logging::set_enabled(true);
@@ -206,7 +267,21 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let hotkey_manager = hotkeys::init(app.handle().clone(), &hotkey_settings);
     app.manage(hotkey_manager);
 
-    build_tray(app)?;
+    if let Err(e) = build_tray(app) {
+        // 没有托盘宿主(部分 Linux 桌面/精简环境)时装不上托盘图标,
+        // 设置窗口仍可正常使用,不应该因此整个应用起不来。
+        eprintln!("系统托盘不可用(继续运行): {e}");
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        setup_kde_wallpaper(app.handle());
+        // 被 kill / 注销时也要还原壁纸:SIGKILL 拦不住,但 SIGTERM/SIGINT
+        // 能救回来(否则桌面停在最后一帧)
+        if kde::is_kde() {
+            install_signal_restore();
+        }
+    }
 
     if !std::env::args().any(|a| a == "--hidden") {
         show_main(app.handle());
@@ -293,6 +368,74 @@ fn trim_working_set() {
     }
 }
 
+/// 启动时准备 KDE 壁纸插件:安装到用户级 KPackage 目录,并把当前桌面
+/// 的壁纸插件切换成 Aria(退出时还原)。只在 KDE + Wayland 下动作。
+#[cfg(target_os = "linux")]
+fn setup_kde_wallpaper(app: &AppHandle) {
+    if !kde::is_kde() {
+        return;
+    }
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        log::warn!("[kde] 当前不是 Wayland 会话,跳过 Plasma 壁纸插件");
+        return;
+    }
+    // 用户主动开了调试窗口:不动系统壁纸
+    if app
+        .state::<ctl::WallState>()
+        .settings
+        .lock()
+        .unwrap()
+        .debug_window
+    {
+        return;
+    }
+    // 打包后插件包随 resources 分发:把实际路径交给安装逻辑
+    if std::env::var_os("ARIA_KDE_PACKAGE").is_none() {
+        if let Ok(res) = app.path().resource_dir() {
+            let cand = res.join("kde/wallpaper");
+            if cand.join("metadata.json").is_file() {
+                // 单线程 setup,无并发读写环境变量的风险
+                unsafe { std::env::set_var("ARIA_KDE_PACKAGE", &cand) };
+            }
+        }
+    }
+    if let Err(e) = kde::install_plugin() {
+        log::warn!("[kde] 壁纸插件安装失败:{e}");
+        return;
+    }
+    match kde::enable_wallpaper() {
+        Ok(prev) => log::info!("[kde] 已切换到 Aria 壁纸插件(原壁纸: {prev:?})"),
+        Err(e) => log::warn!("[kde] 切换 Plasma 壁纸失败:{e}"),
+    }
+}
+
+/// SIGTERM / SIGINT:还原壁纸后退出(异步信号安全:signal-hook 的
+/// 迭代器在专用线程上收信号,真正的 qdbus 调用不在信号处理函数里做)。
+#[cfg(target_os = "linux")]
+fn install_signal_restore() {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    match signal_hook::iterator::Signals::new([SIGTERM, SIGINT]) {
+        Ok(mut signals) => {
+            std::thread::spawn(move || {
+                for sig in signals.forever() {
+                    log::info!("[kde] 收到信号 {sig},还原桌面壁纸后退出");
+                    let _ = kde::restore_wallpaper();
+                    std::process::exit(0);
+                }
+            });
+        }
+        Err(e) => log::warn!("[kde] 信号监听安装失败:{e}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn restore_kde_wallpaper() {
+    match kde::restore_wallpaper() {
+        Ok(()) => log::info!("[kde] 已还原桌面壁纸"),
+        Err(e) => log::warn!("[kde] 还原桌面壁纸失败:{e}"),
+    }
+}
+
 fn show_main(app: &AppHandle) {
     match app.get_webview_window("main") {
         Some(w) => {
@@ -318,6 +461,8 @@ fn recreate_main(app: &AppHandle) {
 }
 
 fn quit_app_inner(app: &AppHandle) {
+    #[cfg(target_os = "linux")]
+    restore_kde_wallpaper();
     let _ = ctl::send_cmd(app, Command::Quit);
     let handle = app.clone();
     std::thread::spawn(move || {
@@ -394,6 +539,13 @@ fn restart_wallpaper(app: AppHandle) -> Result<(), String> {
 
 /// 结束并重新启动 explorer.exe,让 shell 重建 Progman / DefView / WorkerW。
 /// 任务栏会闪一下。壁纸窗口若挂在 Progman 下,会随 explorer 退出而销毁。
+#[cfg(not(windows))]
+#[tauri::command]
+fn restart_explorer() -> Result<(), String> {
+    Err("Linux 没有 explorer.exe;壁纸由 Plasma 壁纸插件承载,重启应用即可".into())
+}
+
+#[cfg(windows)]
 #[tauri::command]
 fn restart_explorer() -> Result<(), String> {
     use std::os::windows::process::CommandExt;
@@ -1158,12 +1310,17 @@ fn set_target_star(app: AppHandle, star: Option<f64>) -> Result<(), String> {
 /// 带上本次实际挑中的 sha2)。`load_track` 每次载入都同步 lazer_set 与
 /// 运行期的 loaded_sha2,这里即播放真相:前端 loaded 事件/轮询兜底以
 /// 此对齐,难度下拉跟随真实播放。
-#[tauri::command]
-fn playing_track(app: AppHandle) -> Option<crate::playlist::Track> {
+/// 当前实际播放的曲目(载入时同步的 lazer_set + loaded_sha2)。
+fn current_playing_track(app: &AppHandle) -> Option<Track> {
     let state = app.state::<ctl::WallState>();
     let set_id = state.settings.lock().unwrap().lazer_set.clone();
     let sha2 = state.loaded_sha2.lock().unwrap().clone();
-    set_id.map(|set_id| crate::playlist::Track { set_id, sha2, qid: 0, ..Default::default() })
+    set_id.map(|set_id| Track { set_id, sha2, qid: 0, ..Default::default() })
+}
+
+#[tauri::command]
+fn playing_track(app: AppHandle) -> Option<crate::playlist::Track> {
+    current_playing_track(&app)
 }
 
 /// 曲库全局星级下限(0 = 不过滤)。
@@ -1183,14 +1340,27 @@ fn open_url(url: String) -> Result<(), String> {
     if !url.starts_with("https://") && !url.starts_with("http://") {
         return Err(format!("仅支持 http(s) 链接:{url}"));
     }
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "", &url])
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("打开浏览器失败:{e}"))
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        return std::process::Command::new("cmd")
+            .args(["/C", "start", "", &url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("打开浏览器失败:{e}"));
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("打开浏览器失败:{e}"))
+    }
 }
 
 /// 手动指定 ffmpeg/ffprobe 完整路径(None = 恢复 PATH 查找)。
@@ -1800,8 +1970,16 @@ fn set_debug_window(app: AppHandle, on: bool) -> Result<(), String> {
         s.debug_window = on;
         settings::save(&app, &s);
     }
-    ctl::send_cmd(&app, Command::SetDebugWindow { on });
-    Ok(())
+    #[cfg(target_os = "linux")]
+    {
+        // KDE 壁纸模式下没有窗口可切:按新设置重启渲染进程。
+        return ctl::restart(&app);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        ctl::send_cmd(&app, Command::SetDebugWindow { on });
+        Ok(())
+    }
 }
 
 /// 超分模式(off / fsr / anime4k-a|b|c):实时热切换 —— 视频链即时
@@ -2081,6 +2259,33 @@ async fn set_hotkeys(
         toggle: parsed.toggle,
         next: parsed.next,
     })
+}
+
+/// 应用内明暗主题 → GTK 原生控件外观。
+///
+/// `<select>` 的**弹出列表**、滚动条、复选框、文件对话框都由 GTK 画,
+/// 网页 CSS 只能管到收起的那个控件;GTK 只看
+/// `gtk-application-prefer-dark-theme`。不通知它的话,KDE 深色模式下
+/// 会看到"有的下拉菜单是亮的"。
+#[tauri::command]
+fn set_ui_theme(dark: bool) {
+    #[cfg(target_os = "linux")]
+    {
+        use gtk::prelude::*;
+        if let Some(settings) = gtk::Settings::default() {
+            settings.set_gtk_application_prefer_dark_theme(dark);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = dark;
+    }
+}
+
+/// 前端按平台隐藏 Windows 专属项(重启 Explorer、全局快捷键)。
+#[tauri::command]
+fn platform() -> &'static str {
+    if cfg!(windows) { "windows" } else { "linux" }
 }
 
 #[tauri::command]

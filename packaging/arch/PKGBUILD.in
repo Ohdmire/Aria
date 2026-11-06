@@ -1,0 +1,51 @@
+# 本地源码包模板:build-package.sh 会替换 @PKGVER@ 后生成 PKGBUILD。
+# 源码只有 Aria 的 git HEAD;osu-replay-render 是 Cargo.toml 里的 git 依赖,
+# 构建时由 cargo 拉取(需要网络或已有缓存)。
+pkgname=aria
+pkgver=@PKGVER@
+pkgrel=1
+pkgdesc='osu! storyboard 桌面动态壁纸播放器(Linux Wayland / KDE Plasma 6)'
+arch=('x86_64')
+url='https://github.com/Ohdmire/Aria'
+license=('MIT')
+depends=(
+    'webkit2gtk-4.1' 'gtk3' 'libayatana-appindicator' 'librsvg'
+    'alsa-lib' 'vulkan-icd-loader' 'libglvnd' 'wayland' 'libxkbcommon'
+    'fontconfig' 'freetype2' 'harfbuzz' 'libsoup3'
+    'gstreamer' 'gst-plugins-base-libs'
+    'qt6-declarative'
+    # 视频 storyboard 解码与视频探测(ffmpeg 包同时提供 ffprobe)
+    'ffmpeg'
+)
+makedepends=('rust' 'cargo' 'git' 'cmake' 'qt6-base' 'pkgconf' 'zstd')
+# native/soundtouch 的 .o 由 cc 编译后交给 rust-lld 链接;makepkg 的
+# -flto=auto 会产出 GCC LTO bitcode,rust-lld 解析不了(undefined symbol
+# st_new/st_set_channels),所以本包关掉 LTO。
+options=('!lto')
+source=("aria-$pkgver-src.tar.zst")
+sha256sums=('SKIP')
+
+build() {
+    cd "$srcdir/aria-$pkgver"
+    cargo build --release --locked
+    cmake -S kde/plugin -B build-kde-plugin -DCMAKE_BUILD_TYPE=Release
+    cmake --build build-kde-plugin -j"$(nproc)"
+}
+
+package() {
+    cd "$srcdir/aria-$pkgver"
+    install -Dm755 target/release/aria "$pkgdir/usr/bin/aria"
+
+    # 随包资源:启动时从这里把壁纸插件装到 ~/.local/share/plasma/wallpapers
+    install -dm755 "$pkgdir/usr/share/aria/kde"
+    cp -a kde/wallpaper "$pkgdir/usr/share/aria/kde/"
+
+    install -Dm644 packaging/arch/aria.desktop \
+        "$pkgdir/usr/share/applications/com.ohdmire.aria.desktop"
+    install -Dm644 icons/128x128.png \
+        "$pkgdir/usr/share/icons/hicolor/128x128/apps/com.ohdmire.aria.png"
+    install -Dm644 icons/32x32.png \
+        "$pkgdir/usr/share/icons/hicolor/32x32/apps/com.ohdmire.aria.png"
+    install -Dm644 icons/icon.png \
+        "$pkgdir/usr/share/icons/hicolor/1024x1024/apps/com.ohdmire.aria.png"
+}

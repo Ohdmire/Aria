@@ -8,3 +8,13 @@ node_modules
 
 # 图标 SVG 源文件禁止入库(仅产物入库)
 icons/ARIA.svg
+
+# KDE 壁纸插件构建产物(scripts/build-kde-plugin.sh 生成)
+kde/wallpaper/contents/ui/aria/libariaplugin.so
+
+# pacman 本地打包产物
+packaging/arch/PKGBUILD
+packaging/arch/*.tar.zst
+packaging/arch/*.pkg.tar.zst
+packaging/arch/src/
+packaging/arch/pkg/

@@ -27,6 +27,11 @@ fn main() {
         .include(st.join("include"))
         .include(&src)
         .shared_flag(false)
-        .pic(false)
+        // Linux 下 Rust 默认以 PIE 链接(x86_64),目标文件必须带 -fPIC,
+        // 否则部分重定位在链接期报 R_X86_64_32S / 只读段重定位。
+        .pic(!cfg!(windows))
         .compile("soundtouch");
+    if cfg!(target_os = "linux") {
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+    }
 }

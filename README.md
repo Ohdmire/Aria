@@ -13,9 +13,30 @@ osu! storyboard 动态桌面壁纸
 
 ## 快速开始
 
+### Windows
+
 Release 下载安装 exe 即用
 - 如电脑内未安装 `ffmpeg` 则第一次下载需要下载带 `-ffmpeg` 的安装包 
 - 后续更新可以直接下载不带 `-ffmpeg` 的
+
+### Linux(Wayland / KDE Plasma 6)
+
+只支持 Wayland;壁纸以 Plasma 壁纸插件的形式挂在桌面 containment 里,
+**桌面图标、任务栏都正常显示**。画面通过 **dmabuf 零拷贝**交给
+plasmashell(1440p 实测 ~120fps,CPU 只有共享内存路径的 1/4)。
+
+```bash
+scripts/build-kde-plugin.sh --install   # 构建 QML 原生控件 + 安装插件包
+cargo build --release                   # 需要 Qt6 + EGL/GLES 开发包、Vulkan 驱动
+./target/release/aria
+```
+
+> 这一版在 `Cargo.toml` 里有一行 `[patch]`,把 `osu-replay-render` 指到
+> 同级的 `../osu-replay-render`(需要它暴露 `Renderer::target_texture()`
+> 才能导出 dmabuf)。上游合并后删掉即可。
+
+启动后会自动安装并切换 Plasma 壁纸,退出时还原。细节、限制与曲库位置
+见 [docs/linux-wayland.md](docs/linux-wayland.md)。
 
 ## 核心特色
 
@@ -26,8 +47,9 @@ Release 下载安装 exe 即用
 
 ## 注意事项
 
-- 设置与播放列表保存在 `%APPDATA%\com.ohdmire.aria\`
+- 设置与播放列表保存在 `%APPDATA%\com.ohdmire.aria\`(Linux:`~/.local/share/com.ohdmire.aria/`)
 - 桌面挂接在 26200 上的实测和约束见 [docs/desktop-wallpaper.md](docs/desktop-wallpaper.md)
+- Linux/Wayland 的实现方式与限制见 [docs/linux-wayland.md](docs/linux-wayland.md)
 
 ## 使用的开源库
 
@@ -42,7 +64,8 @@ osu! 是 Ppy Pty Ltd 的游戏;本项目与 ppy 无关 · MIT License
 
 ```bash
 cargo build --release
-pnpm build:setup:all
+pnpm build:setup:all          # Windows 安装包
+# Linux:先用 scripts/build-kde-plugin.sh 构建壁纸插件,再 pnpm tauri build
 ```
 
 ## 赞助

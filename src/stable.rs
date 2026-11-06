@@ -43,6 +43,7 @@ pub fn stable_root() -> Option<PathBuf> {
     stable_root_auto()
 }
 
+#[cfg(windows)]
 fn stable_root_auto() -> Option<PathBuf> {
     // 注册表 path(安装器写入;卸载残留只有 UninstallID 时不算)
     if let Ok(key) = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
@@ -67,6 +68,69 @@ fn stable_root_auto() -> Option<PathBuf> {
         let p = PathBuf::from(format!("{}:\\osu!", letter as char));
         if p.join("osu!.db").is_file() {
             return Some(p);
+        }
+    }
+    None
+}
+
+/// Linux:osu!stable 只能跑在 Wine/Proton 里,没有注册表可查。
+/// 依次探测显式环境变量、Wine 前缀里的常见安装位置、osu-wine 脚本
+/// 的默认目录;都不中就靠设置里的"手动指定 stable 目录"。
+#[cfg(not(windows))]
+fn stable_root_auto() -> Option<PathBuf> {
+    let ok = |p: PathBuf| p.join("osu!.db").is_file().then_some(p);
+
+    if let Some(dir) = std::env::var_os("OSU_STABLE_DIR") {
+        if let Some(p) = ok(PathBuf::from(dir)) {
+            return Some(p);
+        }
+    }
+
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+
+    // osu-wine / 手工解包的常见摆法
+    for p in [
+        home.join("osu!"),
+        home.join("osu"),
+        home.join(".local/share/osu-wine/osu!"),
+        home.join(".local/share/osu-wine/osu"),
+        home.join("Games/osu!"),
+    ] {
+        if let Some(p) = ok(p) {
+            return Some(p);
+        }
+    }
+
+    // Wine 前缀:drive_c/users/<user>/AppData/Local/osu! 与 drive_c/osu!
+    let mut prefixes: Vec<PathBuf> = Vec::new();
+    for var in ["WINEPREFIX", "STEAM_COMPAT_DATA_PATH"] {
+        if let Some(v) = std::env::var_os(var) {
+            prefixes.push(PathBuf::from(v));
+        }
+    }
+    prefixes.push(home.join(".wine"));
+    if let Ok(rd) = std::fs::read_dir(home.join(".local/share/wineprefixes")) {
+        for e in rd.flatten() {
+            prefixes.push(e.path());
+        }
+    }
+    if let Ok(rd) = std::fs::read_dir(home.join(".local/share/lutris/prefixes")) {
+        for e in rd.flatten() {
+            prefixes.push(e.path());
+        }
+    }
+    for prefix in prefixes {
+        let drive_c = prefix.join("drive_c");
+        if let Some(p) = ok(drive_c.join("osu!")) {
+            return Some(p);
+        }
+        if let Ok(users) = std::fs::read_dir(drive_c.join("users")) {
+            for u in users.flatten() {
+                let local = u.path().join("AppData/Local/osu!");
+                if let Some(p) = ok(local) {
+                    return Some(p);
+                }
+            }
         }
     }
     None

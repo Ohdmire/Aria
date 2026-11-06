@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Aria
+GenericName=osu! 动态壁纸
+Comment=把 osu! 谱面 storyboard 播放成 KDE 桌面动态壁纸
+Exec=aria
+Icon=com.ohdmire.aria
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=osu;wallpaper;storyboard;壁纸;
+StartupNotify=true
+StartupWMClass=aria
