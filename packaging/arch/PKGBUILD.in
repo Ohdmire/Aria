@@ -3,7 +3,7 @@
 # 构建时由 cargo 拉取(需要网络或已有缓存)。
 pkgname=aria
 pkgver=@PKGVER@
-pkgrel=1
+pkgrel=2
 pkgdesc='osu! storyboard 桌面动态壁纸播放器(Linux Wayland / KDE Plasma 6)'
 arch=('x86_64')
 url='https://github.com/Ohdmire/Aria'

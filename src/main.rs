@@ -826,9 +826,10 @@ fn track_display_meta(
     (title, artist, diff.length_ms)
 }
 
-/// 曲库加入播放列表。默认**谱面集级**入列(播放时按目标星级解析
-/// 难度);难度 chip 传入 `sha2` 固定难度;`lockDiff = true` 且未传
-/// `sha2` 时按当前目标星级策略解析一档并锁定(与批量导入同口径)。
+/// 曲库加入播放列表。难度优先级:显式 `sha2`(难度 chip)> 本次加入
+/// 所选的 `target` 策略(None = 最难)> 设置页默认值不再参与 —— 之前
+/// 这里的 `target` 被设置页的 `target_star` 覆盖,导致"加入时选最难"
+/// 实际按设置页的自定义星级挑。
 #[tauri::command]
 async fn playlist_add(
     app: AppHandle,
@@ -844,16 +845,11 @@ async fn playlist_add(
         let state = app2.state::<ctl::WallState>();
         let source = state.settings.lock().unwrap().source.clone();
         let lib = ctl::library(&app2, &source, false)?;
-        let (target, unicode) = {
-            let s = state.settings.lock().unwrap();
-            (s.target_star, s.display_unicode)
-        };
+        let unicode = state.settings.lock().unwrap().display_unicode;
         let Some(set) = lib.sets.iter().find(|s| s.id == set_id) else {
             return Err::<_, String>("谱面集不在曲库中".into());
         };
-        // 显式 sha2(难度 chip 右键)优先;否则按策略挑最相近锁定
-        let sha2 = sha2
-            .or_else(|| Some(playlist::pick_diff(set, playlist::policy_of(target)).sha2.clone()));
+        let sha2 = Some(resolve_add_sha2(set, sha2, target));
         let (title, artist, length_ms) = track_display_meta(set, sha2.as_deref(), target, unicode);
         let mut playlist = state.playlist.lock().unwrap();
         let added = playlist.add(set_id.clone(), sha2, mods, title, artist, length_ms);
@@ -868,6 +864,14 @@ async fn playlist_add(
         reload_current(&app, track).await?;
     }
     Ok(added)
+}
+
+/// 入列时锁定的难度:显式 `sha2` 优先,否则按本次加入所选策略
+/// (None = 最难,Some(-1) = 最容易,Some(x) = 星级最接近 x)。
+/// **不读设置页默认值** —— 之前 `playlist_add` 里 `target` 被设置页的
+/// `target_star` 覆盖,收藏夹里选"最难"也按自定义星级挑。
+fn resolve_add_sha2(set: &lazer::LazerSet, sha2: Option<String>, target: Option<f64>) -> String {
+    sha2.unwrap_or_else(|| playlist::pick_diff(set, playlist::policy_of(target)).sha2.clone())
 }
 
 /// 批量加入播放列表(曲库过滤结果的"添加到播放列表"按钮):一次锁、
@@ -2300,4 +2304,47 @@ fn set_dblclick_add(app: AppHandle, on: bool) -> Result<(), String> {
 #[tauri::command]
 fn quit_app(app: AppHandle) {
     quit_app_inner(&app);
+}
+
+#[cfg(test)]
+mod add_diff_tests {
+    use super::*;
+
+    fn set_with(stars: &[(&str, f64)]) -> lazer::LazerSet {
+        let beatmaps = stars
+            .iter()
+            .map(|(sha2, star)| lazer::LazerBeatmap {
+                sha2: (*sha2).to_string(),
+                name: (*sha2).to_string(),
+                star_rating: *star,
+                ..Default::default()
+            })
+            .collect();
+        lazer::LazerSet { beatmaps, ..Default::default() }
+    }
+
+    /// 入列时"最难"必须是整集最高星,不受设置页默认值影响。
+    #[test]
+    fn hardest_picks_max_star() {
+        let set = set_with(&[("easy", 2.0), ("insane", 6.5), ("hard", 4.0)]);
+        assert_eq!(resolve_add_sha2(&set, None, None), "insane");
+    }
+
+    #[test]
+    fn easiest_picks_min_star() {
+        let set = set_with(&[("easy", 2.0), ("insane", 6.5), ("hard", 4.0)]);
+        assert_eq!(resolve_add_sha2(&set, None, Some(-1.0)), "easy");
+    }
+
+    #[test]
+    fn custom_picks_nearest_star() {
+        let set = set_with(&[("easy", 2.0), ("insane", 6.5), ("hard", 4.0)]);
+        assert_eq!(resolve_add_sha2(&set, None, Some(4.2)), "hard");
+    }
+
+    #[test]
+    fn explicit_sha2_wins() {
+        let set = set_with(&[("easy", 2.0), ("insane", 6.5)]);
+        assert_eq!(resolve_add_sha2(&set, Some("easy".into()), None), "easy");
+    }
 }

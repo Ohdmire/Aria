@@ -638,7 +638,7 @@ function bindLibRow(el, setId, sha2) {
     () => previewSet(setId, sha2),
     () => {
       if (state.dblAdd) {
-        invoke('playlist_add', { setId, sha2: sha2 ?? null, mods: 0 })
+        invoke('playlist_add', { setId, sha2: sha2 ?? null, mods: 0, target: sha2 ? null : policyTarget() })
           .then(() => {
             toast('已加入播放列表');
             refreshQueue();
@@ -1244,12 +1244,13 @@ $('mods-ok').addEventListener('click', async () => {
       await invoke('queue_set_mods', { qids: ctx.qids, mods: bits });
       toast(`已将所选 ${ctx.qids.length} 个条目的 mods 统一为${bits ? ' ' + describeMods(bits) : '无'}`);
     } else if (ctx.mode === 'batch') {
-      const { target } = readPolicySelection(null);
+      const { target } = readPolicySelection();
+      const collMode = $('mods-policy').value === 'coll';
       const n = await invoke('playlist_add_batch', {
         items: filteredSets().map((s) => {
-          // 收藏筛选激活:只在命中的难度里挑(单命中=该档,多命中=策略
-          // 最相近);未激活 = 后端全集按策略挑
-          const sha2 = collPickSha2(s, target);
+          // 只有「当前难度(收藏命中)」收窄到收藏命中的难度;最难/最容易/
+          // 自定义星级都按每个谱面集整集挑。
+          const sha2 = collMode ? collPickSha2(s, target) : null;
           return { setId: s.id, sha2, mods: bits, target: sha2 ? null : target };
         }),
       });
@@ -1260,7 +1261,7 @@ $('mods-ok').addEventListener('click', async () => {
     } else {
       // 难度 = 策略行所选:「所选难度」(chip)/ 最难 / 最容易 / 自定义
       // 星级(输入框);收藏筛选激活时只在命中难度里挑
-      const { sha2, target } = readPolicySelection(ctx.setId);
+      const { sha2, target } = readPolicySelection();
       const added = await invoke('playlist_add', { setId: ctx.setId, sha2, mods: bits, target });
       toast(added ? '已添加到播放列表' : '已替换现有条目参数');
     }
@@ -2572,7 +2573,7 @@ function setPolicy(mode, star) {
 /// 自定义星级读内联输入框,非法时退回设置页的默认值。选择只在本次
 /// 导入生效,不回写默认)。`setId` 提供时叠加收藏筛选命中难度(只在
 /// 命中的难度里挑)。
-function readPolicySelection(setId) {
+function readPolicySelection() {
   const v = $('mods-policy').value;
   if (v === 'coll') {
     // 当前难度(收藏命中):每集锁命中那档;多命中 fallback 按默认
@@ -2585,18 +2586,14 @@ function readPolicySelection(setId) {
     if (!Number.isFinite(sv) || sv <= 0) {
       return { sha2: null, target: targetStar }; // 输入无效:退回设置页默认
     }
-    const picked = setId ? (() => {
-      const set = state.lib?.find((x) => x.id === setId);
-      return set ? collPickSha2(set, sv) : null;
-    })() : null;
-    return { sha2: picked, target: picked ? null : sv };
+    // 自定义星级按**整集**挑;收藏命中那档由置顶「当前难度」项负责
+    return { sha2: null, target: sv };
   }
   const t = v === 'easiest' ? -1 : null;
-  const picked = setId ? (() => {
-    const set = state.lib?.find((x) => x.id === setId);
-    return set ? collPickSha2(set, t) : null;
-  })() : null;
-  return { sha2: picked, target: picked ? null : t };
+  // 「最难 / 最容易」按**整集**挑(谱面集级);收藏筛选时若想锁命中那档,
+  // 选置顶的「当前难度」。以前这里会先 collPickSha2 收窄到收藏命中，
+  // 结果"最难"只等于收藏里最难,不是谱面集最难。
+  return { sha2: null, target: t };
 }
 
 /// 多选「设置难度」:按策略锁定所选条目的难度(单难度集即那一档)。

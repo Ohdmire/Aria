@@ -25,7 +25,7 @@ pub struct LazerFile {
     pub size: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Default, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LazerBeatmap {
     pub sha2: String,
@@ -47,7 +47,7 @@ pub struct LazerBeatmap {
     pub online_id: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Default, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LazerSet {
     pub id: String,
