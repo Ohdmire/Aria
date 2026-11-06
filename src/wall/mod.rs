@@ -12,7 +12,10 @@
 use crate::audio::AudioOut;
 use crate::ipc::{Command, Event, PpGame, VFile};
 use crate::loader::{Library, LoadedWall};
-use crate::win::{self, WallpaperHost};
+// 平台层:Windows → `aria::win`(WorkerW 挂接);Linux → `aria::wayland`
+// (显示器枚举 + 共享内存/KDE 相关)。两者都由 `main.rs` 以 `win` 名字
+// 重导出,`wall` 子进程也走同一个入口。
+use crate::win;
 use osu_replay_render::draw::{Atlas, DrawList};
 use osu_replay_render::scene::{Assets, SceneState};
 use osu_replay_render::storyboard::{self, Assets as SbAssets, StoryboardLayer};
@@ -28,6 +31,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+#[cfg(windows)]
 use winit::platform::windows::WindowAttributesExtWindows;
 use winit::window::{Window, WindowAttributes};
 
@@ -36,11 +40,119 @@ const REATTACH_DELAY: Duration = Duration::from_secs(3);
 /// 纯净模式/渲染暂停(无窗口)下的播放推进周期:~60Hz 足够音效对齐与人眼进度条。
 const PURE_TICK: Duration = Duration::from_millis(15);
 /// 自动暂停迟滞:桌面连续被遮挡多久才暂停渲染(防全屏切换瞬态抖动)。
+#[cfg(windows)]
 const COVER_HOLD: Duration = Duration::from_millis(1000);
 /// 桌面重新可见多久才恢复渲染(重建会话有成本,避免闪烁)。
+#[cfg(windows)]
 const UNCOVER_HOLD: Duration = Duration::from_millis(500);
 /// 场景内部分辨率长边封顶(4K 桌面降载;2K 屏原生)。
+/// 可用 `ARIA_SCENE_MAX` 覆盖(弱 GPU / 想换更高帧率时的诊断与降载开关)。
 const SCENE_MAX_LONG: u32 = 2560;
+
+fn scene_max_long() -> u32 {
+    std::env::var("ARIA_SCENE_MAX")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v >= 640)
+        .unwrap_or(SCENE_MAX_LONG)
+}
+
+/// 渲染输出端。
+///
+/// - `Window`:wgpu surface 直接呈现到窗口(Win32 WorkerW / 调试窗口);
+/// - `Shm`:Linux KDE 壁纸插件模式 —— 场景离屏渲染,帧写进共享内存,
+///   由 plasmashell 桌面 containment 里的 QML 控件显示(图标在它上面,
+///   不会被盖住)。
+enum Sink {
+    Window(SurfaceRenderer),
+    #[cfg(target_os = "linux")]
+    Shm(crate::kde::ShmSink),
+}
+
+impl Sink {
+    fn new(
+        target: Target,
+        width: u32,
+        height: u32,
+        atlas: &Atlas,
+    ) -> Result<Sink, String> {
+        match target {
+            Target::Window { raw_display, raw_window } => {
+                SurfaceRenderer::new(width, height, atlas, raw_display, raw_window)
+                    .map(Sink::Window)
+                    .map_err(|e| format!("初始化渲染失败: {e}"))
+            }
+            #[cfg(target_os = "linux")]
+            Target::Shm => crate::kde::ShmSink::new(width, height, atlas).map(Sink::Shm),
+        }
+    }
+
+    fn scene_size(&self) -> (u32, u32) {
+        match self {
+            Sink::Window(s) => s.scene_size(),
+            #[cfg(target_os = "linux")]
+            Sink::Shm(s) => s.scene_size(),
+        }
+    }
+
+    fn set_atlas(&mut self, atlas: &Atlas) {
+        match self {
+            Sink::Window(s) => s.set_atlas(atlas),
+            #[cfg(target_os = "linux")]
+            Sink::Shm(s) => s.set_atlas(atlas),
+        }
+    }
+
+    fn resize(&mut self, width: u32, height: u32) {
+        match self {
+            Sink::Window(s) => s.resize(width, height),
+            #[cfg(target_os = "linux")]
+            Sink::Shm(s) => s.resize(width, height),
+        }
+    }
+
+    fn device(&self) -> &wgpu::Device {
+        match self {
+            Sink::Window(s) => s.device(),
+            #[cfg(target_os = "linux")]
+            Sink::Shm(s) => s.device(),
+        }
+    }
+
+    fn queue(&self) -> &wgpu::Queue {
+        match self {
+            Sink::Window(s) => s.queue(),
+            #[cfg(target_os = "linux")]
+            Sink::Shm(s) => s.queue(),
+        }
+    }
+
+    fn renderer_mut(&mut self) -> &mut osu_replay_render::render::Renderer {
+        match self {
+            Sink::Window(s) => s.renderer_mut(),
+            #[cfg(target_os = "linux")]
+            Sink::Shm(s) => s.renderer_mut(),
+        }
+    }
+
+    fn render(&mut self, list: &DrawList, clear: [f64; 4]) -> bool {
+        match self {
+            Sink::Window(s) => s.render(list, clear),
+            #[cfg(target_os = "linux")]
+            Sink::Shm(s) => s.render(list, clear),
+        }
+    }
+}
+
+/// 渲染目标:窗口原始句柄,或 KDE 共享内存。
+enum Target {
+    Window {
+        raw_display: raw_window_handle::RawDisplayHandle,
+        raw_window: raw_window_handle::RawWindowHandle,
+    },
+    #[cfg(target_os = "linux")]
+    Shm,
+}
 
 /// 渲染模式(设置 render_mode 的运行期形态)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,9 +239,19 @@ pub fn main() -> i32 {
     // 探测程序能铺满桌面的前提:物理像素,以及 DX12。父进程 spawn 时会设
     // WGPU_BACKEND;直接 --wallpaper 启动时这里补上,避免落到 Vulkan。
     win::enable_per_monitor_dpi();
+    #[cfg(windows)]
     if std::env::var_os("WGPU_BACKEND").is_none() {
         unsafe { std::env::set_var("WGPU_BACKEND", "dx12") };
     }
+
+    // 输出方式:Linux 上父进程按"KDE Plasma 壁纸插件可用"与否传
+    // ARIA_OUTPUT=kde;其余情况都是窗口直渲(Win32 桌面层 / 调试窗口)。
+    let kde_output = std::env::var("ARIA_OUTPUT").map(|v| v == "kde").unwrap_or(false);
+    #[cfg(not(target_os = "linux"))]
+    let kde_output = {
+        let _ = kde_output;
+        false
+    };
     let _ = crate::logging::init();
     let preview = parse_preview_args();
     if let Some((w, h)) = preview {
@@ -164,7 +286,7 @@ pub fn main() -> i32 {
     let audio_device = std::env::var("ARIA_AUDIO_DEVICE")
         .ok()
         .filter(|s| !s.is_empty());
-    let mut app = WallApp::new(out, proxy, audio_device, preview, cmd_inbox);
+    let mut app = WallApp::new(out, proxy, audio_device, preview, kde_output, cmd_inbox);
     app.rebuild_audio();
     // 设备热拔插事件(kira → wasapi-rs → WASAPI):插回/默认切换即时
     // 响应;订阅失败时内部的轮询探测兜底仍在
@@ -337,7 +459,7 @@ enum MapSource {
 /// 资源(含 SurfaceRenderer)。**全部就绪后音频 + 音效 + 画面一起起播**,
 /// 不会出现"BGM 先响、音效迟半拍"。
 struct RenderSession {
-    surf: SurfaceRenderer,
+    surf: Sink,
     sb_layer: Option<StoryboardLayer>,
     sb_samples: Vec<(f32, f32, kira::sound::static_sound::StaticSoundData)>,
     atlas: Atlas,
@@ -630,10 +752,11 @@ mod clock_tests {
 /// 16:9 场景内部分辨率:贴合桌面(不超出),长边封顶 2560(4K 桌面降载;
 /// 2K 16:9 屏正好原生)。blit 再 letterbox 到任意桌面比例。
 fn scene_size(desk_w: u32, desk_h: u32) -> (u32, u32) {
+    let cap = scene_max_long();
     let mut h = desk_h.min(desk_w * 9 / 16).max(1);
     let mut w = h * 16 / 9;
-    if w > SCENE_MAX_LONG {
-        w = SCENE_MAX_LONG;
+    if w > cap {
+        w = cap;
         h = w * 9 / 16;
     }
     (w & !1, h & !1)
@@ -773,6 +896,7 @@ struct WallApp {
     covered_at: Instant,
     /// 壁纸窗口 HWND(遮挡检测用;渲染暂停、窗口销毁后仍保留,
     /// 新窗口创建时更新)。
+    #[cfg(windows)]
     wall_hwnd: Option<windows::Win32::Foundation::HWND>,
     /// 当前曲目的谱面来源(渲染会话重建用;暂停恢复零重读)。
     source: Option<MapSource>,
@@ -785,11 +909,11 @@ struct WallApp {
     fps_measure_at: Instant,
     // 壁纸窗口(空 = 桌面空闲);GPU 会话在 Load 时按需构建
     window: Option<Arc<Window>>,
-    host: Option<WallpaperHost>,
+    host: Option<win::Host>,
     desk: (u32, u32),
     // autoplay 会话(Arc:构建期间与字段借用解耦)
     game: Option<Arc<game::GameData>>,
-    surf: Option<SurfaceRenderer>,
+    surf: Option<Sink>,
     atlas: Option<Atlas>,
     fonts: Option<Fonts>,
     skin: Option<skin::ResolvedSkin>,
@@ -808,6 +932,15 @@ struct WallApp {
     /// 调试窗口模式(设置项/挂接失败兜底):与 preview_size 同形态
     /// (常规带边框窗口,不挂桌面)。--preview 参数优先且运行期不可关。
     debug_window: bool,
+    /// Linux KDE 壁纸插件模式:不建窗口,离屏渲染 + 共享内存发布,
+    /// 画面由 plasmashell 的壁纸 item 显示(桌面图标不会被盖住)。
+    kde_output: bool,
+    /// 上一帧耗时告警的节流时间。
+    stall_log_at: Instant,
+    /// 目标屏刷新率(Hz;创建窗口/会话时探一次,帧调度只读这个值)。
+    /// 每帧再枚举显示器会各开一次 Wayland 连接 + roundtrip,是实打实的
+    /// 渲染阻塞,绝不能放在热路径上。
+    refresh_hz: u32,
     /// 加载序号:每次 apply_load 自增。PP 补算等后台任务携带发起时的
     /// 序号,落地时与当前不符(已切歌/重载)即丢弃,防止旧曲数据热
     /// 替换到新曲上。
@@ -826,6 +959,7 @@ impl WallApp {
         proxy: EventLoopProxy<UserEvent>,
         audio_device: Option<String>,
         preview: Option<(u32, u32)>,
+        kde_output: bool,
         cmd_inbox: Arc<Mutex<Vec<Command>>>,
     ) -> WallApp {
         WallApp {
@@ -910,6 +1044,7 @@ impl WallApp {
             ffprobe_bin: None,
             covered: false,
             covered_at: Instant::now(),
+            #[cfg(windows)]
             wall_hwnd: None,
             source: None,
             clock: Clock { t: 0.0, playing: false, speed: 1.0, wall_t: 0.0, wall_at: None, seek_target: None, jumped: false },
@@ -919,6 +1054,9 @@ impl WallApp {
             status_at: Instant::now(),
             preview_size: preview,
             debug_window: false,
+            kde_output: kde_output,
+            stall_log_at: Instant::now(),
+            refresh_hz: 60,
             load_seq: 0,
             cmd_inbox,
             atlas_limit: 0,
@@ -1621,16 +1759,18 @@ impl WallApp {
         if self.window.is_none() && self.create_window(event_loop).is_err() {
             return Err(String::new()); // 错误事件已在 create_window 内上报
         }
-        let Some(window) = self.window.clone() else { return Err("无壁纸窗口".into()) };
-        use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-        let raw_display = window
-            .display_handle()
-            .map_err(|e| format!("display handle: {e}"))?
-            .as_raw();
-        let raw_window = window
-            .window_handle()
-            .map_err(|e| format!("window handle: {e}"))?
-            .as_raw();
+        #[cfg(target_os = "linux")]
+        let target = if self.kde_output {
+            Target::Shm
+        } else {
+            let (raw_display, raw_window) = self.raw_handles()?;
+            Target::Window { raw_display, raw_window }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let target = {
+            let (raw_display, raw_window) = self.raw_handles()?;
+            Target::Window { raw_display, raw_window }
+        };
         let atlas_max = self.atlas_limit();
         let existing_surf = self.surf.take();
         let Some(source) = self.source.as_ref() else {
@@ -1641,8 +1781,7 @@ impl WallApp {
             game,
             skin,
             source,
-            raw_display,
-            raw_window,
+            target,
             self.desk,
             self.hud_visible,
             self.pp_display,
@@ -1688,6 +1827,26 @@ impl WallApp {
         self.preview_size.is_some() || self.debug_window
     }
 
+    /// 当前窗口的原始句柄(wgpu surface 用)。
+    fn raw_handles(
+        &self,
+    ) -> Result<
+        (raw_window_handle::RawDisplayHandle, raw_window_handle::RawWindowHandle),
+        String,
+    > {
+        use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+        let window = self.window.as_ref().ok_or("无壁纸窗口")?;
+        let display = window
+            .display_handle()
+            .map_err(|e| format!("display handle: {e}"))?
+            .as_raw();
+        let window = window
+            .window_handle()
+            .map_err(|e| format!("window handle: {e}"))?
+            .as_raw();
+        Ok((display, window))
+    }
+
     /// 创建壁纸窗口(隐藏)→ 附加桌面(attach 内部完成布局探测/撑开/定位)。
     /// GPU 会话在 Load 时创建。
     /// 预览模式(--preview):跳过桌面附加,开常规带边框、可自由调整大小
@@ -1698,6 +1857,46 @@ impl WallApp {
     /// 退出 —— 销毁无装饰的暗窗,改开调试窗口继续播放,并上报一次性
     /// 提示;设置里的"调试窗口"开关可主动选择该形态。
     fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
+        // ---- Linux KDE 壁纸插件形态:不建窗口,离屏渲染 + 共享内存发布 ----
+        #[cfg(target_os = "linux")]
+        if self.kde_output {
+            let host = win::host_of(self.monitor);
+            self.host = Some(host);
+            self.window = None;
+            self.desk = (host.width.max(1), host.height.max(1));
+            self.refresh_hz = win::refresh_hz(self.monitor).max(1);
+            log::info!("[kde] 目标屏刷新率 {} Hz", self.refresh_hz);
+            if self.fps == 0 && self.refresh_hz > 70 {
+                log::info!(
+                    "[kde] 帧率跟随刷新率({}Hz);共享内存 + 纹理上传在 60fps 以上收益有限,可在设置里固定 60 降低 CPU/GPU 占用",
+                    self.refresh_hz
+                );
+            }
+            log::info!(
+                "KDE 壁纸插件模式就绪:{}×{}(画面由 plasmashell 壁纸 item 显示)",
+                self.desk.0,
+                self.desk.1
+            );
+            self.out.send(&Event::Ready {
+                width: self.desk.0,
+                height: self.desk.1,
+                refresh_hz: self.refresh_hz,
+            });
+            return Ok(());
+        }
+
+        // Linux 非 KDE 环境:没有 Plasma containment 可挂,退回调试窗口
+        // (layer-shell 在 KWin 上会盖住桌面图标,不做默认)。
+        #[cfg(target_os = "linux")]
+        if !self.window_is_debug() {
+            log::warn!("[window] 无 KDE 壁纸插件,退回调试窗口播放");
+            self.debug_window = true;
+            self.out.send(&Event::Error {
+                message: "未启用 KDE Plasma 壁纸插件,已退回调试窗口播放".into(),
+            });
+        }
+
+        #[cfg(windows)]
         if !self.window_is_debug() {
             // ---- 壁纸形态:隐藏无装饰窗口 → 挂桌面 ----
             let mut attrs = WindowAttributes::default()
@@ -1759,6 +1958,14 @@ impl WallApp {
         }
 
         // ---- 调试窗口形态(--preview / 调试开关 / 挂接失败兜底) ----
+        #[cfg(windows)]
+        {
+            self.refresh_hz = win::monitor_refresh_hz().max(1);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.refresh_hz = win::refresh_hz(self.monitor).max(1);
+        }
         let (w, h) = self.preview_size.unwrap_or((1280, 720));
         let attrs = WindowAttributes::default()
             .with_title("aria debug window")
@@ -1770,17 +1977,21 @@ impl WallApp {
             .create_window(attrs)
             .map_err(|e| format!("创建调试窗口失败: {e}"))?;
         let window = Arc::new(window);
+        #[cfg(windows)]
         let hwnd = win::window_hwnd(&window).map_err(|e| format!("{e}"))?;
         self.host = None;
         self.window = Some(window);
-        self.wall_hwnd = Some(hwnd);
+        #[cfg(windows)]
+        {
+            self.wall_hwnd = Some(hwnd);
+        }
         self.desk = (w.max(1), h.max(1));
         self.window.as_ref().unwrap().set_visible(true);
         log::info!("窗口就绪(调试窗口): {}×{}", self.desk.0, self.desk.1);
         self.out.send(&Event::Ready {
             width: self.desk.0,
             height: self.desk.1,
-            refresh_hz: win::monitor_refresh_hz(),
+            refresh_hz: self.refresh_hz,
         });
         Ok(())
     }
@@ -2543,15 +2754,17 @@ fn slot_cache_key(slot: &osu_replay_render::hitsound::SampleSlot, layered: bool)
 /// 返回 None,调用方回退谱面物件时长。`ffprobe` = 手动指定路径(None =
 /// PATH 查找)。
 fn audio_duration_ms(path: &std::path::Path, ffprobe: Option<&std::path::Path>) -> Option<f64> {
+    #[cfg(windows)]
     use std::os::windows::process::CommandExt;
+    #[cfg(windows)]
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let bin = ffprobe.unwrap_or_else(|| std::path::Path::new("ffprobe"));
-    let out = std::process::Command::new(bin)
-        .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
-        .arg(path)
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
+        .arg(path);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -2566,8 +2779,7 @@ fn prep_render_session(
     game: &game::GameData,
     skin: &mut skin::ResolvedSkin,
     source: &MapSource,
-    raw_display: raw_window_handle::RawDisplayHandle,
-    raw_window: raw_window_handle::RawWindowHandle,
+    target: Target,
     desk: (u32, u32),
     hud: bool,
     pp: bool,
@@ -2588,7 +2800,7 @@ fn prep_render_session(
     ffprobe_bin: Option<&std::path::Path>,
     upscale: osu_replay_render::UpscaleMode,
     start_ms: f32,
-    existing_surf: Option<SurfaceRenderer>,
+    existing_surf: Option<Sink>,
     atlas_max_dim: u32,
 ) -> Result<RenderSession, String> {
     // 相对名解析(背景/storyboard 素材;来自保留的谱面来源)
@@ -2708,8 +2920,7 @@ fn prep_render_session(
             surf.resize(desk.0, desk.1);
             surf
         }
-        _ => SurfaceRenderer::new(w, h, &atlas, raw_display, raw_window)
-            .map_err(|e| format!("初始化渲染失败: {e}"))?,
+        _ => Sink::new(target, w, h, &atlas)?,
     };
     // 像素已上传 GPU,释放 CPU 侧图集副本(4096² = 64MB;壁纸端不用
     // set_atlas 热换,区域矩形查询不受影响)
@@ -3270,6 +3481,25 @@ impl WallApp {
     }
 }
 
+impl WallApp {
+    /// 推进一拍播放并渲染一帧(窗口 RedrawRequested 与 KDE 共享内存
+    /// 发布路径共用的帧体)。
+    fn on_redraw(&mut self) {
+        self.step_playback();
+        self.render_frame();
+        self.frame_count += 1;
+        if self.fps_measure_at.elapsed() >= Duration::from_secs(1) {
+            self.measured_fps = self.frame_count;
+            self.frame_count = 0;
+            self.fps_measure_at = Instant::now();
+        }
+        if self.status_at.elapsed() >= Duration::from_secs(1) {
+            self.status_at = Instant::now();
+            self.send_status();
+        }
+    }
+}
+
 impl ApplicationHandler<UserEvent> for WallApp {
     fn resumed(&mut self, _event_loop: &ActiveEventLoop) {
         // 壁纸窗口按需在 Load/Reload 时创建,这里无事可做
@@ -3297,20 +3527,7 @@ impl ApplicationHandler<UserEvent> for WallApp {
                     surf.resize(self.desk.0, self.desk.1);
                 }
             }
-            WindowEvent::RedrawRequested => {
-                self.step_playback();
-                self.render_frame();
-                self.frame_count += 1;
-                if self.fps_measure_at.elapsed() >= Duration::from_secs(1) {
-                    self.measured_fps = self.frame_count;
-                    self.frame_count = 0;
-                    self.fps_measure_at = Instant::now();
-                }
-                if self.status_at.elapsed() >= Duration::from_secs(1) {
-                    self.status_at = Instant::now();
-                    self.send_status();
-                }
-            }
+            WindowEvent::RedrawRequested => self.on_redraw(),
             WindowEvent::CloseRequested => {
                 // 调试窗口:关闭即退出渲染子进程;壁纸窗口不接受用户关闭
                 if self.window_is_debug() {
@@ -3351,7 +3568,8 @@ impl ApplicationHandler<UserEvent> for WallApp {
             {
                 self.rebuild_audio();
             }
-            // 尺寸跟随:显示器热插拔 / 分辨率变化(只读尺寸)
+            // 尺寸跟随:显示器热插拔 / 分辨率变化(只读尺寸;Win32 专属)
+            #[cfg(windows)]
             if let Some(host) = self.host {
                 // raised desktop:静态壁纸 WorkerW 浮上来会盖住画面。
                 // 每秒核对一次 z 序,缺了就请 shell 再生并压回最底。
@@ -3371,6 +3589,7 @@ impl ApplicationHandler<UserEvent> for WallApp {
             // AutoPause/FsPause/FsSleep 都吃遮挡;FsPause 只暂停播放
             // (壁纸会话保留,画面冻结),FsSleep 暂停播放 + 拆会话释放内存。
             // 预览模式无桌面挂接,遮挡概念不适用,整块跳过。
+            #[cfg(windows)]
             if !self.render_mode.pure()
                 && self.render_mode != RenderMode::Always
                 && self.game.is_some()
@@ -3414,6 +3633,51 @@ impl ApplicationHandler<UserEvent> for WallApp {
             event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + PURE_TICK));
             return;
         }
+        // ---- KDE 壁纸插件:没有窗口可 request_redraw,自己按帧率节流 ----
+        #[cfg(target_os = "linux")]
+        if self.kde_output {
+            if self.surf.is_some() {
+                // 0 = 跟随屏幕刷新率(设置项语义),否则严格按用户设定。
+                // 共享内存三缓冲 + QML 侧 4ms 轮询能跟上高刷;GPU 渲染
+                // 本身不设上限(读者只在帧号变化时拷贝,不会空转)。
+                let fps = if self.fps == 0 { self.refresh_hz.max(1) } else { self.fps };
+                let period = Duration::from_secs_f64(1.0 / fps as f64);
+                let now = Instant::now();
+                match self.frame_at {
+                    Some(last) if now < last + period => {
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(last + period));
+                    }
+                    _ => {
+                        self.frame_at = Some(now);
+                        let started = Instant::now();
+                        self.on_redraw();
+                        // 帧耗时超过目标 1.5 倍 = 这一拍被 GPU 回读/上传拖住
+                        // 了(渲染线程是同步等 map 的)。节流 5s 报一次,
+                        // 免得高刷下刷屏;数值用于判断该降帧率还是查 GPU。
+                        let cost = started.elapsed();
+                        if cost > period.mul_f32(2.0)
+                            && cost > Duration::from_millis(50)
+                            && self.stall_log_at.elapsed() >= Duration::from_secs(5)
+                        {
+                            self.stall_log_at = Instant::now();
+                            log::warn!(
+                                "[render] 帧耗时 {:.1}ms 超过目标 {:.1}ms(目标 {}fps)",
+                                cost.as_secs_f64() * 1000.0,
+                                period.as_secs_f64() * 1000.0,
+                                fps
+                            );
+                        }
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(now + period));
+                    }
+                }
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    Instant::now() + Duration::from_millis(100),
+                ));
+            }
+            return;
+        }
+
         // 帧率门限:0 = 跟随屏幕刷新率(不节流);否则按目标帧率节流重绘。
         // 关键:未到帧边界时必须用 ControlFlow::WaitUntil 定时唤醒 —— 只
         // 跳过 request_redraw 而不设唤醒源的话,事件循环会休眠,壁纸冻结。

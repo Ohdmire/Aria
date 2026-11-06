@@ -173,7 +173,9 @@ fn preview_passthrough() -> Vec<String> {
 }
 
 fn spawn_child(app: &AppHandle) -> anyhow::Result<ChildCtl> {
+    #[cfg(windows)]
     use std::os::windows::process::CommandExt;
+    #[cfg(windows)]
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     let exe = std::env::current_exe()?;
@@ -183,16 +185,8 @@ fn spawn_child(app: &AppHandle) -> anyhow::Result<ChildCtl> {
         // 子进程据此跳过桌面挂接、开常规可调窗口(见 wall::parse_preview_args);
         // 现场从父进程 argv 提取,无需全局状态。
         .args(preview_passthrough())
-        // DX12 后端:省掉 Vulkan 驱动栈与第三方 hook 层(OBS 等)的常驻
-        // 内存(实测比 Vulkan 少 ~57MB)。注意 osu-replay-render 侧需
-        // Backends::from_env() 才生效 —— InstanceDescriptor::default()
-        // 会无视环境变量。
-        .env("WGPU_BACKEND", "dx12")
         // MSAA 恒定关闭(1080p 拉伸下肉眼无差,省 4× 片元开销与显存)
         .env("NO_MSAA", "1")
-        // 壁纸端从不回读像素:跳过 3×帧大小的 MAP_READ 暂存堆
-        //(2560×1440 下约 44MB 提交内存)
-        .env("NO_READBACK", "1")
         // storyboard CPU 解码缓存预算调低(上游缺省 384MB;壁纸 24-60fps
         // 消费,192MB 足够,超限只是偶发重解码)
         .env("SB_CACHE_MB", "192")
@@ -213,17 +207,33 @@ fn spawn_child(app: &AppHandle) -> anyhow::Result<ChildCtl> {
     {
         cmd.env("ARIA_AUDIO_DEVICE", dev);
     }
-    let mut child = cmd
-        .stdin(Stdio::piped())
+    // Windows: DX12 后端省掉 Vulkan 驱动栈与第三方 hook 层的常驻内存,
+    // 且壁纸端从不回读像素(跳过 3×帧大小的 MAP_READ 暂存堆)。
+    // Linux:KDE 壁纸插件模式**必须**保留回读(帧要经共享内存交给
+    // plasmashell),后端交给 wgpu 选 Vulkan。
+    #[cfg(windows)]
+    {
+        cmd.env("WGPU_BACKEND", "dx12").env("NO_READBACK", "1");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // 调试窗口/预览模式要开普通窗口,不占用 Plasma 壁纸插件。
+        let debug_window = app.state::<WallState>().settings.lock().unwrap().debug_window;
+        if crate::kde::plugin_installed() && !debug_window && preview_passthrough().is_empty() {
+            cmd.env("ARIA_OUTPUT", "kde");
+        }
+    }
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()?;
+        .stderr(Stdio::inherit());
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let mut child = cmd.spawn()?;
     let stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
 
     // 先按保存的音量/HUD/渲染模式/背景亮度/总音量/日志/调试窗口设置子进程,再开始转发事件
-    let (bgm_vol, hits_on, hits_vol, hud, pp, hit_anim, brk_lighten, cursor_on, cursor_sz, snaking_in, snaking_out, cursor_trail, cursor_ripples, render_mode, bg_opacity, master, offset, ghidden, fade, ffmpeg, ffprobe, log_on, debug_win) = {
+    let (bgm_vol, hits_on, hits_vol, hud, pp, hit_anim, brk_lighten, cursor_on, cursor_sz, snaking_in, snaking_out, cursor_trail, cursor_ripples, render_mode, bg_opacity, master, offset, ghidden, fade, ffmpeg, ffprobe, log_on, debug_win, fps) = {
         let state = app.state::<WallState>();
         let s = state.settings.lock().unwrap();
         (
@@ -250,6 +260,7 @@ fn spawn_child(app: &AppHandle) -> anyhow::Result<ChildCtl> {
             s.ffprobe.clone().or_else(|| bundled_bin(app, "ffprobe.exe")),
             s.log_enabled,
             s.debug_window,
+            s.fps,
         )
     };
     {
@@ -278,8 +289,11 @@ fn spawn_child(app: &AppHandle) -> anyhow::Result<ChildCtl> {
         let fade_cmd = serde_json::to_string(&Command::SetFade { on: fade }).unwrap();
         let bins_cmd = serde_json::to_string(&Command::SetFfmpegBins { ffmpeg, ffprobe }).unwrap();
         let log_cmd = serde_json::to_string(&Command::SetLog { on: log_on }).unwrap();
+        // 帧率设置必须在起播前下发:子进程默认 0(跟随刷新率),不补这一条
+        // 的话重启应用后用户保存的 30/60/120 会全部失效。
+        let fps_cmd = serde_json::to_string(&Command::SetFps { fps }).unwrap();
         let _ = (&stdin).write_all(
-            format!("{vol_cmd}\n{hits_cmd}\n{hud_cmd}\n{pp_cmd}\n{ha_cmd}\n{bl_cmd}\n{cur_cmd}\n{curs_cmd}\n{snake_in_cmd}\n{snake_out_cmd}\n{trail_cmd}\n{ripple_cmd}\n{mode_cmd}\n{dbg_cmd}\n{bg_cmd}\n{master_cmd}\n{offset_cmd}\n{gh_cmd}\n{fade_cmd}\n{bins_cmd}\n{log_cmd}\n").as_bytes(),
+            format!("{vol_cmd}\n{hits_cmd}\n{hud_cmd}\n{pp_cmd}\n{ha_cmd}\n{bl_cmd}\n{cur_cmd}\n{curs_cmd}\n{snake_in_cmd}\n{snake_out_cmd}\n{trail_cmd}\n{ripple_cmd}\n{mode_cmd}\n{dbg_cmd}\n{bg_cmd}\n{master_cmd}\n{offset_cmd}\n{gh_cmd}\n{fade_cmd}\n{bins_cmd}\n{log_cmd}\n{fps_cmd}\n").as_bytes(),
         );
     }
 
@@ -555,6 +569,7 @@ pub fn load_track_at(app: &AppHandle, track: &Track, start: f32) -> Result<(), S
     // ---- 快路径:路径缓存命中 → 零数据库直接下发(托盘切歌/启动恢复
     // 秒切;数据库只在打开曲库时才解析)----
     if let Some(cached) = crate::pathcache::get(app, &track.set_id) {
+        log::info!("[load] 路径缓存命中 set_id={}", track.set_id);
         let picked = track
             .sha2
             .as_ref()
@@ -582,6 +597,7 @@ pub fn load_track_at(app: &AppHandle, track: &Track, start: f32) -> Result<(), S
     }
 
     // ---- 慢路径:解析曲库(现状逻辑),成功后回写路径缓存 ----
+    log::info!("[load] 路径缓存未命中,解析曲库 set_id={}", track.set_id);
     let source = app.state::<WallState>().settings.lock().unwrap().source.clone();
     let lib = library(app, &source, false)?;
     let set = lib
@@ -666,6 +682,7 @@ pub fn load_track_at(app: &AppHandle, track: &Track, start: f32) -> Result<(), S
 
 /// 发命令给壁纸进程(必要时先拉起)。
 pub fn send_cmd(app: &AppHandle, cmd: Command) -> Result<(), String> {
+    log::info!("[cmd] 下发 {cmd:?}");
     ensure_child(app)?;
     let state = app.state::<WallState>();
     let ctl = state.ctl.lock().unwrap();

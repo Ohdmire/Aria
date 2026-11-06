@@ -1,0 +1,18 @@
+{
+    "KPackageStructure": "Plasma/Wallpaper",
+    "KPlugin": {
+        "Id": "com.ohdmire.aria",
+        "Name": "Aria",
+        "Description": "osu! storyboard 动态壁纸(由 Aria 渲染进程逐帧提供画面)",
+        "Icon": "preferences-desktop-wallpaper",
+        "License": "MIT",
+        "Authors": [
+            {
+                "Name": "Ohdmire"
+            }
+        ],
+        "Category": ""
+    },
+    "Keywords": "osu;storyboard;wallpaper;aria",
+    "X-KDE-ParentApp": "org.kde.plasmashell"
+}

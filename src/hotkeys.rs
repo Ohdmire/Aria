@@ -1,4 +1,4 @@
-//! 全局快捷键(Windows `RegisterHotKey`)。
+//! 全局快捷键(Windows `RegisterHotKey`;Wayland 无对应协议,见文末)。
 //!
 //! 设置里默认**不开启**、也没有任何默认组合;只有用户自己填写并启用后
 //! 才会注册。注册/注销与 `WM_HOTKEY` 分发都在同一条专用线程上完成:
@@ -12,6 +12,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::Duration;
 
 use tauri::AppHandle;
+#[cfg(windows)]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey,
     UnregisterHotKey, VIRTUAL_KEY, VK_BACK, VK_CAPITAL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
@@ -20,6 +21,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_PAUSE,
     VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SCROLL, VK_SNAPSHOT, VK_SPACE, VK_TAB, VK_UP,
 };
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage, WM_HOTKEY,
 };
@@ -89,7 +91,10 @@ pub struct ParsedConfig {
 /// 托管到 Tauri 的快捷键管理器句柄。
 #[derive(Clone)]
 pub struct HotkeyManager {
+    #[cfg(windows)]
     tx: Sender<Cmd>,
+    #[cfg(not(windows))]
+    _private: (),
 }
 
 enum Cmd {
@@ -100,6 +105,7 @@ enum Cmd {
 }
 
 /// 启动快捷键线程并按已保存的设置注册(启动即生效;默认关闭 = 空表)。
+#[cfg(windows)]
 pub fn init(app: AppHandle, settings: &Settings) -> HotkeyManager {
     let (tx, rx) = mpsc::channel();
     let initial = if settings.hotkeys_enabled {
@@ -117,6 +123,28 @@ pub fn init(app: AppHandle, settings: &Settings) -> HotkeyManager {
     HotkeyManager { tx }
 }
 
+/// Wayland 没有全局快捷键协议(xdg-desktop-portal GlobalShortcuts 目前
+/// KDE 未实现),这里保留同名 API:启动不注册任何组合,设置时明确报错,
+/// 让 UI 把"不支持"如实展示,而不是静默失败。
+#[cfg(not(windows))]
+pub fn init(_app: AppHandle, _settings: &Settings) -> HotkeyManager {
+    if _settings.hotkeys_enabled {
+        log::warn!("[hotkeys] Wayland 不支持全局快捷键,已保存的组合不会生效");
+    }
+    HotkeyManager { _private: () }
+}
+
+#[cfg(not(windows))]
+impl HotkeyManager {
+    pub fn register(&self, bindings: Vec<Binding>) -> Result<(), String> {
+        if bindings.is_empty() {
+            return Ok(());
+        }
+        Err("Wayland 不允许应用注册全局快捷键;请用托盘菜单或设置窗口切歌".into())
+    }
+}
+
+#[cfg(windows)]
 impl HotkeyManager {
     /// 用新的组合集合替换当前注册(空表 = 全部注销)。同步等待线程确认,
     /// 冲突/非法组合等错误会带回来。
@@ -130,6 +158,7 @@ impl HotkeyManager {
     }
 }
 
+#[cfg(windows)]
 fn worker(rx: Receiver<Cmd>, app: AppHandle, initial: Vec<Binding>) {
     let mut current = Vec::new();
     if let Err(e) = register_all(&initial, &mut current) {
@@ -160,6 +189,7 @@ fn worker(rx: Receiver<Cmd>, app: AppHandle, initial: Vec<Binding>) {
 }
 
 /// 注销旧配置 → 注册新配置;新配置有任一失败则回滚到旧配置。
+#[cfg(windows)]
 fn apply(next: &[Binding], current: &mut Vec<Binding>) -> Result<(), String> {
     unregister_all(current);
     let old = std::mem::take(current);
@@ -181,6 +211,7 @@ fn apply(next: &[Binding], current: &mut Vec<Binding>) -> Result<(), String> {
     }
 }
 
+#[cfg(windows)]
 fn register_all(bindings: &[Binding], out: &mut Vec<Binding>) -> Result<(), String> {
     for b in bindings {
         let mods = HOT_KEY_MODIFIERS(b.mods | MOD_NOREPEAT.0);
@@ -199,12 +230,14 @@ fn register_all(bindings: &[Binding], out: &mut Vec<Binding>) -> Result<(), Stri
     Ok(())
 }
 
+#[cfg(windows)]
 fn unregister_all(bindings: &[Binding]) {
     for b in bindings {
         let _ = unsafe { UnregisterHotKey(None, b.action.id()) };
     }
 }
 
+#[cfg(windows)]
 fn friendly(e: &windows::core::Error) -> String {
     // ERROR_HOTKEY_ALREADY_REGISTERED = 1409(HRESULT 低 16 位)
     if (e.code().0 as u32 & 0xFFFF) == 1409 {
@@ -218,6 +251,7 @@ fn friendly(e: &windows::core::Error) -> String {
     }
 }
 
+#[cfg(windows)]
 fn pump(app: &AppHandle) {
     unsafe {
         let mut msg = MSG::default();
@@ -233,6 +267,7 @@ fn pump(app: &AppHandle) {
     }
 }
 
+#[cfg(windows)]
 fn dispatch(app: AppHandle, action: Action) {
     // 切歌/重载可能走慢路径(解析曲库),不能阻塞快捷键线程的消息泵
     std::thread::spawn(move || match action {
@@ -312,6 +347,7 @@ pub fn parse_inputs(
 }
 
 /// 解析单个组合,如 `Ctrl+Alt+Right` / `ctrl shift f5` / `Win+MediaNext`。
+#[cfg(windows)]
 pub fn parse_binding(action: Action, text: &str) -> Result<Binding, String> {
     let mut mods = 0u32;
     let mut vk: Option<u32> = None;
@@ -374,6 +410,7 @@ pub fn parse_binding(action: Action, text: &str) -> Result<Binding, String> {
 }
 
 /// 单独按（无修饰键）也相对安全的键:功能键与媒体键。
+#[cfg(windows)]
 fn allows_bare(vk: u32) -> bool {
     // F1–F24,以及媒体键(系统本来就把它们当播放控制)
     (0x70..=0x87).contains(&vk)
@@ -383,6 +420,7 @@ fn allows_bare(vk: u32) -> bool {
         || vk == VK_MEDIA_STOP.0 as u32
 }
 
+#[cfg(windows)]
 fn parse_key(token: &str) -> Result<(u32, String), String> {
     let low = token.to_ascii_lowercase();
     // F1–F24
@@ -468,7 +506,7 @@ fn parse_key(token: &str) -> Result<(u32, String), String> {
     Ok((code.0 as u32, label.to_string()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 
@@ -518,4 +556,9 @@ mod tests {
         assert_eq!(parsed.prev, None);
         assert_eq!(parsed.next.as_deref(), Some("Ctrl+Alt+N"));
     }
+}
+
+#[cfg(not(windows))]
+pub fn parse_binding(_action: Action, text: &str) -> Result<Binding, String> {
+    Err(format!("Wayland 不支持全局快捷键({text})"))
 }

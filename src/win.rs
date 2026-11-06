@@ -126,6 +126,9 @@ pub struct WallpaperHost {
     pub height: u32,
 }
 
+/// 平台无关别名(`wall` 模块按平台把 `win` 指到本模块或 `wayland`)。
+pub type Host = WallpaperHost;
+
 impl WallpaperHost {
     fn invalid() -> WallpaperHost {
         WallpaperHost {

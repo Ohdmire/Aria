@@ -415,9 +415,46 @@ pub fn save(app: &tauri::AppHandle, s: &Settings) {
     }
 }
 
+#[cfg(windows)]
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+#[cfg(windows)]
 const RUN_VALUE: &str = "Aria";
 
+/// Linux 开机自启走 XDG autostart(`~/.config/autostart/*.desktop`),
+/// 与桌面环境无关(GNOME/KDE 都认)。
+#[cfg(not(windows))]
+fn autostart_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+    Some(base.join("autostart").join("com.ohdmire.aria.desktop"))
+}
+
+#[cfg(not(windows))]
+pub fn set_autostart(on: bool) -> Result<(), String> {
+    let path = autostart_path().ok_or("无法定位 ~/.config")?;
+    if on {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let body = format!(
+            "[Desktop Entry]\nType=Application\nName=Aria\nComment=osu! storyboard wallpaper\nExec=\"{}\" --hidden\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+            exe.display()
+        );
+        std::fs::write(&path, body).map_err(|e| e.to_string())?;
+    } else if let Some(p) = autostart_path() {
+        let _ = std::fs::remove_file(p);
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn autostart_enabled() -> bool {
+    autostart_path().is_some_and(|p| p.is_file())
+}
+
+#[cfg(windows)]
 pub fn set_autostart(on: bool) -> Result<(), String> {
     use winreg::enums::{HKEY_CURRENT_USER, KEY_SET_VALUE};
     use winreg::RegKey;
@@ -433,6 +470,7 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(windows)]
 pub fn autostart_enabled() -> bool {
     use winreg::enums::{HKEY_CURRENT_USER, KEY_QUERY_VALUE};
     use winreg::RegKey;

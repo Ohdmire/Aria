@@ -3,6 +3,9 @@
  * 由 [data-accent] 决定,两个维度自由组合;JS 里 ACCENTS 为主题色预设。
  * 新增主题 = 加一组变量,不动任何规则。 */
 :root {
+  /* 原生控件(滚动条/<select> 弹出列表/复选框)跟随结构色:
+   * WebKitGTK 不读我们的 CSS 变量,只认 color-scheme。 */
+  color-scheme: dark;
   /* 主题色默认:蓝 */
   --accent: #4da3ff;
   --accent-hover: #6db5ff;
@@ -66,6 +69,7 @@
 }
 /* 亮色模式(结构反转;主题色仍由 data-accent 决定) */
 :root[data-mode="light"] {
+  color-scheme: light;
   --bg-a: #eef1f6;
   --bg-b: #e2e6ee;
   --card: #ffffff;
@@ -244,6 +248,11 @@ main {
 .field .val { color: var(--text); }
 .field.inline { flex-direction: row; align-items: center; gap: 10px; }
 
+select option {
+  /* 部分平台的弹出列表会用到 option 的背景/前景 */
+  background: var(--card-2);
+  color: var(--text);
+}
 select, .input {
   background: var(--card-2);
   color: var(--text);

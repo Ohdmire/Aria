@@ -86,22 +86,35 @@ pub fn device_by_id(id: &str) -> Option<cpal::Device> {
         .find(|d| d.id().map(|i| i.to_string() == id).unwrap_or(false))
 }
 
-/// 当前默认输出端点 id(wasapi-rs 查询,`wasapi:{端点id}` 形态)。
-/// "跟随系统默认"不再走 cpal 的默认设备哨兵 —— 该路径的 IAudioClient
-/// 后台预激活在部分环境稳定触发 COM 公寓冲突(RPC_E_CHANGED_MODE,
-/// "无法在设置线程模式后对其加以更改"),而按具体端点打开无此问题;
-/// 默认跟随改由本函数解析出具体端点 + 设备事件监听驱动重建。
+/// 当前默认输出端点 id。
+///
+/// Windows 走 wasapi-rs 查询(`wasapi:{端点id}` 形态):"跟随系统默认"
+/// 不再走 cpal 的默认设备哨兵 —— 该路径的 IAudioClient 后台预激活在
+/// 部分环境稳定触发 COM 公寓冲突(RPC_E_CHANGED_MODE),而按具体端点
+/// 打开无此问题;默认跟随改由本函数解析出具体端点 + 设备事件监听驱动
+/// 重建。Linux 直接用 cpal(ALSA/PipeWire/PulseAudio 由 cpal 选)。
+#[cfg(windows)]
 pub fn default_output_id() -> Option<String> {
     let enumerator = wasapi::DeviceEnumerator::new().ok()?;
     let dev = enumerator.get_default_device(&wasapi::Direction::Render).ok()?;
     Some(format!("wasapi:{}", dev.get_id().ok()?))
 }
 
+#[cfg(not(windows))]
+pub fn default_output_id() -> Option<String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    cpal::default_host()
+        .default_output_device()
+        .and_then(|d| d.id().ok())
+        .map(|id| id.to_string())
+}
+
 /// 解析应打开的**具体端点**:指定 id 优先,失效/未指定时回退当前默认。
 /// 返回 (设备, 解析到的端点 id)。解析与打开都含 WASAPI 调用,只在
 /// 后台构建线程上执行(见 wall::rebuild_audio)。
 pub fn resolve_target(desired: Option<&str>) -> (Option<cpal::Device>, Option<String>) {
-    // 构建线程同样要先初始化 COM(wasapi-rs 查询默认端点要用)
+    // 构建线程同样要先初始化 COM(wasapi-rs 查询默认端点要用;Windows only)
+    #[cfg(windows)]
     com_init_mta();
     if let Some(id) = desired {
         if let Some(d) = device_by_id(id) {
@@ -119,6 +132,7 @@ pub fn resolve_target(desired: Option<&str>) -> (Option<cpal::Device>, Option<St
 /// CO_E_NOTINITIALIZED 失败(设备事件监听"从未启动"的根因)。已初始化
 /// 成其他公寓(RPC_E_CHANGED_MODE)无妨 —— COM 会跨公寓封送,照常可用;
 /// cpal 侧自己的 STA 初始化也容忍该返回值,互不冲突。
+#[cfg(windows)]
 fn com_init_mta() {
     use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
@@ -146,6 +160,7 @@ pub enum AudioDeviceEvent {
 /// 监视线程上执行(非渲染线程)。枚举器与注册句柄都是 !Send 且必须
 /// 同线程存活,本函数自管线程,随进程存活。返回是否订阅成功(失败时
 /// 调用方退回轮询兜底)。
+#[cfg(windows)]
 pub fn spawn_device_watcher(
     on_events: impl Fn(&[AudioDeviceEvent]) + Send + 'static,
 ) -> bool {
@@ -234,6 +249,49 @@ pub fn spawn_device_watcher(
             }
         });
     spawned.is_ok()
+}
+
+
+/// Linux 版设备事件:没有 IMMNotificationClient 那种系统级回调(ALSA /
+/// PipeWire / PulseAudio 各自一套),用**低频轮询**代替:每 2s 枚举一次
+/// 输出设备,对比上次的集合与默认端点,只在变化时成组回调。轮询开销是
+/// 几次 cpal 枚举查询,远小于开流本身,且只在独立线程上跑。
+#[cfg(not(windows))]
+pub fn spawn_device_watcher(
+    on_events: impl Fn(&[AudioDeviceEvent]) + Send + 'static,
+) -> bool {
+    use std::time::Duration;
+    std::thread::Builder::new()
+        .name("audio-dev-watch".into())
+        .spawn(move || {
+            let snapshot = || -> (Vec<String>, Option<String>) {
+                let mut ids: Vec<String> =
+                    output_devices().into_iter().map(|(id, _)| id).collect();
+                ids.sort();
+                (ids, default_output_id())
+            };
+            let (mut last_ids, mut last_default) = snapshot();
+            loop {
+                std::thread::sleep(Duration::from_secs(2));
+                let (ids, default) = snapshot();
+                let mut batch: Vec<AudioDeviceEvent> = Vec::new();
+                for id in ids.iter().filter(|id| !last_ids.contains(id)) {
+                    batch.push(AudioDeviceEvent::DeviceActive(id.clone()));
+                }
+                for id in last_ids.iter().filter(|id| !ids.contains(id)) {
+                    batch.push(AudioDeviceEvent::DeviceGone(id.clone()));
+                }
+                if default != last_default {
+                    batch.push(AudioDeviceEvent::DefaultChanged(default.clone()));
+                }
+                last_ids = ids;
+                last_default = default;
+                if !batch.is_empty() {
+                    on_events(&batch);
+                }
+            }
+        })
+        .is_ok()
 }
 
 /// 线性振幅 → 分贝(kira 音量单位)。

@@ -1,7 +1,8 @@
 //! 运行期可开关的文件日志(设置界面"日志记录"开关 + 导出)。
 //!
 //! 自定义 log::Log 后端:始终写 stderr(开发态可见,替代 env_logger),
-//! 开关打开时同时追加写 `%APPDATA%\com.ohdmire.aria\log\aria.log`。
+//! 开关打开时同时追加写应用数据目录下的 `log/aria.log`
+//! (Windows `%APPDATA%\com.ohdmire.aria`,Linux `$XDG_DATA_HOME/com.ohdmire.aria`)。
 //! 设置进程与壁纸渲染子进程都装同一实现、追加同一文件(单行单次
 //! write,跨进程基本不交错),按消息内容区分来源。
 //!
@@ -112,7 +113,8 @@ impl log::Log for Logger {
     }
 }
 
-/// 日志文件路径(%APPDATA%\<identifier>\log\aria.log)。
+/// 日志文件路径(应用数据目录下的 `log/aria.log`)。
+#[cfg(windows)]
 pub fn default_path() -> Option<PathBuf> {
     let base = std::env::var("APPDATA").ok()?;
     Some(
@@ -121,6 +123,17 @@ pub fn default_path() -> Option<PathBuf> {
             .join("log")
             .join("aria.log"),
     )
+}
+
+/// Linux:Tauri 的 app_data_dir 即 `$XDG_DATA_HOME/<identifier>`
+/// (`~/.local/share/com.ohdmire.aria`),子进程不初始化 Tauri,手工拼。
+#[cfg(not(windows))]
+pub fn default_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
+    Some(base.join("com.ohdmire.aria").join("log").join("aria.log"))
 }
 
 /// 开/关文件记录(开 = 打开追加句柄并建目录;关 = 关闭句柄,stderr 照写)。

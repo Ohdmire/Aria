@@ -132,11 +132,38 @@ pub fn custom_data_dir() -> Option<PathBuf> {
 
 /// osu!lazer 数据根:手动指定优先;storage.ini 的 FullPath 无条件优先。
 pub fn data_root() -> Option<PathBuf> {
-    let base = custom_data_dir().or_else(|| {
-        std::env::var_os("APPDATA").map(PathBuf::from).map(|appdata| appdata.join("osu"))
-    })?;
+    let base = custom_data_dir().or_else(default_base_dir)?;
     let root = read_storage_ini_fullpath(&base.join("storage.ini")).unwrap_or(base);
     root.join("client.realm").is_file().then_some(root)
+}
+
+/// lazer 默认数据目录(未手动指定时)。
+#[cfg(windows)]
+fn default_base_dir() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(PathBuf::from).map(|appdata| appdata.join("osu"))
+}
+
+/// Linux 上 lazer 的默认位置:`$XDG_DATA_HOME/osu`(通常
+/// `~/.local/share/osu`);Flatpak 版在 `~/.var/app/sh.ppy.osu/data/osu`。
+/// 按顺序取第一个含 client.realm 的。
+#[cfg(not(windows))]
+fn default_base_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| h.join(".local/share")));
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(d) = data_home {
+        candidates.push(d.join("osu"));
+    }
+    if let Some(h) = &home {
+        candidates.push(h.join(".var/app/sh.ppy.osu/data/osu"));
+        candidates.push(h.join(".osu"));
+    }
+    candidates
+        .into_iter()
+        .find(|p| p.join("client.realm").is_file())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share/osu")))
 }
 
 pub fn realm_path() -> Option<PathBuf> {
