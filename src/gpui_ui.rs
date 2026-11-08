@@ -2804,19 +2804,6 @@ impl App {
             }
             self.persist();
         }
-        for action in crate::tray::poll() {
-            match action {
-                crate::tray::TrayAction::Prev => self.step(-1),
-                crate::tray::TrayAction::Next => self.step(1),
-                crate::tray::TrayAction::Toggle => self.toggle_pause(),
-                crate::tray::TrayAction::Show => self.activate_window(cx),
-                crate::tray::TrayAction::Quit => {
-                    #[cfg(target_os = "linux")]
-                    let _ = crate::kde::restore_wallpaper();
-                    std::process::exit(0);
-                }
-            }
-        }
         for action in crate::hotkeys::poll() {
             match action {
                 crate::hotkeys::Action::Prev => self.step(-1),
@@ -8385,7 +8372,6 @@ pub fn run() {
             }),
             ..Default::default()
         };
-        crate::tray::spawn();
         // KDE 壁纸插件:装包 + 切到 Aria(退出/关窗时还原)。
         #[cfg(target_os = "linux")]
         {
@@ -8454,6 +8440,52 @@ pub fn run() {
         // 兜底轮询:窗口最小化/被遮挡时 gpui 不再出帧,render 里的 poll 也就不会跑,
         // 曲终自动切歌/进度/曲库结果都会停。这里只做"后台兜底 + 有变化才 notify",
         // 它不限制帧率(界面刷新是逐帧的,见 render 里的 request_animation_frame)。
+        // 托盘:gpui-tray 的菜单项直接分发 gpui Action,这里把动作接到 App 方法上。
+        if let Some(view) = view_slot.clone() {
+            let weak = view.downgrade();
+            {
+                let w = weak.clone();
+                cx.on_action(move |_: &crate::tray::ShowWindow, cx: &mut gpui::App| {
+                    let _ = w.update(cx, |this, cx| {
+                        this.activate_window(cx);
+                        cx.notify();
+                    });
+                });
+            }
+            {
+                let w = weak.clone();
+                cx.on_action(move |_: &crate::tray::PrevTrack, cx: &mut gpui::App| {
+                    let _ = w.update(cx, |this, cx| {
+                        this.step(-1);
+                        cx.notify();
+                    });
+                });
+            }
+            {
+                let w = weak.clone();
+                cx.on_action(move |_: &crate::tray::TogglePlay, cx: &mut gpui::App| {
+                    let _ = w.update(cx, |this, cx| {
+                        this.toggle_pause();
+                        cx.notify();
+                    });
+                });
+            }
+            {
+                let w = weak.clone();
+                cx.on_action(move |_: &crate::tray::NextTrack, cx: &mut gpui::App| {
+                    let _ = w.update(cx, |this, cx| {
+                        this.step(1);
+                        cx.notify();
+                    });
+                });
+            }
+            cx.on_action(move |_: &crate::tray::QuitApp, _cx: &mut gpui::App| {
+                #[cfg(target_os = "linux")]
+                let _ = crate::kde::restore_wallpaper();
+                std::process::exit(0);
+            });
+            crate::tray::init(cx);
+        }
         if let Some(view) = view_slot {
             cx.spawn(async move |cx: &mut gpui::AsyncApp| {
                 loop {
