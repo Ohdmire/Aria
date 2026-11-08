@@ -503,24 +503,6 @@ pub fn pick_diff<'a>(set: &'a LazerSet, policy: PickPolicy) -> &'a LazerBeatmap 
 
 /// [`pick_diff`] 的离线版:在路径缓存的难度表上按同一策略挑选,
 /// 播放列表快路径(不解析数据库)用。
-pub fn pick_cached_diff<'a>(
-    diffs: &'a [crate::pathcache::CachedDiff],
-    policy: PickPolicy,
-) -> Option<&'a crate::pathcache::CachedDiff> {
-    let mut it = diffs.iter();
-    let mut best = it.next()?;
-    for b in it {
-        let better = match policy {
-            PickPolicy::Hardest => b.star > best.star,
-            PickPolicy::Easiest => b.star < best.star,
-            PickPolicy::Custom(t) => (b.star - t).abs() < (best.star - t).abs(),
-        };
-        if better {
-            best = b;
-        }
-    }
-    Some(best)
-}
 
 #[cfg(test)]
 mod tests {

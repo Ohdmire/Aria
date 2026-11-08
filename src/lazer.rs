@@ -52,6 +52,11 @@ pub struct LazerBeatmap {
 pub struct LazerSet {
     pub id: String,
     pub online_id: i64,
+    /// 谱面集状态(osu!lazer BeatmapSetStatus:-3 Unknown / -2 Unsubmitted /
+    /// 0 Pending / 1 Ranked / 2 Approved / 3 Qualified / 4 Loved /
+    /// 5 Graveyard / 6 WIP / 7 NeedsUpdate)。
+    #[serde(default)]
+    pub status: i32,
     /// 导入 lazer 的时间(class_BeatmapSet.DateAdded,Unix ms;0 = 未记录)。
     /// stable 源用谱面集目录 mtime 近似。曲库默认按此降序(最新导入在前)。
     pub date_added_ms: i64,
@@ -386,6 +391,7 @@ fn parse_beatmap_sets(store: &mut RowStore<'_>, library: &mut LazerLibrary) -> R
         library.sets.push(LazerSet {
             id: uuid_string(row.get("ID")),
             online_id: int_value(row.get("OnlineID"), -1),
+            status: int_value(row.get("Status"), 0) as i32,
             date_added_ms: timestamp_ms(row.get("DateAdded")),
             artist,
             artist_unicode,

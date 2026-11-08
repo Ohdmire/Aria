@@ -49,6 +49,9 @@ pub struct Settings {
     #[serde(default)]
     pub loop_playback: bool,
     pub autostart: bool,
+    /// 启动后自动播放上次的曲目(默认开)。
+    #[serde(default = "default_true")]
+    pub play_on_start: bool,
     /// 曲库源:"lazer" / "stable"。
     #[serde(default = "default_source")]
     pub source: String,
@@ -181,6 +184,12 @@ pub struct Settings {
     pub lazer_set: Option<String>,
     #[serde(default)]
     pub lazer_sha2: Option<String>,
+    /// 界面主题:"dark"(默认)/ "light"。
+    #[serde(default = "default_theme")]
+    pub theme_mode: String,
+    /// 强调色:blue(默认)/ purple / green / pink / orange。
+    #[serde(default = "default_accent")]
+    pub accent: String,
     /// 关闭主窗口的行为:None = 每次询问;"tray" = 最小化到托盘;
     /// "exit" = 退出程序。
     #[serde(default)]
@@ -199,6 +208,12 @@ pub struct Settings {
     /// 快速导入应用的默认 mods(osu! legacy 位,0 = 无)。
     #[serde(default)]
     pub quick_mods: u32,
+    /// 快速加入的默认难度策略:hardest / easiest / custom。
+    #[serde(default = "default_quick_policy")]
+    pub quick_policy: String,
+    /// 自定义策略下的目标星级。
+    #[serde(default)]
+    pub quick_star: Option<f32>,
     /// 曲名 / 作者优先显示 Unicode 原名(默认开;关 = 罗马音 / 英文)。
     #[serde(default = "default_true")]
     pub display_unicode: bool,
@@ -254,6 +269,14 @@ fn default_hitsound() -> bool {
     true
 }
 
+fn default_theme() -> String {
+    "dark".into()
+}
+
+fn default_accent() -> String {
+    "blue".into()
+}
+
 fn default_render_mode() -> String {
     "always".to_string()
 }
@@ -278,6 +301,10 @@ fn default_hits_volume() -> f32 {
     0.6
 }
 
+fn default_quick_policy() -> String {
+    "hardest".to_string()
+}
+
 fn default_true() -> bool {
     true
 }
@@ -299,6 +326,7 @@ impl Default for Settings {
             speed: 1.0,
             loop_playback: false,
             autostart: false,
+        play_on_start: true,
             source: default_source(),
             lazer_dir: None,
             stable_dir: None,
@@ -340,11 +368,15 @@ impl Default for Settings {
             star_min: 0.0,
             lazer_set: None,
             lazer_sha2: None,
+            theme_mode: default_theme(),
+            accent: default_accent(),
             close_action: None,
             log_enabled: false,
             dblclick_add: false,
             quick_add: true,
             quick_mods: 0,
+            quick_policy: default_quick_policy(),
+            quick_star: None,
             display_unicode: true,
             hotkeys_enabled: false,
             hotkey_prev: None,
@@ -389,11 +421,8 @@ impl Settings {
     }
 }
 
-pub fn load(app: &tauri::AppHandle) -> Settings {
-    use tauri::Manager;
-    let Ok(dir) = app.path().app_data_dir() else {
-        return Settings::default();
-    };
+/// 从指定数据目录读设置(非 Tauri 前端用,如 GPUI)。
+pub fn load_from(dir: &std::path::Path) -> Settings {
     let file = dir.join("settings.json");
     let mut s: Settings = std::fs::read_to_string(file)
         .ok()
@@ -405,13 +434,11 @@ pub fn load(app: &tauri::AppHandle) -> Settings {
     s
 }
 
-pub fn save(app: &tauri::AppHandle, s: &Settings) {
-    use tauri::Manager;
-    if let Ok(dir) = app.path().app_data_dir() {
-        let _ = std::fs::create_dir_all(&dir);
-        if let Ok(json) = serde_json::to_string_pretty(s) {
-            let _ = std::fs::write(dir.join("settings.json"), json);
-        }
+/// 写入指定数据目录(非 Tauri 前端用)。
+pub fn save_to(dir: &std::path::Path, s: &Settings) {
+    let _ = std::fs::create_dir_all(dir);
+    if let Ok(json) = serde_json::to_string_pretty(s) {
+        let _ = std::fs::write(dir.join("settings.json"), json);
     }
 }
 

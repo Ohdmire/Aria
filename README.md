@@ -27,9 +27,12 @@ plasmashell(1440p 实测 ~120fps,CPU 只有共享内存路径的 1/4)。
 
 ```bash
 scripts/build-kde-plugin.sh --install   # 构建 QML 原生控件 + 安装插件包
-cargo build --release                   # 需要 Qt6 + EGL/GLES 开发包、Vulkan 驱动
+cargo build --release                   # 需要 Rust、Qt6/EGL/GLES 开发包、Vulkan 驱动、GTK3
 ./target/release/aria
 ```
+
+前端为 GPUI(无 WebView):曲库/队列/设置三栏,底部播放条,系统托盘
+(托盘需要 GTK3 + libayatana-appindicator;`tray-icon` 关闭了 libxdo 依赖)。
 
 > 这一版在 `Cargo.toml` 里有一行 `[patch]`,把 `osu-replay-render` 指到
 > 同级的 `../osu-replay-render`(需要它暴露 `Renderer::target_texture()`
@@ -56,7 +59,7 @@ cargo build --release                   # 需要 Qt6 + EGL/GLES 开发包、Vulk
 - [osu-replay-render](https://github.com/Ohdmire/osu-replay-render) —— storyboard / 回放渲染核心,osu!stable 与 lazer 曲库解析
 - [kira](https://github.com/tesselode/kira) / [Symphonia](https://github.com/pdeljanov/Symphonia) —— 音频引擎与解码
 - [SoundTouch](https://codeberg.org/soundtouch/soundtouch)(LGPL-2.1) —— BGM 变速
-- [Tauri](https://github.com/tauri-apps/tauri) —— 应用框架
+- [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) —— 应用框架(Zed 的 GPU UI 库)
 
 osu! 是 Ppy Pty Ltd 的游戏;本项目与 ppy 无关 · MIT License
 

@@ -9,10 +9,10 @@ arch=('x86_64')
 url='https://github.com/Ohdmire/Aria'
 license=('MIT')
 depends=(
-    'webkit2gtk-4.1' 'gtk3' 'libayatana-appindicator' 'librsvg'
     'alsa-lib' 'vulkan-icd-loader' 'libglvnd' 'wayland' 'libxkbcommon'
-    'fontconfig' 'freetype2' 'harfbuzz' 'libsoup3'
-    'gstreamer' 'gst-plugins-base-libs'
+    'fontconfig' 'freetype2' 'harfbuzz'
+    # GPUI 前端(含托盘)与 KDE 壁纸插件
+    'gtk3' 'libayatana-appindicator'
     'qt6-declarative'
     # 视频 storyboard 解码与视频探测(ffmpeg 包同时提供 ffprobe)
     'ffmpeg'

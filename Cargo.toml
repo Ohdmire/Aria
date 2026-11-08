@@ -6,7 +6,6 @@ license = "MIT"
 description = "Aria(ATRI rhythm interactive animation)—— osu! storyboard 桌面动态壁纸播放器"
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
 cc = "1"
 
 [dependencies]
@@ -32,12 +31,14 @@ realm-db-reader = { git = "https://github.com/Ohdmire/realm-db-reader", branch =
 # osu!stable osu!.db / collection.db 只读解析
 osu-db = "0.2.1"
 
-tauri = { version = "2", features = ["tray-icon"] }
-tauri-plugin-dialog = "2"
 base64 = "0.23"
-tauri-plugin-single-instance = "2.4.4"
+# 封面缩略图(GPUI 的 img() 按原图解码,直接喂 1080p 封面会 OOM)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # ---------- Windows:桌面挂接 + WASAPI 设备事件 ----------
+# 前端:GPUI(原 Tauri 已移除)
+gpui = "0.2.2"
+
 [target.'cfg(windows)'.dependencies]
 winit = "0.30"
 # 设备热拔插事件(IMMNotificationClient 封装):默认设备切换/加入/移除,
@@ -75,6 +76,9 @@ calloop-wayland-source = "0.4"
 libc = "0.2"
 # 让 WebKitGTK 的原生控件(<select> 弹出列表等)跟随应用内明暗主题
 gtk = "0.18"
+tray-icon = { version = "=0.24.2", default-features = false, features = ["gtk"] }
+# 原生文件选择(走 XDG portal,不引入 GTK2 循环冲突)
+rfd = "0.16"
 # SIGTERM/SIGINT 时还原桌面壁纸(否则被 kill 后桌面停在最后一帧)
 signal-hook = "0.3"
 # dmabuf 零拷贝输出(Vulkan external memory)
@@ -82,6 +86,11 @@ ash = "0.38"
 # 与 wgpu 同版本的 wgpu-types:hal 纹理描述里的 TextureUses
 wgpu-types = "25"
 
+
+# gpui 依赖的 xattr 0.2.3 引用了 libc::ENOATTR,新版 libc 在 Linux 上删了
+# 这个常量,本地打补丁(见 vendor/xattr)。
+[patch.crates-io]
+xattr = { path = "vendor/xattr" }
 
 [profile.dev]
 opt-level = 1

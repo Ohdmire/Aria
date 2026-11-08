@@ -1,6 +1,4 @@
 fn main() {
-    tauri_build::build();
-
     // SoundTouch C++ 源码 + C 接口垫片,静态编译进本 crate。
     // (MSVC 的 C++ 符号修饰与 bindgen 预生成绑定不兼容,垫片导出纯 C
     // 符号,Rust 侧零 mangling 依赖。)
