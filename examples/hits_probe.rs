@@ -45,11 +45,13 @@ fn main() {
                 break;
             }
         }
+        // 第 5 个参数是上游新增的 layered 开关:两次探测都打开,比较的只是
+        // "有谱面层" vs "没有谱面层"。
         let with = osu_replay_render::hitsound::resolve_sample_parts(
-            bank, name, custom, filename, Some(&store), &skin,
+            bank, name, custom, filename, true, Some(&store), &skin,
         );
         let without = osu_replay_render::hitsound::resolve_sample_parts(
-            bank, name, custom, filename, None, &skin,
+            bank, name, custom, filename, true, None, &skin,
         );
         let len = |b: &Option<Vec<u8>>| b.as_ref().map(|v| v.len()).unwrap_or(0);
         println!(

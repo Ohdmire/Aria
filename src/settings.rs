@@ -195,6 +195,9 @@ pub struct Settings {
     pub lazer_set: Option<String>,
     #[serde(default)]
     pub lazer_sha2: Option<String>,
+    /// 上次播放难度的显示名:曲库还没加载完的那几秒,播放条用它而不是 sha2。
+    #[serde(default)]
+    pub lazer_diff: Option<String>,
     /// 界面主题:"dark"(默认)/ "light"。
     #[serde(default = "default_theme")]
     pub theme_mode: String,
@@ -262,8 +265,13 @@ pub struct SavedTrack {
     pub mods: u32,
     #[serde(default)]
     pub title: String,
+    /// 原名标题的另一种写法(osu! 的 romaji / unicode 两套名字都存,显示时按开关挑)
+    #[serde(default)]
+    pub title_u: String,
     #[serde(default)]
     pub artist: String,
+    #[serde(default)]
+    pub artist_u: String,
     #[serde(default)]
     pub length_ms: f64,
 }
@@ -384,6 +392,7 @@ impl Default for Settings {
             sb_only: false,
             lazer_set: None,
             lazer_sha2: None,
+            lazer_diff: None,
             theme_mode: default_theme(),
             accent: default_accent(),
             close_action: None,

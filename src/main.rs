@@ -13,6 +13,7 @@ mod kde;
 #[cfg(target_os = "linux")]
 mod dmabuf;
 mod gpui_ui;
+mod hotkeys;
 mod lazer;
 mod loader;
 mod logging;

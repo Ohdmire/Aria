@@ -32,4 +32,22 @@ fn main() {
     if cfg!(target_os = "linux") {
         println!("cargo:rustc-link-lib=dylib=stdc++");
     }
+
+    // Windows:把 icons/icon.ico 编进 exe(资源 id 1)。
+    // GPUI 的 Windows 后端用 LoadImageW(模块句柄, id 1) 取窗口图标,任务栏 /
+    // Alt-Tab 都用它;不嵌入就只剩系统默认的空白图标。编译失败(缺 rc.exe)
+    // 只警告不中断构建 —— 图标是装饰,不该挡住编译。
+    if cfg!(windows) {
+        let manifest = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+        let icon = manifest.join("icons").join("icon.ico");
+        println!("cargo:rerun-if-changed=icons/icon.ico");
+        let rc = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("aria.rc");
+        // rc.exe 用 / 分隔也行,省得写转义的反斜杠
+        let icon = icon.display().to_string().replace('\\', "/");
+        if std::fs::write(&rc, format!("1 ICON \"{icon}\"\n")).is_ok() {
+            embed_resource::compile(&rc, embed_resource::NONE)
+                .manifest_optional()
+                .unwrap_or_else(|e| println!("cargo:warning=嵌入图标失败(不影响运行): {e}"));
+        }
+    }
 }

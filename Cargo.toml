@@ -1,12 +1,15 @@
 [package]
 name = "aria"
-version = "1.4.0"
+version = "1.4.1"
 edition = "2024"
 license = "MIT"
 description = "Aria(ATRI rhythm interactive animation)—— osu! storyboard 桌面动态壁纸播放器"
 
 [build-dependencies]
 cc = "1"
+# 把 icons/icon.ico 编进 Windows exe(任务栏 / Alt-Tab 图标;GPUI 取资源 id 1)
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
 
 [dependencies]
 osu_replay_render = { git = "https://github.com/Ohdmire/osu-replay-render.git", branch = "master" }
@@ -55,6 +58,11 @@ windows = { version = "0.62", features = [
     "Win32_System_Com",
 ] }
 winreg = "0.56"
+# 原生文件/目录选择:IFileDialog(走 COM,不需要 GTK);common-controls-v6 让
+# 对话框跟随系统视觉样式。Linux 侧仍走 XDG portal(见下面的 linux 段)。
+rfd = { version = "0.16", default-features = false, features = ["common-controls-v6"] }
+# 系统托盘:tray-icon 的 Win32 后端(自建隐藏窗口 + 消息泵,不依赖 GTK)
+tray-icon = { version = "=0.24.2", default-features = false }
 
 # ---------- Linux/Wayland:layer-shell 壁纸层 + 调试窗口 ----------
 [target.'cfg(target_os = "linux")'.dependencies]

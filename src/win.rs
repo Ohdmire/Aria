@@ -30,7 +30,8 @@ use windows::Win32::Foundation::{
     GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, RECT, SetLastError, WPARAM, WIN32_ERROR,
 };
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW, MapWindowPoints,
+    DISPLAY_DEVICEW, EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR,
+    MONITORINFOEXW, MapWindowPoints,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, EnumWindows, FindWindowExW,
@@ -52,6 +53,9 @@ use windows::core::{PCWSTR, w};
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Monitor {
     pub device: String,
+    /// 显示器型号(EDID 里的名字,如 `DELL U2720Q`),给设置页的显示器列表用;
+    /// 读不到就退回设备标识(`DISPLAY2`)。与 Wayland 侧同名字段同义。
+    pub model: String,
     pub x: i32,
     pub y: i32,
     pub w: i32,
@@ -88,8 +92,10 @@ pub fn list_monitors() -> Vec<Monitor> {
                             .unwrap_or(mi.szDevice.len())],
                     );
                     let r = mi.monitorInfo.rcMonitor;
+                    let model = monitor_model(&device);
                     out.push(Monitor {
                         device,
+                        model,
                         x: r.left,
                         y: r.top,
                         w: r.right - r.left,
@@ -109,6 +115,61 @@ pub fn list_monitors() -> Vec<Monitor> {
         );
         out
     }
+}
+
+/// 显示器型号:`EnumDisplayDevicesW(<device>)` 报的 EDID 名字(如 `DELL U2720Q`)。
+/// 驱动只给 "Generic PnP Monitor" 时退回设备标识段(`MONITOR\DELA1C3` → `DELA1C3`),
+/// 再退回 `DISPLAY2` 这种设备名。
+fn monitor_model(device: &str) -> String {
+    let wide: Vec<u16> = device.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let mut dd = DISPLAY_DEVICEW {
+            cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+            ..Default::default()
+        };
+        if EnumDisplayDevicesW(PCWSTR(wide.as_ptr()), 0, &mut dd, 0).as_bool() {
+            let name = wide_str(&dd.DeviceString);
+            if !name.is_empty() && !name.eq_ignore_ascii_case("Generic PnP Monitor") {
+                return name;
+            }
+            let id = wide_str(&dd.DeviceID);
+            if let Some(code) = id.strip_prefix("MONITOR\\").and_then(|r| r.split('\\').next()) {
+                if !code.is_empty() {
+                    return code.to_string();
+                }
+            }
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    device.trim_start_matches("\\\\.\\").to_string()
+}
+
+/// Win32 定长 UTF-16 字段 → String(截到第一个 NUL)。
+fn wide_str(buf: &[u16]) -> String {
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..len]).trim().to_string()
+}
+
+/// 结束并重新启动 explorer.exe,让 shell 重建 Progman / DefView / WorkerW。
+/// 任务栏会闪一下;壁纸窗口挂在 Progman 下,会随 explorer 退出而销毁,
+/// 由壁纸子进程自己重挂(见 `wall` 模块的"被外部销毁"重试)。
+pub fn restart_explorer() -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let status = std::process::Command::new("taskkill")
+        .args(["/F", "/IM", "explorer.exe"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()?;
+    if !status.success() {
+        bail!("结束 explorer 失败,退出码 {}", status.code().unwrap_or(-1));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::process::Command::new("explorer.exe")
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()?;
+    Ok(())
 }
 
 /// 未公开的 Progman 消息:让 shell 整理桌面层(生成 WorkerW)。

@@ -6,7 +6,7 @@
 //! - 设置页:全部会话参数(开关/步进/枚举/路径文本),改动即持久化并下发;
 //! - 右侧播放列表:点击切歌、多选、右键菜单(难度/上移下移/移除);
 //! - 底部播放条:上一首/暂停/下一首、±10s、进度、时长、音量;
-//! - 托盘:见 `tray` 模块(独立 GTK 线程)。
+//! - 托盘:见 `tray` 模块(独立线程 + 平台消息循环)。
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -14,14 +14,27 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
-use gpui::{StatefulInteractiveElement, img as gpui_img};
+use gpui::StatefulInteractiveElement;
+// 自绘控件(滚动条)的过渡动画
+use gpui::AnimationExt;
 use serde_json::json;
 use gpui::{
     div, px, rgb, rgba, Application, Context, FocusHandle, KeyDownEvent, MouseButton, Render,
     Window, WindowOptions,
 };
 
+/// 应用数据目录(Windows `%APPDATA%\com.ohdmire.aria`,Linux XDG,
+/// 与旧 Tauri app_data_dir、[`crate::logging`] 同口径)。
+#[cfg(windows)]
+pub fn data_dir() -> PathBuf {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("com.ohdmire.aria")
+}
+
 /// 应用数据目录(Linux XDG,与旧 Tauri app_data_dir 同口径)。
+#[cfg(not(windows))]
 pub fn data_dir() -> PathBuf {
     if let Some(x) = std::env::var_os("XDG_DATA_HOME") {
         return PathBuf::from(x).join("com.ohdmire.aria");
@@ -33,6 +46,40 @@ pub fn data_dir() -> PathBuf {
 }
 
 static WINDOW: Mutex<Option<gpui::WindowHandle<App>>> = Mutex::new(None);
+
+/// 主窗口的 Win32 句柄:给原生文件对话框当 owner。没有 owner 时 Windows 上
+/// 对话框可能弹在主窗口后面,看起来像"点了没反应"。
+#[cfg(windows)]
+static MAIN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// 把一个裸 HWND 包成 `HasWindowHandle`/`HasDisplayHandle`,交给 rfd 当 owner。
+#[cfg(windows)]
+struct RawParent(std::num::NonZeroIsize);
+
+#[cfg(windows)]
+impl raw_window_handle::HasWindowHandle for RawParent {
+    fn window_handle(
+        &self,
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        let h = raw_window_handle::Win32WindowHandle::new(self.0);
+        Ok(unsafe {
+            raw_window_handle::WindowHandle::borrow_raw(raw_window_handle::RawWindowHandle::Win32(h))
+        })
+    }
+}
+
+#[cfg(windows)]
+impl raw_window_handle::HasDisplayHandle for RawParent {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        Ok(unsafe {
+            raw_window_handle::DisplayHandle::borrow_raw(raw_window_handle::RawDisplayHandle::Windows(
+                raw_window_handle::WindowsDisplayHandle::new(),
+            ))
+        })
+    }
+}
 
 /// 关闭主窗口时是否最小化到托盘(由 settings.close_action 同步)。
 static CLOSE_TO_TRAY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -211,6 +258,10 @@ enum Field {
     Ffmpeg,
     Ffprobe,
     Skin,
+    /// 全局快捷键的三条组合键文本(Windows `RegisterHotKey`;其它平台只保存不注册)。
+    HotkeyPrev,
+    HotkeyToggle,
+    HotkeyNext,
     NumVolume,
     NumBgm,
     NumHits,
@@ -251,8 +302,14 @@ enum SortKey {
 struct Row {
     set_id: String,
     sha2: String,
+    /// 显示用标题/艺术家(按「以 Unicode 显示」开关由下面四个字段挑选,过滤时重算)
     title: String,
     artist: String,
+    /// 原名与 unicode 名都留着:搜索两个都匹配,切换显示也不用重读曲库
+    title_raw: String,
+    title_u: String,
+    artist_raw: String,
+    artist_u: String,
     star: f64,
     star_lo: f64,
     diffs: usize,
@@ -269,8 +326,11 @@ struct Row {
 struct QueueTrack {
     set_id: String,
     sha2: Option<String>,
+    /// 两套名字都存(romaji / unicode),显示时按「以 Unicode 显示」现挑
     title: String,
+    title_u: String,
     artist: String,
+    artist_u: String,
     length_ms: f64,
     mods: u32,
 }
@@ -618,6 +678,163 @@ struct App {
     lib_scroll: gpui::UniformListScrollHandle,
     lib_list: gpui::ListState,
     queue_scroll: gpui::UniformListScrollHandle,
+    /// 展开的谱面集在 `rows` 里的下标(虚拟列表用它把 ix 映射成"行/难度块"),
+    /// 只在 rows 或 expanded 变化时更新,不逐帧算。
+    expanded_row: Option<usize>,
+    /// 当前鼠标悬停在哪条自绘滚动条上(同一时刻只可能有一条),驱动宽度/配色动画。
+    sb_hover: std::cell::Cell<Option<&'static str>>,
+    /// 拖动中指针滑出滚动条时先"粘住"高亮,松手后再清。
+    sb_sticky: std::cell::Cell<Option<&'static str>>,
+    /// 自动检测到的路径(注册表 / storage.ini / PATH),只在变化时重新采集。
+    probe_lazer_root: Option<std::path::PathBuf>,
+    probe_stable_root: Option<std::path::PathBuf>,
+    probe_realm: Option<std::path::PathBuf>,
+    probe_ffmpeg: Option<std::path::PathBuf>,
+    probe_ffprobe: Option<std::path::PathBuf>,
+}
+
+/// 播放条上的传输图标:纯路径绘制,不依赖字体字形,也不是 emoji。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransportIcon {
+    Prev,
+    Play,
+    Pause,
+    Next,
+}
+
+/// 在给定方框里画出图标(16×16 栅格,按实际 bounds 缩放)。
+fn transport_icon_path(
+    kind: TransportIcon,
+    b: gpui::Bounds<gpui::Pixels>,
+) -> Option<gpui::Path<gpui::Pixels>> {
+    let s = f32::from(b.size.width) / 16.0;
+    let p = |x: f32, y: f32| {
+        gpui::point(b.origin.x + gpui::px(x * s), b.origin.y + gpui::px(y * s))
+    };
+    let mut pb = gpui::PathBuilder::fill();
+    match kind {
+        TransportIcon::Play => {
+            pb.add_polygon(&[p(4.5, 2.0), p(13.0, 8.0), p(4.5, 14.0)], true);
+        }
+        TransportIcon::Pause => {
+            pb.add_polygon(&[p(4.0, 2.0), p(6.5, 2.0), p(6.5, 14.0), p(4.0, 14.0)], true);
+            pb.add_polygon(&[p(9.5, 2.0), p(12.0, 2.0), p(12.0, 14.0), p(9.5, 14.0)], true);
+        }
+        TransportIcon::Prev => {
+            // 竖条 + 左向三角
+            pb.add_polygon(&[p(2.5, 2.0), p(4.5, 2.0), p(4.5, 14.0), p(2.5, 14.0)], true);
+            pb.add_polygon(&[p(13.5, 2.0), p(5.5, 8.0), p(13.5, 14.0)], true);
+        }
+        TransportIcon::Next => {
+            // 右向三角 + 竖条
+            pb.add_polygon(&[p(2.5, 2.0), p(10.5, 8.0), p(2.5, 14.0)], true);
+            pb.add_polygon(&[p(11.5, 2.0), p(13.5, 2.0), p(13.5, 14.0), p(11.5, 14.0)], true);
+        }
+    }
+    pb.build().ok()
+}
+
+/// 把一次按键事件翻译成快捷键文本(`Ctrl+Alt+Right` / `F8` / `MediaNext`)。
+///
+/// 只按修饰键(Ctrl / Alt / Shift / Win)时返回 `None` —— 捕获模式要等主键。
+/// 键名统一走 [`crate::hotkeys`] 解析器认识的写法,主键缺失时用字符本身兜底。
+fn hotkey_chord_text(ks: &gpui::Keystroke) -> Option<String> {
+    let key = ks.key.as_str();
+    // 修饰键本身不构成组合
+    if matches!(
+        key,
+        "control" | "ctrl" | "alt" | "shift" | "platform" | "function" | "fn" | "win" | "super" | "meta" | "cmd"
+    ) {
+        return None;
+    }
+    let named = match key {
+        "up" => "Up",
+        "down" => "Down",
+        "left" => "Left",
+        "right" => "Right",
+        "space" => "Space",
+        "enter" | "return" => "Enter",
+        "tab" => "Tab",
+        "escape" | "esc" => "Escape",
+        "backspace" => "Backspace",
+        "delete" | "del" => "Delete",
+        "insert" | "ins" => "Insert",
+        "home" => "Home",
+        "end" => "End",
+        "pageup" => "PageUp",
+        "pagedown" => "PageDown",
+        "pause" => "Pause",
+        "printscreen" => "PrintScreen",
+        "capslock" => "CapsLock",
+        "numlock" => "NumLock",
+        "scrolllock" => "ScrollLock",
+        "mediaplaypause" | "playpause" => "MediaPlayPause",
+        "medianext" | "nexttrack" => "MediaNext",
+        "mediaprev" | "prevtrack" => "MediaPrev",
+        "mediastop" | "stop" => "MediaStop",
+        "minus" => "Minus",
+        "equal" => "Plus",
+        "comma" => "Comma",
+        "period" => "Period",
+        "slash" => "Slash",
+        "backslash" => "Backslash",
+        "semicolon" => "Semicolon",
+        "quote" => "Quote",
+        "backtick" | "backquote" => "Backquote",
+        "leftbracket" => "BracketLeft",
+        "rightbracket" => "BracketRight",
+        // 字母 / 数字 / f1–f24 / numpad:键名本身就够解析器识别
+        _ => {
+            if let Some(c) = ks.key_char.as_deref().filter(|c| c.chars().count() == 1) {
+                // 符号键用字符本身(解析器认 - = , . / \ ; ' ` [ ])
+                return finish_chord(ks, &c.to_uppercase());
+            }
+            return finish_chord(ks, &key.to_uppercase());
+        }
+    };
+    finish_chord(ks, named)
+}
+
+/// 拼上修饰键前缀。
+fn finish_chord(ks: &gpui::Keystroke, base: &str) -> Option<String> {
+    let mut text = String::new();
+    if ks.modifiers.control {
+        text.push_str("Ctrl+");
+    }
+    if ks.modifiers.alt {
+        text.push_str("Alt+");
+    }
+    if ks.modifiers.shift {
+        text.push_str("Shift+");
+    }
+    if ks.modifiers.platform {
+        text.push_str("Win+");
+    }
+    text.push_str(base);
+    Some(text)
+}
+
+/// 滚动偏移(gpui 里是**负值**:顶部 0、底部 -max)→ 滑块位置比例 0..1。
+///
+/// 单独拎出来是因为这个符号很容易搞反:直接拿 `offset` 当正值算,比例恒为 0,
+/// 滑块就永远贴在顶端("滚动条不滚动"的元凶)。
+fn scroll_frac(offset_y: f32, max: f32) -> f32 {
+    if max <= 0.0 {
+        0.0
+    } else {
+        ((-offset_y) / max).clamp(0.0, 1.0)
+    }
+}
+
+/// 两个 `0xRRGGBB` 之间线性插值(自绘控件的过渡配色用)。
+fn lerp_rgb(a: u32, b: u32, t: f32) -> u32 {
+    let t = t.clamp(0.0, 1.0);
+    let ch = |shift: u32| {
+        let x = ((a >> shift) & 0xff) as f32;
+        let y = ((b >> shift) & 0xff) as f32;
+        ((x + (y - x) * t).round() as u32 & 0xff) << shift
+    };
+    ch(16) | ch(8) | ch(0)
 }
 
 impl App {
@@ -640,6 +857,10 @@ impl App {
             Field::Ffmpeg,
             Field::Ffprobe,
             Field::Skin,
+            // 快捷键的三行也要有焦点句柄,否则点进去收不到按键(录不进去)
+            Field::HotkeyPrev,
+            Field::HotkeyToggle,
+            Field::HotkeyNext,
             Field::NumVolume,
             Field::NumBgm,
             Field::NumHits,
@@ -756,8 +977,19 @@ impl App {
             lib_scroll: gpui::UniformListScrollHandle::default(),
             lib_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(300.0)),
             queue_scroll: gpui::UniformListScrollHandle::default(),
+            expanded_row: None,
+            sb_hover: std::cell::Cell::new(None),
+            sb_sticky: std::cell::Cell::new(None),
+            probe_lazer_root: None,
+            probe_stable_root: None,
+            probe_realm: None,
+            probe_ffmpeg: None,
+            probe_ffprobe: None,
         };
+        app.refresh_probes();
         sync_close_mode(&app.settings);
+        // 全局快捷键:按已保存的组合注册(默认关闭 = 空表;幂等)
+        crate::hotkeys::start(&app.settings);
         app.spawn_library_load();
         app.load_queue();
         // 队列为空时默认落在曲库,避免一进来只看到空列表
@@ -781,7 +1013,9 @@ impl App {
                 set_id: t.set_id.clone(),
                 sha2: t.sha2.clone(),
                 title: if t.title.is_empty() { t.set_id.clone() } else { t.title.clone() },
+                title_u: t.title_u.clone(),
                 artist: t.artist.clone(),
+                artist_u: t.artist_u.clone(),
                 length_ms: t.length_ms,
                 mods: t.mods,
             })
@@ -791,6 +1025,8 @@ impl App {
 
     /// 后台解析曲库(不阻塞 UI):结果在 poll 里应用。
     fn spawn_library_load(&mut self) {
+        // 曲库源/目录可能刚变过:顺手重新采集自动检测路径(不逐帧做)
+        self.refresh_probes();
         self.loading = true;
         self.status_line = "曲库加载中…".to_string();
         let source = self.settings.source.clone();
@@ -835,6 +1071,10 @@ impl App {
                             sha2,
                             title: pick_text(&set.title, &set.title_unicode, unicode),
                             artist: pick_text(&set.artist, &set.artist_unicode, unicode),
+                            title_raw: set.title.clone(),
+                            title_u: set.title_unicode.clone(),
+                            artist_raw: set.artist.clone(),
+                            artist_u: set.artist_unicode.clone(),
                             star,
                             star_lo: if star_lo.is_finite() { star_lo } else { star },
                             diffs: set.beatmaps.len(),
@@ -934,9 +1174,12 @@ impl App {
             .all_rows
             .iter()
             .filter(|r| {
+                // 搜索:原名和 unicode 名**都**参与匹配(不是只搜当前显示的那个)
                 if !q.is_empty()
-                    && !r.title.to_lowercase().contains(&q)
-                    && !r.artist.to_lowercase().contains(&q)
+                    && !r.title_raw.to_lowercase().contains(&q)
+                    && !r.title_u.to_lowercase().contains(&q)
+                    && !r.artist_raw.to_lowercase().contains(&q)
+                    && !r.artist_u.to_lowercase().contains(&q)
                 {
                     return false;
                 }
@@ -962,6 +1205,12 @@ impl App {
             })
             .cloned()
             .collect();
+        // 显示名按「以 Unicode 显示」开关现挑:切换开关只重算这一步,不用重读曲库
+        let unicode = self.settings.display_unicode;
+        for r in rows.iter_mut() {
+            r.title = pick_text(&r.title_raw, &r.title_u, unicode);
+            r.artist = pick_text(&r.artist_raw, &r.artist_u, unicode);
+        }
         // 星级过滤后每个谱面集剩余多少难度
         if self.star_min > 0.0 || self.star_max > 0.0 {
             if let Some(lib) = &self.lib {
@@ -1016,6 +1265,11 @@ impl App {
             rows.reverse();
         }
         self.rows = rows;
+        // 行集合变了:同步"展开的谱面集在第几行"(虚拟列表用它做算术映射)
+        self.expanded_row = self
+            .expanded
+            .as_ref()
+            .and_then(|id| self.rows.iter().position(|r| &r.set_id == id));
     }
 
     // ---- 播放 ----
@@ -1024,6 +1278,10 @@ impl App {
         let dead = self.child.as_mut().map(|c| !c.alive()).unwrap_or(true);
         if dead {
             self.child = spawn_wallpaper(self.status.clone());
+            // 新进程的默认渲染模式是 AutoPause,必须把保存的设置补上
+            if self.child.is_some() {
+                self.send_child_settings();
+            }
         }
     }
 
@@ -1113,6 +1371,8 @@ impl App {
             self.toast("壁纸进程启动失败");
             return;
         };
+        // 开始播放 = 退出预览:右侧信息卡要跟着新歌走,不能停在之前预览的那首
+        self.preview = None;
         let skin = self.resolve_skin();
         let monitor = self.monitor_bounds();
         let cmd = serde_json::json!({
@@ -1148,7 +1408,7 @@ impl App {
                 self.load_seq_seen = st.load_seq;
                 st.t = 0.0;
             }
-            self.current_title(set_id);
+            self.current_title(set_id, Some(&chosen));
         }
         if sent {
             if let Some(child) = &self.child {
@@ -1190,9 +1450,23 @@ impl App {
             .map(|m| (m.x, m.y, m.w as u32, m.h as u32))
     }
 
-    fn current_title(&mut self, set_id: &str) {
-        if let Some(r) = self.all_rows.iter().find(|r| r.set_id == set_id) {
+    /// 记住"实际在放的那首"(谱面集 + 难度),播放条据此显示,不受曲库预览影响。
+    fn current_title(&mut self, set_id: &str, sha2: Option<&str>) {
+        if self.all_rows.iter().any(|r| r.set_id == set_id) {
             self.settings.lazer_set = Some(set_id.to_string());
+            if let Some(s) = sha2.filter(|s| !s.is_empty()) {
+                // 顺手记下难度名:曲库还没加载完的那几秒,播放条不至于把 sha2 当名字
+                let name = self
+                    .lib
+                    .as_ref()
+                    .and_then(|l| self.set_idx.get(set_id).and_then(|i| l.sets.get(*i)))
+                    .and_then(|set| set.beatmaps.iter().find(|b| b.sha2 == s))
+                    .map(|b| b.name.clone());
+                self.settings.lazer_sha2 = Some(s.to_string());
+                if name.is_some() {
+                    self.settings.lazer_diff = name;
+                }
+            }
             self.persist();
         }
     }
@@ -1372,6 +1646,7 @@ impl App {
         fresh.set_overrides = old.set_overrides;
         fresh.lazer_set = old.lazer_set;
         fresh.lazer_sha2 = old.lazer_sha2;
+        fresh.lazer_diff = old.lazer_diff;
         self.settings = fresh;
 
         apply_palette(self.settings.theme_mode != "light", &self.settings.accent);
@@ -1394,6 +1669,95 @@ impl App {
         // 能热更新的参数立刻生效
         self.send_live_settings();
         self.toast("已恢复默认设置");
+    }
+
+    /// 子进程刚(重)启动时,把保存的会话参数一次性下发。
+    ///
+    /// 子进程里的 `RenderMode` 默认是 `AutoPause`:不下发的话,设置页选「始终渲染」
+    /// 也不会生效 —— 全屏遮挡时画面照样被拆掉(和 Tauri 版 `ctl::spawn_child`
+    /// 起播前的那一批 `Set*` 命令完全对应)。
+    fn send_child_settings(&mut self) {
+        let (
+            volume,
+            hits_volume,
+            hud,
+            pp,
+            hit_anim,
+            brk_lighten,
+            cursor_on,
+            cursor_sz,
+            snaking_in,
+            snaking_out,
+            cursor_trail,
+            cursor_ripples,
+            render_mode,
+            debug_win,
+            bg_opacity,
+            master,
+            offset,
+            ghidden,
+            fade,
+            ffmpeg,
+            ffprobe,
+            log_on,
+            fps,
+        ) = {
+            let s = &self.settings;
+            (
+                s.volume,
+                if s.hitsound { s.hits_volume } else { 0.0 },
+                s.hud,
+                s.pp,
+                !s.reduce_anim,
+                s.break_lighten,
+                s.cursor,
+                s.cursor_size,
+                s.snaking_in,
+                s.snaking_out,
+                s.cursor_trail,
+                s.cursor_ripples,
+                s.render_mode.clone(),
+                s.debug_window,
+                s.bg_opacity,
+                s.master_volume,
+                s.audio_offset_ms,
+                // 单曲覆盖在 Load 里下发,这里只补全局值
+                s.gameplay_hidden,
+                s.fade_audio,
+                s.ffmpeg.clone(),
+                s.ffprobe.clone(),
+                s.log_enabled,
+                s.fps,
+            )
+        };
+        let cmds = [
+            json!({"cmd": "set_volume", "v": volume}),
+            json!({"cmd": "set_hits_volume", "v": hits_volume}),
+            json!({"cmd": "set_hud", "on": hud}),
+            json!({"cmd": "set_pp", "on": pp}),
+            json!({"cmd": "set_hit_animations", "on": hit_anim}),
+            json!({"cmd": "set_break_lighten", "on": brk_lighten}),
+            json!({"cmd": "set_cursor", "on": cursor_on}),
+            json!({"cmd": "set_cursor_size", "x": cursor_sz}),
+            json!({"cmd": "set_snaking_in", "on": snaking_in}),
+            json!({"cmd": "set_snaking_out", "on": snaking_out}),
+            json!({"cmd": "set_cursor_trail", "on": cursor_trail}),
+            json!({"cmd": "set_cursor_ripples", "on": cursor_ripples}),
+            json!({"cmd": "set_render_mode", "mode": render_mode}),
+            json!({"cmd": "set_debug_window", "on": debug_win}),
+            json!({"cmd": "set_bg_opacity", "v": bg_opacity}),
+            json!({"cmd": "set_master", "v": master}),
+            json!({"cmd": "set_offset", "ms": offset}),
+            json!({"cmd": "set_gameplay_hidden", "on": ghidden}),
+            json!({"cmd": "set_fade", "on": fade}),
+            json!({"cmd": "set_ffmpeg_bins", "ffmpeg": ffmpeg, "ffprobe": ffprobe}),
+            json!({"cmd": "set_log", "on": log_on}),
+            // 帧率必须在起播前下发:子进程默认 0(跟随刷新率)
+            json!({"cmd": "set_fps", "fps": fps}),
+        ];
+        for c in cmds {
+            self.send(c);
+        }
     }
 
     /// 把设置里可热更新的项重新下发(恢复默认后用)。
@@ -1445,7 +1809,9 @@ impl App {
                 sha2: t.sha2.clone(),
                 mods: t.mods,
                 title: t.title.clone(),
+                title_u: t.title_u.clone(),
                 artist: t.artist.clone(),
+                artist_u: t.artist_u.clone(),
                 length_ms: t.length_ms,
             })
             .collect();
@@ -1476,8 +1842,10 @@ impl App {
         if let Some(t) = self.queue.iter_mut().find(|t| t.set_id == set_id) {
             t.sha2 = sha2;
             t.mods = mods;
-            t.title = r.title.clone();
-            t.artist = r.artist.clone();
+            t.title = r.title_raw.clone();
+            t.title_u = r.title_u.clone();
+            t.artist = r.artist_raw.clone();
+            t.artist_u = r.artist_u.clone();
             t.length_ms = len;
             self.save_queue();
             self.toast("已更新现有条目");
@@ -1486,8 +1854,10 @@ impl App {
         self.queue.push(QueueTrack {
             set_id: r.set_id.clone(),
             sha2,
-            title: r.title.clone(),
-            artist: r.artist.clone(),
+            title: r.title_raw.clone(),
+            title_u: r.title_u.clone(),
+            artist: r.artist_raw.clone(),
+            artist_u: r.artist_u.clone(),
             length_ms: len,
             mods,
         });
@@ -1515,8 +1885,10 @@ impl App {
         if let Some(t) = self.queue.iter_mut().find(|t| t.set_id == set_id) {
             t.sha2 = sha2;
             t.mods = mods;
-            t.title = r.title.clone();
-            t.artist = r.artist.clone();
+            t.title = r.title_raw.clone();
+            t.title_u = r.title_u.clone();
+            t.artist = r.artist_raw.clone();
+            t.artist_u = r.artist_u.clone();
             t.length_ms = len;
             self.save_queue();
             self.toast("已更新现有条目");
@@ -1525,8 +1897,10 @@ impl App {
         self.queue.push(QueueTrack {
             set_id: r.set_id.clone(),
             sha2,
-            title: r.title.clone(),
-            artist: r.artist.clone(),
+            title: r.title_raw.clone(),
+            title_u: r.title_u.clone(),
+            artist: r.artist_raw.clone(),
+            artist_u: r.artist_u.clone(),
             length_ms: len,
             mods,
         });
@@ -1554,8 +1928,10 @@ impl App {
             if let Some(t) = self.queue.iter_mut().find(|t| t.set_id == id) {
                 t.sha2 = sha2;
                 t.mods = mods;
-                t.title = r.title.clone();
-                t.artist = r.artist.clone();
+                t.title = r.title_raw.clone();
+                t.title_u = r.title_u.clone();
+                t.artist = r.artist_raw.clone();
+                t.artist_u = r.artist_u.clone();
                 t.length_ms = len;
                 updated += 1;
                 continue;
@@ -1563,8 +1939,10 @@ impl App {
             self.queue.push(QueueTrack {
                 set_id: r.set_id.clone(),
                 sha2,
-                title: r.title.clone(),
-                artist: r.artist.clone(),
+                title: r.title_raw.clone(),
+                title_u: r.title_u.clone(),
+                artist: r.artist_raw.clone(),
+                artist_u: r.artist_u.clone(),
                 length_ms: len,
                 mods,
             });
@@ -1723,7 +2101,8 @@ impl App {
             "force_skin_colours" => self.settings.force_skin_colours = !self.settings.force_skin_colours,
             "display_unicode" => {
                 self.settings.display_unicode = !self.settings.display_unicode;
-                self.spawn_library_load();
+                // 只是显示名切换:重新算一遍列表即可,不必重读整个曲库
+                self.apply_filter();
             }
             "dblclick_add" => self.settings.dblclick_add = !self.settings.dblclick_add,
             "quick_add" => self.settings.quick_add = !self.settings.quick_add,
@@ -1762,6 +2141,10 @@ impl App {
                 self.settings.debug_window = !self.settings.debug_window;
                 self.send(json!({"cmd": "set_debug_window", "on": self.settings.debug_window}));
             }
+            "hotkeys_enabled" => {
+                self.settings.hotkeys_enabled = !self.settings.hotkeys_enabled;
+                self.apply_hotkeys();
+            }
             _ => {}
         }
         self.persist();
@@ -1782,9 +2165,11 @@ impl App {
                 };
             }
             "render_mode" => {
-                let order = ["autopause", "always", "off"];
+                // 与设置页下拉同序(Always → AutoPause → FsPause → FsSleep → Off)
+                let order = ["always", "autopause", "fs_pause", "fs_sleep", "off"];
                 let i = order.iter().position(|v| *v == self.settings.render_mode).unwrap_or(0);
                 self.settings.render_mode = order[(i + 1) % order.len()].to_string();
+                self.send(json!({"cmd": "set_render_mode", "mode": self.settings.render_mode}));
             }
             "play_mode" => {
                 self.settings.play_mode = match self.settings.play_mode {
@@ -1960,6 +2345,27 @@ impl App {
         })
     }
 
+    /// `ListState::reset` 会把滚动位置清零。删行/展开行导致条数变化时,
+    /// 用这个"重置但保住当前位置",避免列表跳回最顶上。
+    fn reset_list_keep_scroll(state: &gpui::ListState, len: usize) {
+        let keep = state.logical_scroll_top();
+        state.reset(len);
+        if len > 0 {
+            state.scroll_to(gpui::ListOffset {
+                item_ix: keep.item_ix.min(len - 1),
+                offset_in_item: keep.offset_in_item,
+            });
+        }
+    }
+
+    /// 全局快捷键的三行(捕获模式:按键而不是打字)
+    fn is_hotkey(field: Field) -> bool {
+        matches!(
+            field,
+            Field::HotkeyPrev | Field::HotkeyToggle | Field::HotkeyNext
+        )
+    }
+
     fn field_kind(field: Field) -> Option<&'static str> {
         Some(match field {
             Field::NumVolume => "volume",
@@ -2097,6 +2503,10 @@ impl App {
     // ---- 文本编辑 ----
 
     fn begin_edit(&mut self, field: Field, window: &mut Window) {
+        // 进入快捷键捕获:先注销当前注册,否则按同一组合会被系统先吞掉,捕获不到
+        if Self::is_hotkey(field) {
+            let _ = crate::hotkeys::apply(false, None, None, None);
+        }
         let value = match field {
             Field::Search => self.search.clone(),
             Field::LazerDir => self.settings.lazer_dir.clone().unwrap_or_default(),
@@ -2104,6 +2514,9 @@ impl App {
             Field::Ffmpeg => self.settings.ffmpeg.clone().unwrap_or_default(),
             Field::Ffprobe => self.settings.ffprobe.clone().unwrap_or_default(),
             Field::Skin => self.settings.skin.clone().unwrap_or_default(),
+            Field::HotkeyPrev => self.settings.hotkey_prev.clone().unwrap_or_default(),
+            Field::HotkeyToggle => self.settings.hotkey_toggle.clone().unwrap_or_default(),
+            Field::HotkeyNext => self.settings.hotkey_next.clone().unwrap_or_default(),
             _ => {
                 // 数值输入:点击后清空,直接输入新值;留空提交则保持原值
                 String::new()
@@ -2158,6 +2571,19 @@ impl App {
                 self.send(json!({"cmd": "set_ffmpeg_bins", "ffmpeg": self.settings.ffmpeg, "ffprobe": self.settings.ffprobe}));
             }
             Field::Skin => self.settings.skin = opt(text),
+            // 快捷键:三条文本一起重新注册(空 = 不绑定);规范化后的文本写回
+            Field::HotkeyPrev => {
+                self.settings.hotkey_prev = opt(text);
+                self.apply_hotkeys();
+            }
+            Field::HotkeyToggle => {
+                self.settings.hotkey_toggle = opt(text);
+                self.apply_hotkeys();
+            }
+            Field::HotkeyNext => {
+                self.settings.hotkey_next = opt(text);
+                self.apply_hotkeys();
+            }
             _ => {
                 if let Some(kind) = Self::field_kind(ed.field) {
                     if let Ok(v) = text.parse::<f64>() {
@@ -2170,7 +2596,55 @@ impl App {
         self.persist();
     }
 
+    /// 快捷键:把设置里的三条文本交给 `hotkeys` 线程重新注册(未启用 = 全部注销)。
+    fn apply_hotkeys(&mut self) {
+        match crate::hotkeys::apply(
+            self.settings.hotkeys_enabled,
+            self.settings.hotkey_prev.as_deref(),
+            self.settings.hotkey_toggle.as_deref(),
+            self.settings.hotkey_next.as_deref(),
+        ) {
+            Ok(t) => {
+                self.settings.hotkey_prev = t.prev;
+                self.settings.hotkey_toggle = t.toggle;
+                self.settings.hotkey_next = t.next;
+            }
+            Err(e) => self.toast(format!("快捷键:{e}")),
+        }
+    }
+
     fn on_key(&mut self, field: Field, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        if self.edit.as_ref().map(|e| e.field) != Some(field) {
+            return;
+        }
+        // 快捷键是"捕获"模式:点进输入框后按什么组合就填什么,不用手打文字。
+        if Self::is_hotkey(field) {
+            let key = ev.keystroke.key.as_str();
+            if key == "escape" {
+                // 放弃本次捕获,恢复原来的注册
+                self.edit = None;
+                self.apply_hotkeys();
+                cx.notify();
+                return;
+            }
+            let text = if matches!(key, "backspace" | "delete") {
+                // 退格 / Delete = 清空这条绑定
+                String::new()
+            } else {
+                match hotkey_chord_text(&ev.keystroke) {
+                    Some(t) => t,
+                    // 只按了修饰键:继续等主键
+                    None => return,
+                }
+            };
+            if let Some(ed) = self.edit.as_mut() {
+                ed.buf = text;
+            }
+            // 捕获到完整组合后立即落账并重新注册
+            self.commit_edit();
+            cx.notify();
+            return;
+        }
         let Some(ed) = &mut self.edit else { return };
         if ed.field != field {
             return;
@@ -2230,6 +2704,12 @@ impl App {
     /// 刷新播放状态(定时器调用);返回是否需要重绘。
     fn poll(&mut self, cx: &mut Context<Self>) -> bool {
         let mut dirty = false;
+        // 拖动结束后再清"拖动期间保留"的滚动条高亮(松手瞬间拖动可能还没结束)
+        if self.sb_sticky.get().is_some() && !cx.has_active_drag() {
+            self.sb_sticky.set(None);
+            self.sb_hover.set(None);
+            dirty = true;
+        }
         // 曲终自动切歌:单曲循环重播本曲;顺序/随机都走 step(),
         // 随机模式沿洗好的整轮排列前进(不再是"下一首 +1")。
         let ended = {
@@ -2337,6 +2817,13 @@ impl App {
                 }
             }
         }
+        for action in crate::hotkeys::poll() {
+            match action {
+                crate::hotkeys::Action::Prev => self.step(-1),
+                crate::hotkeys::Action::Toggle => self.toggle_pause(),
+                crate::hotkeys::Action::Next => self.step(1),
+            }
+        }
         let (t, playing, dur) = {
             let st = self.status.lock().unwrap();
             (st.t, st.playing, st.duration)
@@ -2428,7 +2915,12 @@ fn sample_gradient(spectrum: &[(f64, [u8; 3])], value: f64) -> [u8; 3] {
     spectrum[spectrum.len() - 1].1
 }
 
-/// 谱面集状态文字标签(ranked / approved / loved / qualified / pending / graveyard)。
+/// 谱面集状态文字标签(osu!lazer `BeatmapSetStatus`)。
+///
+/// 取值(见 `lazer::LazerSet::status`):-3 Unknown / -2 Unsubmitted /
+/// 0 Pending / 1 Ranked / 2 Approved / 3 Qualified / 4 Loved /
+/// 5 Graveyard / 6 WIP / 7 NeedsUpdate。
+/// -3 不显示:osu!stable 源没有在线状态,整库都是 -3,画出来会满屏灰标。
 fn status_badge(status: i32) -> impl IntoElement {
     let (label, bg, fg) = match status {
         1 => ("ranked", 0xb3ff66u32, 0x1a2a00u32),
@@ -2437,6 +2929,9 @@ fn status_badge(status: i32) -> impl IntoElement {
         4 => ("loved", 0xff66aa, 0xffffff),
         0 => ("pending", 0x6aa0e0, 0xffffff),
         5 => ("graveyard", 0x777788, 0xffffff),
+        6 => ("wip", 0xd8a24a, 0x2a1c00),
+        7 => ("needs update", 0xe06666, 0xffffff),
+        -2 => ("unsubmitted", 0x777788, 0xffffff),
         _ => ("", 0x777788, 0xffffff),
     };
     if label.is_empty() {
@@ -2511,26 +3006,6 @@ fn fmt_ms(ms: f64) -> String {
     }
     let secs = (ms / 1000.0).round() as u64;
     format!("{}:{:02}", secs / 60, secs % 60)
-}
-
-/// 用系统默认方式打开网址(Windows 用 start,其它平台用 xdg-open)。
-fn open_url(url: &str) {
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = std::process::Command::new("xdg-open")
-            .arg(url)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
 }
 
 fn star_text(v: f64) -> String {
@@ -2700,6 +3175,15 @@ fn spawn_wallpaper(status: Arc<Mutex<PlayStatus>>) -> Option<crate::ctl::ChildCt
 
 impl Render for App {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 每帧都跑一次 poll:状态/进度/曲库结果当帧更新,不再靠 250ms 心跳
+        // (以前那是 4Hz 的"人为帧率上限")。poll 自己只在真有变化时 notify。
+        let _ = self.poll(cx);
+        // 只有在"正在播放"时才需要连续出帧(进度条用本地时钟插值)。
+        // 其余时间交给事件驱动:悬停动画由 AnimationElement 自己请求帧,
+        // 不需要整页每帧重绘 —— 否则设置/关于页的悬停过渡会被挤掉帧。
+        if self.playing && !self.awaiting_start {
+            window.request_animation_frame();
+        }
         // 窗口尺寸变化(放大/缩小)时强制重新测量列表,否则虚拟列表沿用旧的测量结果,
         // 设置页等宽内容不会重排。
         let vs = window.viewport_size();
@@ -2812,6 +3296,11 @@ impl Render for App {
                     this.edit_armed = false;
                 } else if this.edit.is_some() {
                     this.commit_num_edit();
+                    // 捕获中途点了别处:丢掉草稿并恢复原来的注册
+                    if this.edit.as_ref().is_some_and(|e| Self::is_hotkey(e.field)) {
+                        this.edit = None;
+                        this.apply_hotkeys();
+                    }
                     cx.notify();
                 }
             }))
@@ -3131,19 +3620,40 @@ impl App {
             }
             DropKind::RenderMode => {
                 self.settings.render_mode = value;
+                // 运行中切换也要立刻下发,否则子进程还按旧模式走(改了没反应)
+                self.send(json!({"cmd": "set_render_mode", "mode": self.settings.render_mode}));
             }
             DropKind::Speed => {
                 self.settings.speed = value.parse().unwrap_or(1.0);
                 self.send(json!({"cmd": "set_speed", "x": self.settings.speed}));
             }
             DropKind::QueueDiff => {
-                let i = self.pos;
-                if let Some(t) = self.queue.get_mut(i) {
-                    t.sha2 = if value.is_empty() { None } else { Some(value) };
-                }
-                self.save_queue();
-                if !self.queue.is_empty() {
-                    self.play_index(i);
+                // 目标 = 正在预览的那首,其次是实际在放的那首,最后才退回 queue[pos]
+                let target_set = self
+                    .preview
+                    .as_ref()
+                    .map(|(id, _)| id.clone())
+                    .or_else(|| self.settings.lazer_set.clone())
+                    .or_else(|| self.queue.get(self.pos).map(|q| q.set_id.clone()));
+                let qi = target_set
+                    .as_ref()
+                    .and_then(|id| self.queue.iter().position(|q| &q.set_id == id));
+                let sha = if value.is_empty() { None } else { Some(value.clone()) };
+                match qi {
+                    // 在播放列表里:改那一行的难度并重播
+                    Some(i) => {
+                        if let Some(t) = self.queue.get_mut(i) {
+                            t.sha2 = sha;
+                        }
+                        self.save_queue();
+                        self.play_index(i);
+                    }
+                    // 只是曲库预览、还没进播放列表:直接用它开播(预览态随之清掉)
+                    None => {
+                        if let Some(id) = target_set {
+                            self.play(&id, sha.as_deref(), self.settings.quick_mods);
+                        }
+                    }
                 }
             }
             DropKind::OvStoryboard | DropKind::OvHitsound
@@ -3194,6 +3704,50 @@ impl App {
             )
     }
 
+    /// 传输图标按钮:实心/描边方框 + 悬停底色 + 路径图标(不依赖字体/emoji)。
+    fn icon_btn(
+        &self,
+        id: &'static str,
+        icon: TransportIcon,
+        filled: bool,
+        cx: &mut Context<Self>,
+        f: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        let (bg, fg, hover, w) = if filled {
+            // 播放/暂停:主题色圆钮 + 白图标
+            (pal().accent, 0xffffff, pal().accent, 46.0)
+        } else {
+            (pal().ctl, pal().text, pal().ctl_hover, 38.0)
+        };
+        div()
+            .id(gpui::ElementId::Name(format!("ib{id}").into()))
+            .w(px(w))
+            .h(px(28.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .bg(rgb(bg))
+            .cursor_pointer()
+            .hover(move |st| st.bg(rgb(hover)))
+            .on_click(cx.listener(move |this, _e, _w, cx| {
+                f(this, cx);
+                cx.notify();
+            }))
+            .child(
+                gpui::canvas(
+                    |_b, _w, _cx| {},
+                    move |b, _, w, _cx| {
+                        if let Some(path) = transport_icon_path(icon, b) {
+                            w.paint_path(path, rgb(fg));
+                        }
+                    },
+                )
+                .w(px(16.0))
+                .h(px(16.0)),
+            )
+    }
+
     #[track_caller]
     fn small_btn(
         &self,
@@ -3213,13 +3767,43 @@ impl App {
         cx: &mut Context<Self>,
         f: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> impl IntoElement {
+        self.small_btn_full(label, width, None, cx, f)
+    }
+
+    /// 同一个函数里渲染多行同名按钮时用:`key` 拼进 id,各行才互不抢点击。
+    /// (只用 标签 + 调用点 做 id 时,`path_row` 的四个「浏览…」会共用一个 id,
+    /// 表现就是只有第一行能点。)
+    #[track_caller]
+    fn small_btn_keyed(
+        &self,
+        label: impl Into<String>,
+        key: impl Into<String>,
+        width: Option<f32>,
+        cx: &mut Context<Self>,
+        f: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        self.small_btn_full(label, width, Some(key.into()), cx, f)
+    }
+
+    #[track_caller]
+    fn small_btn_full(
+        &self,
+        label: impl Into<String>,
+        width: Option<f32>,
+        key: Option<String>,
+        cx: &mut Context<Self>,
+        f: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
         let label = label.into();
-        // 稳定且唯一的 id:标签 + 调用点(file:line)。只按标签命名时,同一帧
-        // 里两个同名按钮(例如队列头的「清空」与清空确认框的「清空」)会共用
-        // 交互状态:背景按钮在 capture 阶段把 pending 清掉,前面那个按钮
-        // 的点击就丢了(表现为"点了没反应")。id 每帧变化同样会丢点击。
+        // 稳定且唯一的 id:标签 + 调用点(file:line)[+ 调用方给的 key]。只按
+        // 标签命名时,同一帧里两个同名按钮(例如队列头的「清空」与清空确认框
+        // 的「清空」)会共用交互状态:背景按钮在 capture 阶段把 pending 清掉,
+        // 前面那个按钮的点击就丢了(表现为"点了没反应")。id 每帧变化同样会丢点击。
         let loc = std::panic::Location::caller();
-        let id = format!("btn::{}@{}:{}", label, loc.file(), loc.line());
+        let id = match key {
+            Some(k) => format!("btn::{}@{}:{}#{}", label, loc.file(), loc.line(), k),
+            None => format!("btn::{}@{}:{}", label, loc.file(), loc.line()),
+        };
         let mut btn = div()
             .id(gpui::ElementId::Name(id.into()))
             .px_3()
@@ -3296,9 +3880,20 @@ impl App {
             .border_color(if active { rgb(pal().accent) } else { rgb(pal().line) })
             .text_sm()
             .child(if active {
-                format!("{}▏", shown)
+                if shown.is_empty() && Self::is_hotkey(field) {
+                    // 捕获中:提示"按键",不是让你打字
+                    "按下组合键…▏".to_string()
+                } else {
+                    format!("{}▏", shown)
+                }
             } else if shown.is_empty() {
-                if field == Field::Search { "搜索".to_string() } else { "…".to_string() }
+                match field {
+                    Field::Search => "搜索".to_string(),
+                    Field::HotkeyPrev | Field::HotkeyToggle | Field::HotkeyNext => {
+                        "未设置".to_string()
+                    }
+                    _ => "…".to_string(),
+                }
             } else {
                 shown
             })
@@ -3459,22 +4054,24 @@ impl App {
                     })),
             );
 
-        // 虚拟列表:行 + 展开的难度块各自占一项
-        let mut items: Vec<(usize, bool)> = Vec::new();
-        for (i, r) in self.rows.iter().enumerate() {
-            items.push((i, false));
-            if self.expanded.as_deref() == Some(r.set_id.as_str()) {
-                items.push((i, true));
-            }
-        }
-        if self.lib_list.item_count() != items.len() {
-            self.lib_list.reset(items.len());
+        // 虚拟列表:行 + 展开的难度块各占一项。
+        // 这里用算术映射代替"每帧重建 Vec<item>":曲库几万首时,以前每帧都要
+        // 分配并填充一遍 items,白白吃掉帧预算。
+        let exp_row = self.expanded_row.filter(|i| *i < self.rows.len());
+        let item_count = self.rows.len() + usize::from(exp_row.is_some());
+        if self.lib_list.item_count() != item_count {
+            // 展开/收起难度块会改变条数:保位置,别把曲库滚回开头
+            Self::reset_list_keep_scroll(&self.lib_list, item_count);
         }
         let entity = cx.entity();
         let list = gpui::list(self.lib_list.clone(), move |ix, _w, cx| {
             let app = entity.read(cx);
-            let Some((ri, is_chips)) = items.get(ix).copied() else {
-                return div().into_any_element();
+            let (ri, is_chips) = match exp_row {
+                // 展开行的下一项是难度块
+                Some(k) if ix == k + 1 => (k, true),
+                // 它之后的项整体后移一位
+                Some(k) if ix > k + 1 => (ix - 1, false),
+                _ => (ix, false),
             };
             let Some(row) = app.rows.get(ri) else {
                 return div().into_any_element();
@@ -3521,7 +4118,9 @@ impl App {
                             .clone()
                             .or_else(|| self.settings.stable_dir.clone())
                             .or_else(|| {
-                                crate::lazer::data_root().map(|p| p.to_string_lossy().into_owned())
+                                self.probe_lazer_root
+                                    .as_ref()
+                                    .map(|p| p.to_string_lossy().into_owned())
                             })
                             .unwrap_or_default(),
                     ),
@@ -3530,40 +4129,107 @@ impl App {
     }
 
     /// 普通滚动容器的跟随型滚动条(轮滚时刷新)。
+    /// 自绘滚动条(设置页 / 关于页 / 菜单列表共用),可拖拽、带悬停过渡。
+    ///
+    /// **gpui 的滚动偏移是负值**:顶部 = 0,越往下越接近 `-max_offset`。所以滑块
+    /// 位置必须用 `-offset / max` 换算;以前直接拿 `offset` 当正值算,结果永远是
+    /// 0,滑块一直贴在顶端 —— 拖动时内容在动、条不动,看起来就是"滚动条不滚动"。
     fn tracked_scrollbar(
         &self,
         id: &'static str,
         h: &gpui::ScrollHandle,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let off: f32 = h.offset().y.into();
         let max: f32 = h.max_offset().height.into();
         let view: f32 = h.bounds().size.height.into();
-        let ratio = if view + max > 0.0 {
-            (view / (view + max)).clamp(0.05, 1.0)
-        } else {
-            1.0
-        };
-        let frac = if max > 0.0 { (off / max).clamp(0.0, 1.0) } else { 0.0 };
-        if max <= 0.0 {
-            return div().id(gpui::ElementId::Name(format!("sb{id}hidden").into()));
+        // 不需要滚动(或还没量出高度):不画条,也不留 1px 缝隙
+        if max <= 0.5 {
+            return div()
+                .id(gpui::ElementId::Name(format!("sb{id}hidden").into()))
+                .into_any_element();
         }
-        let h = h.clone();
+        // 滑块高度占比;内容比视口短时退化成整条
+        let ratio = (view / (view + max)).clamp(0.08, 1.0);
+        // 顶部 0 → 底部 1(注意 gpui 的 offset 是负值)
+        let frac = scroll_frac(f32::from(h.offset().y), max);
+
+        let hot = self.sb_hover.get() == Some(id);
+        let dur = Duration::from_millis(140);
+        let (idle, accent) = (pal().thumb, pal().accent);
+
+        // 像素 → 滚动偏移(负值,和 gpui 内部一致;句柄按值捕获,供 'static 回调使用)
+        let h_seek = h.clone();
+        let seek = move |track_top: f32, track_h: f32, pointer_y: f32| {
+            let max: f32 = h_seek.max_offset().height.into();
+            let view: f32 = h_seek.bounds().size.height.into();
+            if max <= 0.0 {
+                return;
+            }
+            let r = (view / (view + max)).clamp(0.08, 1.0);
+            let thumb_h = track_h * r;
+            let rel = (pointer_y - track_top - thumb_h / 2.0)
+                .clamp(0.0, (track_h - thumb_h).max(0.0));
+            let f = if track_h - thumb_h > 0.0 {
+                rel / (track_h - thumb_h)
+            } else {
+                0.0
+            };
+            h_seek.set_offset(gpui::point(px(0.0), px(-f * max)));
+        };
+
+        let thumb = div()
+            .id(gpui::ElementId::Name(format!("sbth{id}").into()))
+            .absolute()
+            .left(px(2.0))
+            .right(px(2.0))
+            .h(gpui::relative(ratio))
+            // top 用比例定位:轨道高度随窗口变化也不用重新算像素
+            .top(gpui::relative(frac * (1.0 - ratio)))
+            .rounded_full()
+            .bg(rgb(idle))
+            // 悬停:提亮 + 加宽(动画只挂在滑块上,轨道 id 保持稳定,不打断拖拽)
+            .with_animation(
+                gpui::ElementId::Name(format!("sbth{id}-{hot}").into()),
+                gpui::Animation::new(dur).with_easing(gpui::ease_in_out),
+                move |el, t| {
+                    let c = if hot {
+                        lerp_rgb(idle, accent, t)
+                    } else {
+                        lerp_rgb(accent, idle, t)
+                    };
+                    let inset = if hot { 2.0 - t } else { 1.0 + t };
+                    el.bg(rgb(c)).left(px(inset)).right(px(inset))
+                },
+            );
+
         div()
             .id(gpui::ElementId::Name(format!("sb{id}").into()))
             .absolute()
             .right(px(2.0))
             .top_0()
             .bottom_0()
-            .w(px(8.0))
+            .w(px(10.0))
             .rounded_full()
             .bg(rgb(pal().line2))
             .cursor_pointer()
-            // 滚动条盖在内容上:挡住点击,避免拖/点滚动条时误触下面的控件
+            // 盖在内容上:拖/点滚动条时不要误触下面的控件
             .occlude()
-            // 整条轨道都可拖(不只滑块),按下拖动即可滚到指针位置
+            .on_hover(cx.listener(move |this, hovered: &bool, _w, cx| {
+                let next = if *hovered { Some(id) } else { None };
+                if next.is_none() && cx.has_active_drag() {
+                    // 拖动中指针滑出轨道:不要清高亮,松手后由 poll 收尾
+                    this.sb_sticky.set(Some(id));
+                    return;
+                }
+                this.sb_sticky.set(None);
+                if this.sb_hover.get() != next && (next.is_some() || this.sb_hover.get() == Some(id)) {
+                    this.sb_hover.set(next);
+                    cx.notify();
+                }
+            }))
+            // 按住拖动:整条轨道都是热区(点一下不拖不会有位移,和系统滚动条一致)
             .on_drag(ScrollBarDrag(id), |_, _, _, cx| cx.new(|_| DragGhost))
-            .on_drag_move::<ScrollBarDrag>(cx.listener(move |_t, e: &gpui::DragMoveEvent<ScrollBarDrag>, _w, cx| {
+            .on_drag_move::<ScrollBarDrag>(cx.listener(move |this, e: &gpui::DragMoveEvent<ScrollBarDrag>, _w, cx| {
                 if e.drag(cx).0 != id {
                     return;
                 }
@@ -3571,30 +4237,20 @@ impl App {
                 if track_h <= 0.0 {
                     return;
                 }
-                let thumb_h = track_h * ratio;
-                let y: f32 = e.event.position.y.into();
-                let rel = (y - f32::from(e.bounds.origin.y) - thumb_h / 2.0)
-                    .clamp(0.0, (track_h - thumb_h).max(0.0));
-                let f = if track_h - thumb_h > 0.0 {
-                    rel / (track_h - thumb_h)
-                } else {
-                    0.0
-                };
-                let max: f32 = h.max_offset().height.into();
-                h.set_offset(gpui::point(px(0.0), px(-f * max)));
+                // 拖动期间保持高亮
+                if this.sb_hover.get() != Some(id) {
+                    this.sb_hover.set(Some(id));
+                }
+                // 不节流:每个移动事件都立即生效(界面刷新由逐帧渲染驱动)
+                seek(
+                    f32::from(e.bounds.origin.y),
+                    track_h,
+                    f32::from(e.event.position.y),
+                );
                 cx.notify();
             }))
-            .child(
-                div()
-                    .id(gpui::ElementId::Name(format!("sbth{id}").into()))
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .h(gpui::relative(ratio))
-                    .top(gpui::relative(frac * (1.0 - ratio)))
-                    .rounded_full()
-                    .bg(rgb(pal().thumb)),
-            )
+            .child(thumb)
+            .into_any_element()
     }
 
     /// 通用 ListState 滚动条(可拖拽)。
@@ -3606,106 +4262,222 @@ impl App {
     ) -> impl IntoElement {
         let max: f32 = state.max_offset_for_scrollbar().height.into();
         let view: f32 = state.viewport_bounds().size.height.into();
-        let off: f32 = (-state.scroll_px_offset_for_scrollbar().y).into();
-        let ratio = if view + max > 0.0 {
-            (view / (view + max)).clamp(0.05, 1.0)
-        } else {
-            1.0
-        };
-        let frac = if max > 0.0 { (off / max).clamp(0.0, 1.0) } else { 0.0 };
-        if max <= 0.0 {
-            return div().id(gpui::ElementId::Name(format!("bar{id}hidden").into()));
+        if max <= 0.5 {
+            return div()
+                .id(gpui::ElementId::Name(format!("bar{id}hidden").into()))
+                .into_any_element();
         }
+        let ratio = (view / (view + max)).clamp(0.08, 1.0);
+        // ListState 的 scroll_px_offset_for_scrollbar 也是负值(内部返回 -offset),
+        // 直接交给 scroll_frac(它只取一次负)。再套一层负号会让比例恒为 0。
+        let frac = scroll_frac(
+            f32::from(state.scroll_px_offset_for_scrollbar().y),
+            max,
+        );
+        let hot = self.sb_hover.get() == Some(id);
+        let dur = Duration::from_millis(140);
+        let (idle, accent) = (pal().thumb, pal().accent);
+
+        // 指针 → 滚动位置(ListState 的偏移已经取过负号,这边按正值算)
         let st = state.clone();
+        let seek = move |track_top: f32, track_h: f32, pointer_y: f32| {
+            let max: f32 = st.max_offset_for_scrollbar().height.into();
+            let view: f32 = st.viewport_bounds().size.height.into();
+            if max <= 0.0 {
+                return;
+            }
+            let r = (view / (view + max)).clamp(0.08, 1.0);
+            let thumb_h = track_h * r;
+            let rel = (pointer_y - track_top - thumb_h / 2.0)
+                .clamp(0.0, (track_h - thumb_h).max(0.0));
+            let f = if track_h - thumb_h > 0.0 {
+                rel / (track_h - thumb_h)
+            } else {
+                0.0
+            };
+            let cur: f32 = (-st.scroll_px_offset_for_scrollbar().y).into();
+            st.scroll_by(px(f * max - cur));
+        };
+
+        let thumb = div()
+            .id(gpui::ElementId::Name(format!("th{id}").into()))
+            .absolute()
+            .left(px(2.0))
+            .right(px(2.0))
+            .h(gpui::relative(ratio))
+            .top(gpui::relative(frac * (1.0 - ratio)))
+            .rounded_full()
+            .bg(rgb(idle))
+            // 悬停:提亮 + 加宽(动画只挂在滑块上,轨道 id 保持稳定,不打断拖拽)
+            .with_animation(
+                gpui::ElementId::Name(format!("th{id}-{hot}").into()),
+                gpui::Animation::new(dur).with_easing(gpui::ease_in_out),
+                move |el, t| {
+                    let c = if hot {
+                        lerp_rgb(idle, accent, t)
+                    } else {
+                        lerp_rgb(accent, idle, t)
+                    };
+                    let inset = if hot { 2.0 - t } else { 1.0 + t };
+                    el.bg(rgb(c)).left(px(inset)).right(px(inset))
+                },
+            );
+
         div()
             .id(gpui::ElementId::Name(format!("bar{id}").into()))
             .absolute()
             .right(px(2.0))
             .top_0()
             .bottom_0()
-            .w(px(8.0))
+            .w(px(10.0))
             .rounded_full()
             .bg(rgb(pal().line2))
+            .cursor_pointer()
             // 滚动条盖在行上:挡住点击,避免拖滚动条时误触下面的行
             .occlude()
-            .on_drag_move::<ListBarDrag>(cx.listener(move |_t, e: &gpui::DragMoveEvent<ListBarDrag>, _w, cx| {
+            .on_hover(cx.listener(move |this, hovered: &bool, _w, cx| {
+                let next = if *hovered { Some(id) } else { None };
+                if next.is_none() && cx.has_active_drag() {
+                    // 拖动中指针滑出轨道:保留高亮,松手后由 poll 收尾
+                    this.sb_sticky.set(Some(id));
+                    return;
+                }
+                this.sb_sticky.set(None);
+                if this.sb_hover.get() != next && (next.is_some() || this.sb_hover.get() == Some(id)) {
+                    this.sb_hover.set(next);
+                    cx.notify();
+                }
+            }))
+            // 整条轨道都能拖(不只滑块)
+            .on_drag(ListBarDrag, |_, _, _, cx| cx.new(|_| DragGhost))
+            .on_drag_move::<ListBarDrag>(cx.listener(move |this, e: &gpui::DragMoveEvent<ListBarDrag>, _w, cx| {
                 let track_h: f32 = e.bounds.size.height.into();
                 if track_h <= 0.0 {
                     return;
                 }
-                let thumb_h = track_h * ratio;
-                let y: f32 = e.event.position.y.into();
-                let rel = (y - f32::from(e.bounds.origin.y) - thumb_h / 2.0)
-                    .clamp(0.0, (track_h - thumb_h).max(0.0));
-                let f = if track_h - thumb_h > 0.0 { rel / (track_h - thumb_h) } else { 0.0 };
-                let max: f32 = st.max_offset_for_scrollbar().height.into();
-                let cur: f32 = (-st.scroll_px_offset_for_scrollbar().y).into();
-                st.scroll_by(px(f * max - cur));
+                // 拖动期间保持高亮(指针可能已经滑出轨道)
+                if this.sb_hover.get() != Some(id) {
+                    this.sb_hover.set(Some(id));
+                }
+                seek(
+                    f32::from(e.bounds.origin.y),
+                    track_h,
+                    f32::from(e.event.position.y),
+                );
                 cx.notify();
             }))
-            .child(
-                div()
-                    .id(gpui::ElementId::Name(format!("th{id}").into()))
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .h(gpui::relative(ratio))
-                    .top(gpui::relative(frac * (1.0 - ratio)))
-                    .rounded_full()
-                    .bg(rgb(pal().thumb))
-                    .on_drag(ListBarDrag, |_, _, _, cx| cx.new(|_| DragGhost)),
-            )
+            .child(thumb)
+            .into_any_element()
     }
 
-    /// 曲库虚拟列表滚动条(可拖拽)。
+    /// 曲库虚拟列表滚动条:可拖拽 + 悬停加宽提亮。
     fn lib_scrollbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let max: f32 = self.lib_list.max_offset_for_scrollbar().height.into();
         let view: f32 = self.lib_list.viewport_bounds().size.height.into();
-        let off: f32 = (-self.lib_list.scroll_px_offset_for_scrollbar().y).into();
-        let ratio = if view + max > 0.0 {
-            (view / (view + max)).clamp(0.05, 1.0)
-        } else {
-            1.0
+        if max <= 0.5 {
+            return div()
+                .id(gpui::ElementId::Name("libbarhidden".into()))
+                .into_any_element();
+        }
+        let ratio = (view / (view + max)).clamp(0.08, 1.0);
+        // 同上:负偏移,别再套负号
+        let frac = scroll_frac(
+            f32::from(self.lib_list.scroll_px_offset_for_scrollbar().y),
+            max,
+        );
+        let hot = self.sb_hover.get() == Some("lib");
+        let dur = Duration::from_millis(140);
+        let (idle, accent) = (pal().thumb, pal().accent);
+
+        let st = self.lib_list.clone();
+        let seek = move |track_top: f32, track_h: f32, pointer_y: f32| {
+            let max: f32 = st.max_offset_for_scrollbar().height.into();
+            let view: f32 = st.viewport_bounds().size.height.into();
+            if max <= 0.0 {
+                return;
+            }
+            let r = (view / (view + max)).clamp(0.08, 1.0);
+            let thumb_h = track_h * r;
+            let rel = (pointer_y - track_top - thumb_h / 2.0)
+                .clamp(0.0, (track_h - thumb_h).max(0.0));
+            let f = if track_h - thumb_h > 0.0 {
+                rel / (track_h - thumb_h)
+            } else {
+                0.0
+            };
+            let cur: f32 = (-st.scroll_px_offset_for_scrollbar().y).into();
+            st.scroll_by(px(f * max - cur));
         };
-        let frac = if max > 0.0 { (off / max).clamp(0.0, 1.0) } else { 0.0 };
+
+        let thumb = div()
+            .id("libthumb")
+            .absolute()
+            .left(px(2.0))
+            .right(px(2.0))
+            .h(gpui::relative(ratio))
+            .top(gpui::relative(frac * (1.0 - ratio)))
+            .rounded_full()
+            .bg(rgb(idle))
+            .with_animation(
+                gpui::ElementId::Name(format!("libthumb-{hot}").into()),
+                gpui::Animation::new(dur).with_easing(gpui::ease_in_out),
+                move |el, t| {
+                    let c = if hot {
+                        lerp_rgb(idle, accent, t)
+                    } else {
+                        lerp_rgb(accent, idle, t)
+                    };
+                    let inset = if hot { 2.0 - t } else { 1.0 + t };
+                    el.bg(rgb(c)).left(px(inset)).right(px(inset))
+                },
+            );
+
         div()
             .id("libbar")
             .absolute()
             .right(px(2.0))
             .top_0()
             .bottom_0()
-            .w(px(8.0))
+            .w(px(10.0))
             .rounded_full()
             .bg(rgb(pal().line2))
-            // 滚动条盖在行上:挡住点击,避免拖滚动条时误触下面的行
+            .cursor_pointer()
             .occlude()
+            .on_hover(cx.listener(|this, hovered: &bool, _w, cx| {
+                let next = if *hovered { Some("lib") } else { None };
+                if next.is_none() && cx.has_active_drag() {
+                    // 拖动中指针滑出轨道:保留高亮,松手后由 poll 收尾
+                    this.sb_sticky.set(Some("lib"));
+                    return;
+                }
+                this.sb_sticky.set(None);
+                if this.sb_hover.get() != next
+                    && (next.is_some() || this.sb_hover.get() == Some("lib"))
+                {
+                    this.sb_hover.set(next);
+                    cx.notify();
+                }
+            }))
+            // 整条轨道都能拖(不只滑块)
+            .on_drag(LibBarDrag, |_, _, _, cx| cx.new(|_| DragGhost))
             .on_drag_move::<LibBarDrag>(cx.listener(move |this, e: &gpui::DragMoveEvent<LibBarDrag>, _w, cx| {
                 let track_h: f32 = e.bounds.size.height.into();
                 if track_h <= 0.0 {
                     return;
                 }
-                let thumb_h = track_h * ratio;
-                let top: f32 = e.event.position.y.into();
-                let rel = (top - f32::from(e.bounds.origin.y) - thumb_h / 2.0)
-                    .clamp(0.0, (track_h - thumb_h).max(0.0));
-                let f = if track_h - thumb_h > 0.0 { rel / (track_h - thumb_h) } else { 0.0 };
-                let max: f32 = this.lib_list.max_offset_for_scrollbar().height.into();
-                let cur: f32 = (-this.lib_list.scroll_px_offset_for_scrollbar().y).into();
-                this.lib_list.scroll_by(px(f * max - cur));
+                // 拖动期间保持高亮
+                if this.sb_hover.get() != Some("lib") {
+                    this.sb_hover.set(Some("lib"));
+                }
+                seek(
+                    f32::from(e.bounds.origin.y),
+                    track_h,
+                    f32::from(e.event.position.y),
+                );
                 cx.notify();
             }))
-            .child(
-                div()
-                    .id("libthumb")
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .h(gpui::relative(ratio))
-                    .top(gpui::relative(frac * (1.0 - ratio)))
-                    .rounded_full()
-                    .bg(rgb(pal().thumb))
-                    .on_drag(LibBarDrag, |_, _, _, cx| cx.new(|_| DragGhost)),
-            )
+            .child(thumb)
+            .into_any_element()
     }
 
     fn lib_row_el(app: &App, entity: &gpui::Entity<App>, r: &Row) -> gpui::AnyElement {
@@ -3734,6 +4506,9 @@ impl App {
             .on_mouse_down(gpui::MouseButton::Left, move |ev: &gpui::MouseDownEvent, _w, cx| {
                 let _ = e1.update(cx, |this, cx| {
                     if ev.click_count >= 2 {
+                        // 双击行的「其余部分」= 在右侧预览这首(不开播、不打断当前播放);
+                        // 双击曲子 = 播放(或按设置加入播放列表);
+                        // 展开箭头已 stop_propagation,双击它不会走到这里
                         this.preview = None;
                         if this.settings.dblclick_add {
                             this.add_to_queue(&sid1);
@@ -3862,16 +4637,27 @@ impl App {
                     .cursor_pointer()
                     .text_color(rgb(pal().dim))
                     .child(if expanded { "▾" } else { "▸" })
-                    .on_click(move |_e: &gpui::ClickEvent, _w, cx| {
-                        let _ = e4.update(cx, |this, cx| {
-                            this.expanded = if this.expanded.as_deref() == Some(sid4.as_str()) {
-                                None
-                            } else {
-                                Some(sid4.clone())
-                            };
-                            cx.notify();
-                        });
-                    }),
+                    // 展开/收起和整行的单击/双击要分开:这里吃掉事件并停止冒泡,
+                    // 否则双击展开会被整行当成"双击播放",单击也会顺手切预览。
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        move |_ev: &gpui::MouseDownEvent, _w, cx: &mut gpui::App| {
+                            // 按下即生效(不等抬起、不做防抖);只 stop_propagation,
+                            // 让整行的「单击预览/双击播放」收不到这次点击。
+                            cx.stop_propagation();
+                            let _ = e4.update(cx, |this, cx| {
+                                this.expanded = if this.expanded.as_deref() == Some(sid4.as_str()) {
+                                    None
+                                } else {
+                                    Some(sid4.clone())
+                                };
+                                this.expanded_row = this.expanded.as_ref().and_then(|id| {
+                                    this.rows.iter().position(|r| &r.set_id == id)
+                                });
+                                cx.notify();
+                            });
+                        },
+                    ),
             )
             .into_any_element()
     }
@@ -3920,9 +4706,13 @@ impl App {
                     .hover(|st| st.bg(rgb(pal().ctl_hover)))
                     .child(star_badge(b.star_rating))
                     .child(div().text_sm().child(b.name.clone()))
-                    .on_click(move |_e: &gpui::ClickEvent, _w, cx| {
+                    .on_click(move |e: &gpui::ClickEvent, _w, cx| {
+                        // 连点只认第一次:否则快速双击会把同一首播两遍
+                        if e.click_count() > 1 {
+                            return;
+                        }
                         let _ = e1.update(cx, |this, cx| {
-                            this.expanded = None;
+                            // 点歌只开播,不收起点开的难度块(否则刚点完就缩回去)
                             this.play(&sid, Some(&sha), this.settings.quick_mods);
                             cx.notify();
                         });
@@ -3950,7 +4740,11 @@ impl App {
         if let Some((id, _)) = &self.preview {
             return Some(id.clone());
         }
-        self.queue.get(self.pos).map(|q| q.set_id.clone()).or_else(|| self.settings.lazer_set.clone())
+        // 没在预览时以"真正在放的那首"为准:队列位置可能还停在别的歌上
+        self.settings
+            .lazer_set
+            .clone()
+            .or_else(|| self.queue.get(self.pos).map(|q| q.set_id.clone()))
     }
 
     /// 信息卡大封面(256px,按 set_id 缓存)。
@@ -3975,17 +4769,28 @@ impl App {
     fn info_card(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let set_id = self.current_set_id();
         let (title, artist, diff_name, diff_star, stats, tags, overridden) = if let Some(id) = &set_id {
-            if let (Some(lib), Some(set)) = (&self.lib, self.lib.as_ref().and_then(|l| l.sets.iter().find(|s| s.id == *id))) {
-                let _ = lib;
+            // 用 set_idx 直接定位:这是逐帧跑的,别在几万条谱面集里线性查找
+            let set_by_id = self
+                .lib
+                .as_ref()
+                .and_then(|l| self.set_idx.get(id.as_str()).and_then(|i| l.sets.get(*i)));
+            if let Some(set) = set_by_id {
                 // 优先用实际播放/预览的难度,其次最难
                 let want = self
                     .preview
                     .as_ref()
                     .and_then(|(pid, sha)| (pid == id).then(|| sha.clone()).flatten())
+                    // 正在放这首:用它真正加载的那个难度(队列位置可能不准)
+                    .or_else(|| {
+                        self.settings
+                            .lazer_sha2
+                            .clone()
+                            .filter(|_| self.settings.lazer_set.as_deref() == Some(id.as_str()))
+                    })
                     .or_else(|| {
                         self.queue
-                            .get(self.pos)
-                            .filter(|t| &t.set_id == id)
+                            .iter()
+                            .find(|t| &t.set_id == id)
                             .and_then(|t| t.sha2.clone())
                     })
                     .or_else(|| {
@@ -4026,8 +4831,61 @@ impl App {
             fallback_from_queue(self, &set_id)
         };
         let cover = set_id.as_deref().and_then(|id| self.hero_image(id));
-        // 右侧大封面也可单击快速加入(与曲库行封面一致)
-        let cover_set = set_id.clone();
+        // 点封面要打开的 osu! 网页:优先当前难度 /b/{bid},没有就谱面集 /s/{sid}
+        let (beatmap_online_id, set_online_id) = {
+            let mut bid = 0;
+            let mut sid = 0;
+            if let Some(id) = &set_id {
+                if let Some(set) = self
+                    .lib
+                    .as_ref()
+                    .and_then(|l| self.set_idx.get(id.as_str()).and_then(|i| l.sets.get(*i)))
+                {
+                    sid = set.online_id;
+                    let want = self
+                        .preview
+                        .as_ref()
+                        .and_then(|(pid, sha)| (pid == id).then(|| sha.clone()).flatten())
+                        .or_else(|| {
+                            self.settings.lazer_sha2.clone().filter(|_| {
+                                self.settings.lazer_set.as_deref() == Some(id.as_str())
+                            })
+                        })
+                        .or_else(|| {
+                            self.queue
+                                .iter()
+                                .find(|t| &t.set_id == id)
+                                .and_then(|t| t.sha2.clone())
+                        })
+                        .or_else(|| {
+                            self.queue
+                                .get(self.pos)
+                                .filter(|t| &t.set_id == id)
+                                .and_then(|_| self.policy_pick(id))
+                        });
+                    bid = want
+                        .and_then(|sha| set.beatmaps.iter().find(|b| b.sha2 == sha))
+                        .or_else(|| {
+                            set.beatmaps
+                                .iter()
+                                .max_by(|a, b| a.star_rating.total_cmp(&b.star_rating))
+                        })
+                        .map(|b| b.online_id)
+                        .unwrap_or(0);
+                }
+            }
+            (bid, sid)
+        };
+        // 谱面集状态(ranked / loved / …):信息卡也显示一枚
+        let set_status = set_id
+            .as_ref()
+            .and_then(|id| {
+                self.lib.as_ref().and_then(|l| {
+                    self.set_idx.get(id.as_str()).and_then(|i| l.sets.get(*i))
+                })
+            })
+            .map(|s| s.status)
+            .unwrap_or(-3);
 
         div()
             .id("info-card")
@@ -4052,15 +4910,20 @@ impl App {
                     .rounded_md()
                     .bg(rgb(pal().line2))
                     .cursor_pointer()
-                    .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |this, _e, _w, cx| {
-                        if let Some(id) = &cover_set {
-                            if this.settings.quick_add {
-                                this.add_to_queue(id);
-                            } else {
-                                this.preview_set(id, None);
-                            }
-                            cx.notify();
+                    .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |this, ev: &gpui::MouseDownEvent, _w, cx| {
+                        // 只认单击:双击封面不至于连开两个浏览器标签
+                        if ev.click_count > 1 {
+                            return;
                         }
+                        // 点封面 = 用浏览器打开 osu! 网页(不是"加入/更新播放列表条目")
+                        if beatmap_online_id > 0 {
+                            cx.open_url(&format!("https://osu.ppy.sh/b/{beatmap_online_id}"));
+                        } else if set_online_id > 0 {
+                            cx.open_url(&format!("https://osu.ppy.sh/s/{set_online_id}"));
+                        } else {
+                            this.toast("这首没有 osu! 网页(缺少 online id)");
+                        }
+                        cx.notify();
                     }))
                     .child(match cover {
                         Some(img) => gpui::img(gpui::ImageSource::Image(img))
@@ -4123,6 +4986,7 @@ impl App {
                             }))
                     })
                     .child(star_badge(diff_star))
+                    .child(status_badge(set_status))
                     .child(div().flex_1())
                     .child(self.small_btn("个性设置…", cx, |this, _| this.open_overrides())),
             )
@@ -4296,20 +5160,27 @@ impl App {
         let entity = cx.entity();
         let count = self.queue.len();
         if self.queue_list.item_count() != count {
-            self.queue_list.reset(count);
+            // 保位置:删掉一行不该把列表弹回最顶端
+            Self::reset_list_keep_scroll(&self.queue_list, count);
         }
         // 让位预览:队列数组不动,只按 (源, 落点) 生成一份显示顺序。
         // 拖动中的目标位置由指针绝对坐标换算(见 on_drag_move),与行内容
         // 重排无关,所以不会出现「越拖越偏」的反馈错位。
-        let mut order: Vec<usize> = (0..count).collect();
-        if let (Some(s0), Some(o)) = (self.dragging, self.drag_over) {
-            if s0 < count && o < count && s0 != o {
+        // 不拖动时不建这个 Vec(逐帧 O(n) 分配没有必要),直接用行号。
+        let drag_order: Option<Vec<usize>> = match (self.dragging, self.drag_over) {
+            (Some(s0), Some(o)) if s0 < count && o < count && s0 != o => {
+                let mut order: Vec<usize> = (0..count).collect();
                 let moved = order.remove(s0);
                 order.insert(o, moved);
+                Some(order)
             }
-        }
+            _ => None,
+        };
         let list = gpui::list(self.queue_list.clone(), move |ix, _w, cx| {
-            let i = order.get(ix).copied().unwrap_or(ix);
+            let i = match &drag_order {
+                Some(order) => order.get(ix).copied().unwrap_or(ix),
+                None => ix,
+            };
             {
             let app = entity.read(cx);
             {
@@ -4321,6 +5192,18 @@ impl App {
                         .lib
                         .as_ref()
                         .and_then(|l| app.set_idx.get(&t.set_id).and_then(|k| l.sets.get(*k)));
+                    // 标题/艺术家按「以 Unicode 显示」现挑:队列里存的是入队时的文本,
+                    // 直接用它的话切换开关不会生效。库里有这首就用库里的原名/unicode 名。
+                    let (row_title, row_artist) = match set {
+                        Some(st) => (
+                            pick_text(&st.title, &st.title_unicode, app.settings.display_unicode),
+                            pick_text(&st.artist, &st.artist_unicode, app.settings.display_unicode),
+                        ),
+                        None => (
+                            pick_text(&t.title, &t.title_u, app.settings.display_unicode),
+                            pick_text(&t.artist, &t.artist_u, app.settings.display_unicode),
+                        ),
+                    };
                     let resolved = t
                         .sha2
                         .clone()
@@ -4351,10 +5234,7 @@ impl App {
                     let previewing = app.preview.as_ref().is_some_and(|(id, _)| id == &t.set_id);
                     let e1 = entity.clone();
                     let e2 = entity.clone();
-                    let e3 = entity.clone();
-                    let e4 = entity.clone();
                     let e5 = entity.clone();
-                    let e6 = entity.clone();
                     let mods = t.mods;
                     let sid_prev = t.set_id.clone();
                     let sha_prev = t.sha2.clone();
@@ -4471,8 +5351,8 @@ impl App {
                                 handle = handle.cursor_pointer();
                                 handle.on_drag(i, {
                                     let entity = entity.clone();
-                                    let title = t.title.clone();
-                                    let artist = t.artist.clone();
+                                    let title = pick_text(&t.title, &t.title_u, app.settings.display_unicode);
+                                    let artist = pick_text(&t.artist, &t.artist_u, app.settings.display_unicode);
                                     let cover = app.thumb_of(&t.set_id);
                                     // offset 用不到:让位目标由指针绝对坐标/行高换算,
                                     // 这里只记下源下标与初始落点。
@@ -4522,7 +5402,8 @@ impl App {
                                 .flex_none()
                                 .text_sm()
                                 .text_color(if playing { rgb(pal().accent) } else { rgb(pal().dim) })
-                                .child(if playing { "▶".to_string() } else { format!("{}", i + 1) }),
+                                // 正在播的那行用实心圆点标记(不用 emoji 三角)
+                                .child(if playing { "●".to_string() } else { format!("{}", i + 1) }),
                         )
                         .child(
                             div()
@@ -4543,7 +5424,7 @@ impl App {
                                                 .text_base()
                                                 .overflow_hidden()
                                                 .min_w(px(0.0))
-                                                .child(if t.title.is_empty() { "…".to_string() } else { t.title.clone() }),
+                                                .child(if row_title.is_empty() { "…".to_string() } else { row_title.clone() }),
                                         )
                                         .child(star_badge(star))
                                         .children(if mods != 0 {
@@ -4566,10 +5447,10 @@ impl App {
                                         .overflow_hidden()
                                         .text_color(rgb(pal().dim))
                                         .child({
-                                            let mut sub = if t.artist.is_empty() {
+                                            let mut sub = if row_artist.is_empty() {
                                                 "曲库加载中".to_string()
                                             } else {
-                                                t.artist.clone()
+                                                row_artist.clone()
                                             };
                                             if !diff_name.is_empty() {
                                                 sub.push_str(" · ");
@@ -4587,32 +5468,14 @@ impl App {
                                 .text_color(rgb(pal().dim))
                                 .child(fmt_ms(dur_ms)),
                         )
-                        .child(
-                            div()
-                                .id(gpui::ElementId::Name(format!("del{i}").into()))
-                                .w(px(36.0))
-                                .h(px(44.0))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_base()
-                                .text_color(rgb(pal().dim))
-                                .cursor_pointer()
-                                .child("✕")
-                                .on_click(move |_e: &gpui::ClickEvent, _w, cx| {
-                                    let _ = e3.update(cx, |this, cx| {
-                                        this.remove_at(i);
-                                        cx.notify();
-                                    });
-                                }),
-                        )
                         .into_any_element()
                 }
             }
             }
         })
         .px_2()
+        // 右侧给滚动条留位置(轨道 10px + 2px 边距),否则「✕」会被它盖住
+        .pr(px(18.0))
         .w_full()
         .h_full()
         .min_h(px(0.0));
@@ -4787,12 +5650,15 @@ impl App {
 
                     )
             })
+            // 曲库/播放条显示原曲名还是 unicode 名(默认开)
+            .child(self.toggle_row("以 Unicode 显示", s.display_unicode, "display_unicode", cx))
             // 播放分组的题头:内容整体在画面上面,但保留分组标题
             .child(section("播放"))
             // 曲库源(从曲库读取哪一份数据)
             .child({
-                let laz_ok = crate::lazer::realm_path().is_some();
-                let stb_ok = crate::stable::stable_root().is_some();
+                // 用采集好的结果(不逐帧读注册表 / storage.ini)
+                let laz_ok = self.probe_realm.is_some();
+                let stb_ok = self.probe_stable_root.is_some();
                 let btn = |name: &'static str, active: bool, available: bool, cx: &mut Context<Self>| {
                     let mut b = div()
                         .id(gpui::ElementId::Name(format!("src{name}").into()))
@@ -4890,8 +5756,11 @@ impl App {
                 DropKind::RenderMode,
                 s.render_mode.clone(),
                 vec![
+                    // 与 Tauri 版 ui/index.html 的 #render-mode 同五项、同文案
                     ("always".into(), "始终渲染".into()),
-                    ("autopause".into(), "全屏时不渲染".into()),
+                    ("autopause".into(), "全屏时不渲染画面".into()),
+                    ("fs_pause".into(), "全屏时暂停播放".into()),
+                    ("fs_sleep".into(), "全屏时暂停并休眠".into()),
                     ("off".into(), "播放器模式".into()),
                 ],
                 cx,
@@ -4972,6 +5841,11 @@ impl App {
             .child(self.toggle_row("光标轨迹", s.cursor_trail, "cursor_trail", cx))
             .child(self.toggle_row("光标波纹", s.cursor_ripples, "cursor_ripples", cx))
             .child(self.step_row("光标大小", format!("{:.2}", s.cursor_size), "cursor_size", cx))
+            .child(section("快捷键"))
+            .child(self.toggle_row("启用全局快捷键", s.hotkeys_enabled, "hotkeys_enabled", cx))
+            .child(self.hotkey_row("上一首", Field::HotkeyPrev, s.hotkey_prev.clone(), cx))
+            .child(self.hotkey_row("播放 / 暂停", Field::HotkeyToggle, s.hotkey_toggle.clone(), cx))
+            .child(self.hotkey_row("下一首", Field::HotkeyNext, s.hotkey_next.clone(), cx))
             .child(section("系统"))
             .child(self.toggle_row("启动后自动播放", s.play_on_start, "play_on_start", cx))
             .child(self.toggle_row("开机自启", s.autostart, "autostart", cx))
@@ -5001,7 +5875,7 @@ impl App {
                     .justify_end()
                     .pb_2()
                     .child(self.small_btn("下载 ffmpeg", cx, |_this, cx| {
-                        open_url("https://ffmpeg.org/download.html");
+                        cx.open_url("https://ffmpeg.org/download.html");
                         cx.notify();
                     })),
             )
@@ -5015,6 +5889,25 @@ impl App {
                     .child(self.small_btn("导出日志", cx, |this, _| this.export_log()))
                     .child(self.small_btn("还原桌面壁纸", cx, |this, _| this.restore_wallpaper()))
                     .child(self.small_btn("重启壁纸进程", cx, |this, _| this.restart_child()))
+                    // Windows 特有:桌面层次乱了 / 壁纸挂不上去时,重启 shell 重建
+                    // Progman / DefView / WorkerW(任务栏会闪一下;壁纸进程自己重挂)。
+                    .children({
+                        #[cfg(windows)]
+                        {
+                            Some(self.small_btn("重启资源管理器", cx, |this, _| {
+                                std::thread::spawn(|| {
+                                    if let Err(e) = crate::win::restart_explorer() {
+                                        log::warn!("[shell] 重启资源管理器失败: {e}");
+                                    }
+                                });
+                                this.toast("正在重启资源管理器…");
+                            }))
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            None
+                        }
+                    })
                     .child(self.small_btn(
                         format!("清除全部个性设置 ({})", self.settings.set_overrides.len()),
                         cx,
@@ -5098,10 +5991,31 @@ impl App {
         self.toast("已恢复全局设置");
     }
 
-    /// 原生文件/目录选择(XDG portal,后台线程,结果在 poll 里落账)。
+    /// 原生文件/目录选择(Windows IFileDialog / Linux XDG portal;后台线程,
+    /// 结果在 poll 里落账)。
     fn browse(&mut self, field: Field) {
+        // 起始目录用当前值:手填过路径时直接打开到那儿,省得每次从头翻
+        let start = match field {
+            Field::LazerDir => self.settings.lazer_dir.clone(),
+            Field::StableDir => self.settings.stable_dir.clone(),
+            _ => None,
+        }
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir());
+        #[cfg(windows)]
+        let parent = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
         std::thread::spawn(move || {
             let mut dialog = rfd::FileDialog::new();
+            if let Some(dir) = &start {
+                dialog = dialog.set_directory(dir);
+            }
+            // 有 owner 才会前置/模态;主窗口还没建好时退化成无 owner
+            #[cfg(windows)]
+            {
+                if let Some(h) = std::num::NonZeroIsize::new(parent) {
+                    dialog = dialog.set_parent(&RawParent(h));
+                }
+            }
             let picked = match field {
                 Field::Ffmpeg | Field::Ffprobe => dialog.pick_file(),
                 _ => dialog.pick_folder(),
@@ -5112,19 +6026,58 @@ impl App {
         });
     }
 
-    fn in_path(name: &str) -> bool {
-        std::env::var_os("PATH")
-            .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
-            .unwrap_or(false)
+    /// 在 PATH 里找可执行文件,返回第一个命中的完整路径。
+    ///
+    /// Windows 上要按 `PATHEXT` 补扩展名:命令行里写 `ffmpeg` 时系统会自己
+    /// 找到 `ffmpeg.exe`,但 `dir.join("ffmpeg").is_file()` 找不到 —— 之前
+    /// 设置页明明 PATH 里有 ffmpeg 却显示 ✗ 就是这个原因。
+    fn which_in_path(name: &str) -> Option<PathBuf> {
+        let paths = std::env::var_os("PATH")?;
+        let mut exts: Vec<String> = vec![String::new()];
+        if cfg!(windows) {
+            let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+            exts.extend(
+                pathext
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|e| !e.is_empty())
+                    .map(str::to_ascii_lowercase),
+            );
+        }
+        std::env::split_paths(&paths)
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .find_map(|dir| {
+                exts.iter()
+                    .map(|ext| dir.join(format!("{name}{ext}")))
+                    .find(|p| p.is_file())
+            })
+    }
+    /// 采集"自动检测"的路径(注册表 / storage.ini / PATH 扫描)。
+    ///
+    /// 这些探测是真实 I/O,而 gpui 每帧都会重跑一遍 `render`;所以只在
+    /// **可能变化时**采集(启动、改路径、换曲库源、刷新曲库、切到设置页),
+    /// 而不是逐帧做,也不靠 TTL 过期。
+    fn refresh_probes(&mut self) {
+        self.probe_lazer_root = crate::lazer::data_root();
+        self.probe_stable_root = crate::stable::stable_root();
+        self.probe_realm = crate::lazer::realm_path();
+        self.probe_ffmpeg = Self::which_in_path("ffmpeg");
+        self.probe_ffprobe = Self::which_in_path("ffprobe");
     }
 
-    fn path_ok(field: Field, v: &Option<String>) -> bool {
+    fn path_ok(&self, field: Field, v: &Option<String>) -> bool {
         match field {
             Field::LazerDir | Field::StableDir => {
                 v.as_ref().map(|p| Path::new(p).is_dir()).unwrap_or(true)
             }
-            Field::Ffmpeg => v.as_deref().map(|p| Path::new(p).is_file()).unwrap_or_else(|| Self::in_path("ffmpeg")),
-            Field::Ffprobe => v.as_deref().map(|p| Path::new(p).is_file()).unwrap_or_else(|| Self::in_path("ffprobe")),
+            Field::Ffmpeg => v
+                .as_deref()
+                .map(|p| Path::new(p).is_file())
+                .unwrap_or_else(|| self.probe_ffmpeg.is_some()),
+            Field::Ffprobe => v
+                .as_deref()
+                .map(|p| Path::new(p).is_file())
+                .unwrap_or_else(|| self.probe_ffprobe.is_some()),
             _ => true,
         }
     }
@@ -5159,6 +6112,10 @@ impl App {
             let _ = c.child.wait();
         }
         self.child = spawn_wallpaper(self.status.clone());
+        // 重启出来的进程同样要补齐设置(渲染模式/帧率等),否则会退回默认
+        if self.child.is_some() {
+            self.send_child_settings();
+        }
         self.toast("壁纸进程已重启");
     }
 
@@ -5437,13 +6394,21 @@ impl App {
     }
 
     fn path_row(&self, label: &'static str, field: Field, value: Option<String>, cx: &mut Context<Self>) -> impl IntoElement {
-        let ok = Self::path_ok(field, &value);
-        // 未手动指定时显示自动检测到的路径
+        let ok = self.path_ok(field, &value);
+        // 未手动指定时显示自动检测到的路径(探测结果带 5s 缓存,不逐帧读注册表/扫 PATH)
+        // 未手动指定时显示自动检测到的路径(采集结果,不在这里现场探测)
         let effective = value.clone().or_else(|| match field {
-            Field::LazerDir => crate::lazer::data_root().map(|p| p.to_string_lossy().into_owned()),
-            Field::StableDir => crate::stable::stable_root().map(|p| p.to_string_lossy().into_owned()),
-            Field::Ffmpeg => Some("系统 PATH 中的 ffmpeg".to_string()),
-            Field::Ffprobe => Some("系统 PATH 中的 ffprobe".to_string()),
+            Field::LazerDir => self
+                .probe_lazer_root
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            Field::StableDir => self
+                .probe_stable_root
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            // PATH 自动检测:显示命中的完整路径(能看出用的是哪一个),找不到就是 None
+            Field::Ffmpeg => self.probe_ffmpeg.as_ref().map(|p| p.display().to_string()),
+            Field::Ffprobe => self.probe_ffprobe.as_ref().map(|p| p.display().to_string()),
             _ => None,
         });
         let is_default = value.is_none();
@@ -5484,8 +6449,9 @@ impl App {
                         None
                     }),
             )
-            .child(self.small_btn("浏览…", cx, move |this, _| this.browse(field)))
-            .child(self.small_btn_w("恢复默认", Some(96.0), cx, move |this, _| {
+            // 四行按钮同标签、同调用点:必须带 field 当 key,否则只有第一行能点
+            .child(self.small_btn_keyed("浏览…", format!("{field:?}"), None, cx, move |this, _| this.browse(field)))
+            .child(self.small_btn_keyed("恢复默认", format!("{field:?}"), Some(96.0), cx, move |this, _| {
                 match field {
                     Field::LazerDir => this.settings.lazer_dir = None,
                     Field::StableDir => this.settings.stable_dir = None,
@@ -5503,6 +6469,62 @@ impl App {
                 }
                 this.persist();
             }))
+    }
+
+    /// 一行快捷键:说明 + 组合键文本框 + 清除。
+    fn hotkey_row(
+        &self,
+        label: &'static str,
+        field: Field,
+        value: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let shown = value.unwrap_or_default();
+        div()
+            .flex()
+            .flex_row()
+            .justify_between()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_2()
+            .border_b_1()
+            .border_color(rgb(pal().line2))
+            .text_sm()
+            .child(label)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(self.text_field(field, &shown, 200.0, cx))
+                    // id 按 field 区分:三行同标签按钮不能共用交互状态
+                    .child(
+                        div()
+                            .id(gpui::ElementId::Name(format!("hkclear{field:?}").into()))
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .bg(rgb(pal().ctl))
+                            .text_sm()
+                            .cursor_pointer()
+                            .hover(|st| st.bg(rgb(pal().ctl_hover)))
+                            .child("清除")
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                this.commit_num_edit();
+                                match field {
+                                    Field::HotkeyPrev => this.settings.hotkey_prev = None,
+                                    Field::HotkeyToggle => this.settings.hotkey_toggle = None,
+                                    Field::HotkeyNext => this.settings.hotkey_next = None,
+                                    _ => {}
+                                }
+                                this.apply_hotkeys();
+                                this.persist();
+                                cx.notify();
+                            })),
+                    ),
+            )
     }
 
     /// 通用滑块:圆角轨道 + 高亮进度 + 圆形滑钮;拖动时按元素 bounds 换算比例。
@@ -5652,29 +6674,41 @@ impl App {
         }
     }
 
-    /// 点击播放条封面:切换到播放列表,滚动到当前曲目行并选中它。
-    fn jump_to_current_in_queue(&mut self) {
-        if self.queue.is_empty() {
+    /// 点击播放条封面:如果"正在放的那首"在播放列表里,就切到列表并定位到它;
+    /// 不在列表里(曲库直接点播)则什么都不做 —— 不跳视图、不滚动、不清预览。
+    fn focus_playing_in_queue(&mut self) {
+        let Some(set_id) = self.settings.lazer_set.clone() else {
             return;
-        }
-        let i = self.pos.min(self.queue.len() - 1);
+        };
+        let sha = self.settings.lazer_sha2.clone();
+        // 同一个谱面集可能在列表里出现多次(不同难度/mods):优先 set+难度 精确匹配
+        let idx = sha
+            .as_ref()
+            .and_then(|s| {
+                self.queue
+                    .iter()
+                    .position(|q| q.set_id == set_id && q.sha2.as_ref() == Some(s))
+            })
+            .or_else(|| self.queue.iter().position(|q| q.set_id == set_id));
+        let Some(i) = idx else {
+            return;
+        };
+        self.pos = i;
+        self.settings.playlist_pos = i;
+        self.preview = None;
         self.view = View::Queue;
-        // 进入多选模式并独占选中当前曲目,方便直接右键/批量操作
-        self.select_mode = true;
+        // 普通模式:只滚到当前曲目,不进入多选、也不自动勾选
+        self.select_mode = false;
         self.selected.clear();
-        self.selected.insert(i);
-        self.sel_anchor = Some(i);
+        self.sel_anchor = None;
         self.ctx = None;
         self.ctx_multi = false;
-        // 先用当前队列长度同步列表 item 数:queue_panel 里
-        // "item_count 不一致就 reset" 会把下面设置的定位清掉。
+        self.persist();
+        // 先用当前队列长度同步 item 数,否则下面设置的定位会被 reset 清掉
         let count = self.queue.len();
         if self.queue_list.item_count() != count {
             self.queue_list.reset(count);
         }
-        // 直接按"第 i 项在顶部"设置逻辑滚动位置。之前用
-        // scroll_to_reveal_item:切到播放列表的同一帧里列表还没布局
-        // (height=0),它会按"把该项贴到底部"算,导致先跳到最下方再回弹。
         self.queue_list.scroll_to(gpui::ListOffset {
             item_ix: i,
             offset_in_item: px(0.0),
@@ -5704,35 +6738,60 @@ impl App {
             (t, dur)
         };
         let frac = if dur > 0.0 { (t / dur).clamp(0.0, 1.0) as f32 } else { 0.0 };
-        // 题头以"当前播放的曲目"为准:先看队列当前项,其次看正在预览/
-        // 实际播放的谱面集(拖动排序、切源等改动后也不会变成"未播放")
-        let now = self
-            .queue
-            .get(self.pos)
-            .map(|q| format!("{} - {}", q.title, q.artist))
-            .filter(|t| t != " - ")
-            .or_else(|| {
-                let id = self.current_set_id()?;
-                let r = self.all_rows.iter().find(|r| r.set_id == id)?;
-                Some(format!("{} - {}", r.title, r.artist))
+        // 播放条只反映"实际在放的那首":
+        // 以真正下发 load 的目标为准(settings.lazer_set / lazer_sha2),
+        // 队列只是它的一个来源 —— 从曲库直接点播时,队列位置可能还停在别的歌上。
+        let playing_set = self
+            .settings
+            .lazer_set
+            .clone()
+            .or_else(|| self.queue.get(self.pos).map(|q| q.set_id.clone()));
+        let playing_sha = self.settings.lazer_sha2.clone().or_else(|| {
+            self.queue
+                .iter()
+                .find(|q| Some(&q.set_id) == playing_set.as_ref())
+                .and_then(|q| q.sha2.clone())
+        });
+        // 难度显示名:优先查库,库还没加载完就用上次记下的名字(绝不显示 sha2)
+        let playing_diff_name = playing_sha
+            .as_ref()
+            .and_then(|sha| {
+                let set = self.lib.as_ref().and_then(|l| {
+                    self.set_idx
+                        .get(playing_set.as_deref()?)
+                        .and_then(|i| l.sets.get(*i))
+                })?;
+                set.beatmaps.iter().find(|b| &b.sha2 == sha).map(|b| b.name.clone())
             })
-            .unwrap_or_else(|| "未播放".to_string());
-        let star = self
-            .queue
-            .get(self.pos)
-            .and_then(|t| {
-                let sha = t.sha2.as_ref()?;
-                self.lib
-                    .as_ref()?
-                    .sets
-                    .iter()
-                    .find(|s| s.id == t.set_id)?
-                    .beatmaps
-                    .iter()
-                    .find(|b| &b.sha2 == sha)
-                    .map(|b| b.star_rating)
-            })
-            .unwrap_or(0.0);
+            .or_else(|| self.settings.lazer_diff.clone());
+        let now = {
+            // 优先用库里的原名/unicode 名现挑(队列里存的是入队时的文本)
+            let unicode = self.settings.display_unicode;
+            let from_lib = playing_set.as_ref().and_then(|id| {
+                self.all_rows.iter().find(|r| &r.set_id == id).map(|r| {
+                    format!(
+                        "{} - {}",
+                        pick_text(&r.title_raw, &r.title_u, unicode),
+                        pick_text(&r.artist_raw, &r.artist_u, unicode)
+                    )
+                })
+            });
+            from_lib
+                .or_else(|| {
+                    playing_set
+                        .as_ref()
+                        .and_then(|id| self.queue.iter().find(|q| &q.set_id == id))
+                        .map(|q| {
+                            format!(
+                                "{} - {}",
+                                pick_text(&q.title, &q.title_u, unicode),
+                                pick_text(&q.artist, &q.artist_u, unicode)
+                            )
+                        })
+                })
+                .filter(|t| t != " - ")
+                .unwrap_or_else(|| "未播放".to_string())
+        };
 
         div()
             .flex()
@@ -5773,81 +6832,78 @@ impl App {
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .child(self.small_btn("⏮", cx, |this, _| this.step(-1)))
-                    .child(
-                        div()
-                            .id("toggle")
-                            .px_3()
-                            .py_1()
-                            .rounded_full()
-                            .bg(rgb(pal().accent))
-                            .text_color(rgb(0xffffff))
-                            .cursor_pointer()
-                            .child(if self.playing { "⏸" } else { "▶" })
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.toggle_pause();
-                                cx.notify();
-                            })),
-                    )
-                    .child(self.small_btn("⏭", cx, |this, _| this.step(1)))
+                    .child(self.icon_btn("prev", TransportIcon::Prev, false, cx, |this, _| this.step(-1)))
+                    .child(self.icon_btn(
+                        "toggle",
+                        if self.playing { TransportIcon::Pause } else { TransportIcon::Play },
+                        true,
+                        cx,
+                        |this, _| this.toggle_pause(),
+                    ))
+                    .child(self.icon_btn("next", TransportIcon::Next, false, cx, |this, _| this.step(1)))
                     .child({
-                        let (mut opts, cur) = match self.queue.get(self.pos) {
-                            Some(t) => {
-                                let mut opts: Vec<(String, String)> = Vec::new();
-                                if let Some(set) = self
-                                    .lib
-                                    .as_ref()
-                                    .and_then(|l| self.set_idx.get(&t.set_id).and_then(|i| l.sets.get(*i)))
-                                {
-                                    let mut bs: Vec<&crate::lazer::LazerBeatmap> =
-                                        set.beatmaps.iter().collect();
-                                    bs.sort_by(|a, b| a.star_rating.total_cmp(&b.star_rating));
-                                    for b in bs {
-                                        opts.push((
-                                            b.sha2.clone(),
-                                            format!("{} ★{:.2}", b.name, b.star_rating),
-                                        ));
-                                    }
-                                }
-                                let cur = t
-                                    .sha2
+                        // 难度框的"主体":预览优先(预览时就是想在播放条挑难度开播),
+                        // 没有预览时才是正在放的那首。曲库预览的曲目还没进播放列表,
+                        // 以前这里会因为没有队列行而一个难度都列不出来。
+                        let ui_set = self
+                            .preview
+                            .as_ref()
+                            .map(|(id, _)| id.clone())
+                            .or_else(|| playing_set.clone());
+                        let previewing = self.preview.is_some();
+                        let ui_sha = if previewing {
+                            self.preview.as_ref().and_then(|(_, s)| s.clone())
+                        } else {
+                            playing_sha.clone()
+                        };
+                        let cur_set = ui_set.as_ref().and_then(|id| {
+                            self.lib
+                                .as_ref()
+                                .and_then(|l| self.set_idx.get(id.as_str()).and_then(|i| l.sets.get(*i)))
+                        });
+                        let (mut opts, cur) = match cur_set {
+                            Some(set) => {
+                                let mut bs: Vec<&crate::lazer::LazerBeatmap> =
+                                    set.beatmaps.iter().collect();
+                                bs.sort_by(|a, b| a.star_rating.total_cmp(&b.star_rating));
+                                let opts: Vec<(String, String)> = bs
+                                    .iter()
+                                    .map(|b| {
+                                        (b.sha2.clone(), format!("{} ★{:.2}", b.name, b.star_rating))
+                                    })
+                                    .collect();
+                                let cur = ui_sha
                                     .clone()
-                                    .or_else(|| self.policy_pick(&t.set_id))
+                                    .or_else(|| {
+                                        self.queue
+                                            .iter()
+                                            .find(|q| Some(&q.set_id) == ui_set.as_ref())
+                                            .and_then(|q| q.sha2.clone())
+                                    })
+                                    .or_else(|| ui_set.as_ref().and_then(|id| self.policy_pick(id)))
                                     .unwrap_or_default();
                                 (opts, cur)
                             }
-                            None => (Vec::new(), String::new()),
+                            None => (Vec::new(), ui_sha.clone().unwrap_or_default()),
                         };
                         opts.truncate(60);
+                        // 库还没就绪(=这一档不在选项里)时,别把 sha2 当难度名显示
+                        if !cur.is_empty() && !opts.iter().any(|(v, _)| v == &cur) {
+                            // 预览时不能借用"正在播的那首"的难度名,会串台
+                            let name = if previewing {
+                                "…".to_string()
+                            } else {
+                                playing_diff_name.clone().unwrap_or_else(|| "…".to_string())
+                            };
+                            opts.insert(0, (cur.clone(), name));
+                        }
                         // 播放条难度框固定长度(240px):不随难度名长短伸缩,
                         // 超长名字单行省略,避免把这一排其它控件挤走。
                         self.dropdown_w(DropKind::QueueDiff, cur, opts, Some(240.0), cx)
                     })
-                    .child(self.dropdown_w(
-                        DropKind::Speed,
-                        // 用与选项一致的字符串,才能高亮当前档
-                        match self.settings.speed {
-                            v if (v - 0.5).abs() < 0.001 => "0.5".to_string(),
-                            v if (v - 0.75).abs() < 0.001 => "0.75".to_string(),
-                            v if (v - 1.0).abs() < 0.001 => "1".to_string(),
-                            v if (v - 1.25).abs() < 0.001 => "1.25".to_string(),
-                            v if (v - 1.5).abs() < 0.001 => "1.5".to_string(),
-                            v if (v - 2.0).abs() < 0.001 => "2".to_string(),
-                            v => format!("{}", v),
-                        },
-                        vec![
-                            ("0.5".into(), "0.50x".into()),
-                            ("0.75".into(), "0.75x".into()),
-                            ("1".into(), "1.00x".into()),
-                            ("1.25".into(), "1.25x".into()),
-                            ("1.5".into(), "1.50x".into()),
-                            ("2".into(), "2.00x".into()),
-                        ],
-                        Some(92.0),
-                        cx,
-                    ))
                     .child({
-                        let cur = self.queue.get(self.pos).map(|t| t.set_id.clone());
+                        // 封面同样只跟"实际在放的那首",预览不参与
+                        let cur = playing_set.clone();
                         let inner = match cur.and_then(|id| self.hero_image(&id)) {
                             Some(img) => gpui::img(gpui::ImageSource::Image(img))
                                 .w_full()
@@ -5868,10 +6924,11 @@ impl App {
                             .flex_none()
                             .overflow_hidden()
                             .cursor_pointer()
-                            // 点击封面 = 定位到播放列表里的当前曲目并选中
+                            // 点封面:只有"正在放的这首确实在播放列表里"才跳过去定位;
+                            // 曲库直接点播(不在列表里)就什么都不做
                             .child(inner)
                             .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.jump_to_current_in_queue();
+                                this.focus_playing_in_queue();
                                 cx.notify();
                             }))
                     })
@@ -5900,7 +6957,31 @@ impl App {
                                     ),
                             ),
                     )
-                    .child(div().text_xs().text_color(rgb(pal().dim)).child("🔈"))
+                    // 倍率跟在封面 + 题头后面(原先排在难度框和封面之间)
+                    .child(self.dropdown_w(
+                        DropKind::Speed,
+                        // 用与选项一致的字符串,才能高亮当前档
+                        match self.settings.speed {
+                            v if (v - 0.5).abs() < 0.001 => "0.5".to_string(),
+                            v if (v - 0.75).abs() < 0.001 => "0.75".to_string(),
+                            v if (v - 1.0).abs() < 0.001 => "1".to_string(),
+                            v if (v - 1.25).abs() < 0.001 => "1.25".to_string(),
+                            v if (v - 1.5).abs() < 0.001 => "1.5".to_string(),
+                            v if (v - 2.0).abs() < 0.001 => "2".to_string(),
+                            v => format!("{}", v),
+                        },
+                        vec![
+                            ("0.5".into(), "0.50x".into()),
+                            ("0.75".into(), "0.75x".into()),
+                            ("1".into(), "1.00x".into()),
+                            ("1.25".into(), "1.25x".into()),
+                            ("1.5".into(), "1.50x".into()),
+                            ("2".into(), "2.00x".into()),
+                        ],
+                        Some(92.0),
+                        cx,
+                    ))
+                    .child(div().text_xs().text_color(rgb(pal().dim)).child("音量"))
                     .child(self.slider(
                         "volume",
                         self.settings.master_volume,
@@ -7081,7 +8162,7 @@ impl App {
                 .child(div().text_xs().text_color(rgb(pal().dim)).child(desc))
                 .on_click(cx.listener(move |_t, _e, _w, cx| {
                     if !url.is_empty() {
-                        open_url(url);
+                        cx.open_url(url);
                     }
                     cx.notify();
                 }))
@@ -7132,7 +8213,7 @@ impl App {
                             .cursor_pointer()
                             .child("https://github.com/Ohdmire/Aria")
                             .on_click(cx.listener(|_t, _e, _w, cx| {
-                                open_url("https://github.com/Ohdmire/Aria");
+                                cx.open_url("https://github.com/Ohdmire/Aria");
                                 cx.notify();
                             })),
                     )
@@ -7156,7 +8237,7 @@ impl App {
                                     .cursor_pointer()
                                     .child("赞助作者(爱发电)  https://afdian.com/a/ATRI1024")
                                     .on_click(cx.listener(|_t, _e, _w, cx| {
-                                        open_url("https://afdian.com/a/ATRI1024");
+                                        cx.open_url("https://afdian.com/a/ATRI1024");
                                         cx.notify();
                                     })),
                             ),
@@ -7354,6 +8435,15 @@ pub fn run() {
                     false
                 }
             });
+            // 记下主窗口 HWND:原生文件对话框拿它当 owner(否则可能弹在窗口后面)
+            #[cfg(windows)]
+            {
+                if let Ok(h) = raw_window_handle::HasWindowHandle::window_handle(&*window) {
+                    if let raw_window_handle::RawWindowHandle::Win32(w32) = h.as_raw() {
+                        MAIN_HWND.store(w32.hwnd.get(), std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
             let view = cx.new(App::new);
             view_slot = Some(view.clone());
             view
@@ -7361,24 +8451,25 @@ pub fn run() {
             let _ = handle.update(cx, |_, window, _| window.activate_window());
             *WINDOW.lock().unwrap() = Some(handle);
         }
-        // 心跳:实体建好后再 spawn(构造期 spawn 的 WeakEntity 升不上来,
-        // 任务会静默退出 —— 曲库后台结果不应用、进度不刷新就是这么来的)。
+        // 兜底轮询:窗口最小化/被遮挡时 gpui 不再出帧,render 里的 poll 也就不会跑,
+        // 曲终自动切歌/进度/曲库结果都会停。这里只做"后台兜底 + 有变化才 notify",
+        // 它不限制帧率(界面刷新是逐帧的,见 render 里的 request_animation_frame)。
         if let Some(view) = view_slot {
             cx.spawn(async move |cx: &mut gpui::AsyncApp| {
                 loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(250))
-                    .await;
-                if view
-                    .update(cx, |this, cx| {
-                        if this.poll(cx) {
-                            cx.notify();
-                        }
-                    })
-                    .is_err()
-                {
-                    break;
-                }
+                    cx.background_executor()
+                        .timer(Duration::from_millis(250))
+                        .await;
+                    if view
+                        .update(cx, |this, cx| {
+                            if this.poll(cx) {
+                                cx.notify();
+                            }
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
             })
             .detach();
@@ -7407,6 +8498,39 @@ mod drag_slot_tests {
         assert_eq!(drag_slot(10_000.0, top, 0.0, 5), 4);
         // 空列表不 panic
         assert_eq!(drag_slot(150.0, top, 0.0, 0), 0);
+    }
+
+    /// 滚动条滑块位置:gpui 的 offset 是负值,顶部 0 / 底部 -max。
+    /// 之前按正值算,比例恒为 0 → 滑块永远停在顶端。
+    #[test]
+    fn scrollbar_frac_uses_negative_offset() {
+        assert_eq!(scroll_frac(0.0, 200.0), 0.0, "顶部");
+        assert_eq!(scroll_frac(-50.0, 200.0), 0.25);
+        assert_eq!(scroll_frac(-100.0, 200.0), 0.5);
+        assert_eq!(scroll_frac(-200.0, 200.0), 1.0, "底部");
+        assert_eq!(scroll_frac(-400.0, 200.0), 1.0, "越界夹到 1");
+        assert_eq!(scroll_frac(-10.0, 0.0), 0.0, "不可滚动");
+    }
+
+    /// 快捷键捕获:gpui 的按键事件 → 快捷键文本,且必须能被真正注册用的解析器接受。
+    #[test]
+    fn hotkey_capture_maps_keystrokes() {
+        let chord = |s: &str| {
+            let ks = gpui::Keystroke::parse(s).expect("keystroke 应能解析");
+            hotkey_chord_text(&ks)
+        };
+        assert_eq!(chord("ctrl-alt-right").as_deref(), Some("Ctrl+Alt+Right"));
+        assert_eq!(chord("f8").as_deref(), Some("F8"));
+        assert_eq!(chord("shift-alt-a").as_deref(), Some("Alt+Shift+A"));
+        assert_eq!(chord("ctrl").as_deref(), None, "只按修饰键不产生组合");
+        assert_eq!(chord("shift").as_deref(), None, "只按修饰键不产生组合");
+
+        #[cfg(windows)]
+        for s in ["ctrl-alt-right", "f8", "ctrl-shift-f5", "alt-space", "ctrl-a"] {
+            let text = chord(s).unwrap_or_else(|| panic!("{s} 应产生组合"));
+            crate::hotkeys::parse_binding(crate::hotkeys::Action::Next, &text)
+                .unwrap_or_else(|e| panic!("捕获到 {text} 但解析失败: {e}"));
+        }
     }
 }
 

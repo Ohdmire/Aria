@@ -240,7 +240,7 @@ dependencies = [
 
 [[package]]
 name = "aria"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "anyhow",
  "ash",
@@ -248,6 +248,7 @@ dependencies = [
  "calloop 0.14.5",
  "calloop-wayland-source 0.4.1",
  "cc",
+ "embed-resource",
  "env_logger",
  "gpui",
  "gtk",
