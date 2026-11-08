@@ -16,8 +16,12 @@ osu! storyboard 动态桌面壁纸
 ### Windows
 
 Release 下载安装 exe 即用
-- 如电脑内未安装 `ffmpeg` 则第一次下载需要下载带 `-ffmpeg` 的安装包 
-- 后续更新可以直接下载不带 `-ffmpeg` 的
+
+安装包**不再内置 ffmpeg**,也不会自动安装:
+- **不装也能正常运行**,只是视频 storyboard、视频时长探测等少数功能不可用;
+- 需要时自己到 <https://ffmpeg.org/download.html> 下载,解压后把 `bin` 目录加入 PATH,
+  或在「设置 → 路径」里手动指定 `ffmpeg` / `ffprobe`;
+- 设置页「路径」区有「下载 ffmpeg」按钮,点它只是打开下载页,不会自动下载/安装。
 
 ### Linux(Wayland / KDE Plasma 6)
 

@@ -513,6 +513,7 @@ mod tests {
         let set = LazerSet {
             id: "s".into(),
             online_id: 0,
+            status: 1,
             date_added_ms: 0,
             artist: "Artist".into(),
             artist_unicode: "歌手".into(),
@@ -534,8 +535,6 @@ mod tests {
 
     #[test]
     fn add_remove_clear_current() {
-        let mut p = Playlist::default();
-        // 去重:同一谱面集重复入列被跳过(默认行为)
         let mut p = Playlist::default();
         p.add("a".into(), Some("x".into()), 0, String::new(), String::new(), 0.0);
         // 重复入列 = 原位替换参数(位置/qid 不变),不是跳过
