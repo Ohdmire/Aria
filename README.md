@@ -24,26 +24,11 @@ Release 下载安装 exe 即用
 - 设置页「路径」区有「下载 ffmpeg」按钮,点它只是打开下载页,不会自动下载/安装。
 
 ### Linux(Wayland / KDE Plasma 6)
-
-只支持 Wayland;壁纸以 Plasma 壁纸插件的形式挂在桌面 containment 里,
-**桌面图标、任务栏都正常显示**。画面通过 **dmabuf 零拷贝**交给
-plasmashell(1440p 实测 ~120fps,CPU 只有共享内存路径的 1/4)。
-
 ```bash
 scripts/build-kde-plugin.sh --install   # 构建 QML 原生控件 + 安装插件包
 cargo build --release                   # 需要 Rust、Qt6/EGL/GLES 开发包、Vulkan 驱动、GTK3
 ./target/release/aria
 ```
-
-前端为 GPUI(无 WebView):曲库/队列/设置三栏,底部播放条,系统托盘
-(托盘需要 GTK3 + libayatana-appindicator;`tray-icon` 关闭了 libxdo 依赖)。
-
-> 这一版在 `Cargo.toml` 里有一行 `[patch]`,把 `osu-replay-render` 指到
-> 同级的 `../osu-replay-render`(需要它暴露 `Renderer::target_texture()`
-> 才能导出 dmabuf)。上游合并后删掉即可。
-
-启动后会自动安装并切换 Plasma 壁纸,退出时还原。细节、限制与曲库位置
-见 [docs/linux-wayland.md](docs/linux-wayland.md)。
 
 ## 核心特色
 
