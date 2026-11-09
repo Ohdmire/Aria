@@ -3184,6 +3184,65 @@ impl Render for App {
             let q = self.queue_list.item_count();
             self.queue_list.reset(q);
         }
+        let titlebar = div()
+            .id("custom-titlebar")
+            .flex_none()
+            .flex()
+            .h(px(34.0))
+            .items_center()
+            .bg(rgb(pal().panel))
+            .text_color(rgb(pal().text))
+            .on_mouse_down(gpui::MouseButton::Left, |_event, window, _cx| {
+                window.start_window_move();
+            })
+            .child(div().flex_1().px_3().text_sm().child("Aria"))
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .h_full()
+                    .items_center()
+                    .child(
+                        div()
+                            .id("minimize-window")
+                            .flex()
+                            .w(px(46.0))
+                            .h_full()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|this| this.bg(rgb(pal().ctl)))
+                            .child("-")
+                            .on_click(|_, window, _| window.minimize_window()),
+                    )
+                    .child(
+                        div()
+                            .id("zoom-window")
+                            .flex()
+                            .w(px(46.0))
+                            .h_full()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|this| this.bg(rgb(pal().ctl)))
+                            .child(if window.is_maximized() { "❐" } else { "□" })
+                            .on_click(|_, window, _| window.zoom_window()),
+                    )
+                    .child(
+                        div()
+                            .id("close-window")
+                            .flex()
+                            .w(px(46.0))
+                            .h_full()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|this| this.bg(rgb(0xc42b3c)).text_color(rgb(0xffffff)))
+                            .child("×")
+                            .on_click(|_, window, _| window.remove_window()),
+                    ),
+            );
+
         let header = div()
             .flex_none()
             .flex()
@@ -3297,6 +3356,7 @@ impl Render for App {
             .flex_col()
             .bg(rgb(pal().bg))
             .text_color(rgb(pal().text))
+            .child(titlebar)
             .child(header)
             .child(body)
             .child(bar);
@@ -8365,10 +8425,8 @@ pub fn run() {
                 origin: gpui::point(px(40.), px(40.)),
                 size: gpui::size(px(1100.), px(640.)),
             })),
-            titlebar: Some(gpui::TitlebarOptions {
-                title: Some("Aria".into()),
-                ..Default::default()
-            }),
+            titlebar: None,
+            window_decorations: Some(gpui::WindowDecorations::Client),
             ..Default::default()
         };
         // KDE 壁纸插件:装包 + 切到 Aria(退出/关窗时还原)。
