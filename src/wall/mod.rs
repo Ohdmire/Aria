@@ -3584,16 +3584,16 @@ impl ApplicationHandler<UserEvent> for WallApp {
                     }
                 }
             }
-            // 遮挡检测(带迟滞:连续遮挡 2s 才触发,桌面重新可见 0.5s 即恢复)。
-            // 窗口销毁的暂停态用保留的 wall_hwnd 检测,恢复才能触发。
-            // AutoPause/FsPause/FsSleep 都吃遮挡;FsPause 只暂停播放
-            // (壁纸会话保留,画面冻结),FsSleep 暂停播放 + 拆会话释放内存。
-            // 预览模式无桌面挂接,遮挡概念不适用,整块跳过。
+            // 遮挡检测(带迟滞:连续遮挡 1s 才触发,桌面重新可见 0.5s 即恢复)。
+            // AutoPause/FsSleep 确认遮挡后会拆窗口并把 host 清空。暂停态
+            // 必须继续用保留的 wall_hwnd 检测,退出全屏才能把画面建回来。
+            // 预览/调试窗口无桌面挂接,整块跳过。
             #[cfg(windows)]
             if !self.render_mode.pure()
                 && self.render_mode != RenderMode::Always
                 && self.game.is_some()
-                && self.host.is_some()
+                && !self.window_is_debug()
+                && (self.host.is_some() || self.wall_hwnd.is_some())
             {
                 let covered = self.wall_hwnd.map(win::desktop_covered).unwrap_or(false);
                 if covered != self.covered {
