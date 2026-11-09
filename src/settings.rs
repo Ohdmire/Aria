@@ -208,6 +208,13 @@ pub struct Settings {
     /// "tray" = 收到托盘;"exit" = 退出程序。
     #[serde(default)]
     pub close_action: Option<String>,
+    /// 主窗口上次的尺寸(逻辑像素;None = 用默认 1180×720)。
+    /// 只在窗口没最大化时记录 —— 最大化时那是屏幕尺寸,不是用户选的窗口大小;
+    /// 启动时按它恢复,设置页「重置窗口大小」会把它改回默认尺寸。
+    #[serde(default)]
+    pub window_w: Option<f32>,
+    #[serde(default)]
+    pub window_h: Option<f32>,
     /// 日志记录开关:开 = 本进程与壁纸子进程的运行日志写入数据目录
     /// log/aria.log(设置界面可导出);关 = 仅 stderr。
     #[serde(default)]
@@ -396,6 +403,8 @@ impl Default for Settings {
             theme_mode: default_theme(),
             accent: default_accent(),
             close_action: None,
+            window_w: None,
+            window_h: None,
             log_enabled: false,
             dblclick_add: false,
             quick_add: true,

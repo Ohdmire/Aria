@@ -127,6 +127,8 @@ fn on_should_close(window: &mut gpui::Window, cx: &mut gpui::App, view: &gpui::E
         return false;
     }
     if CLOSE_TO_EXIT.load(std::sync::atomic::Ordering::Relaxed) {
+        // 退出前把窗口尺寸等最后一次改动落盘
+        let _ = view.update(cx, |this, _| this.persist());
         return true;
     }
     // 只有关闭按钮按下(或 Alt+F4)才弹。显示窗口时补来的 WM_CLOSE 没有这个状态。
@@ -687,6 +689,10 @@ struct App {
     /// 拖动让位预览的目标下标(落点)。
     drag_over: Option<usize>,
     last_size: (f32, f32),
+    /// 「重置窗口大小」按下后留给下一帧处理(按钮回调里拿不到 Window)。
+    reset_window_pending: bool,
+    /// 窗口尺寸落盘去抖序号:连续拖拽时只有最后一次变化会写文件。
+    window_size_seq: u64,
     settings_rev: u64,
     settings_rev_seen: std::cell::Cell<u64>,
     seek_guard: std::time::Instant,
@@ -977,6 +983,8 @@ impl App {
             dragging: None,
             drag_over: None,
             last_size: (0.0, 0.0),
+            reset_window_pending: false,
+            window_size_seq: 0,
             settings_rev: 0,
             settings_rev_seen: std::cell::Cell::new(0),
             seek_guard: std::time::Instant::now(),
@@ -1692,6 +1700,24 @@ impl App {
         crate::settings::save_to(&data_dir(), &self.settings);
         apply_palette(self.settings.theme_mode != "light", &self.settings.accent);
         sync_close_mode(&self.settings);
+    }
+
+    /// 窗口尺寸变化后延迟落盘:拖拽缩放时每帧都在变,别每一帧都写文件。
+    /// 序号自增,只有"最后一次变化"的定时器会真正保存。
+    fn queue_window_size_save(&mut self, cx: &mut Context<Self>) {
+        self.window_size_seq = self.window_size_seq.wrapping_add(1);
+        let seq = self.window_size_seq;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(600))
+                .await;
+            let _ = this.update(cx, |this, _| {
+                if this.window_size_seq == seq {
+                    this.persist();
+                }
+            });
+        })
+        .detach();
     }
 
     /// 恢复默认设置:保留播放列表 / 个性设置 / 上次播放记录等用户数据,
@@ -3278,6 +3304,159 @@ fn spawn_wallpaper(status: Arc<Mutex<PlayStatus>>) -> Option<crate::ctl::ChildCt
 
 // ---- 视图 ----
 
+/// Wayland 客户端装饰下窗口没有系统边框、也没有可拖的边角:这里在窗口最
+/// 外侧垫一圈透明命中区,按下鼠标就交给合成器做交互式缩放
+/// (xdg_toplevel.resize)。每条只有几像素宽,不铺背景,不影响正常点击;
+/// 由 render 摆在 root 最后,盖在标题栏拖动区/播放条之上。
+/// Windows 由窗口过程(WM_NCHITTEST)处理四边,不需要这一层。
+#[cfg(not(windows))]
+fn window_resize_grips() -> Vec<gpui::AnyElement> {
+    use gpui::{CursorStyle, ResizeEdge};
+
+    const EDGE: f32 = 5.0;
+    const CORNER: f32 = 12.0;
+
+    #[allow(clippy::too_many_arguments)]
+    fn grip(
+        id: &'static str,
+        w: Option<f32>,
+        h: Option<f32>,
+        left: Option<f32>,
+        right: Option<f32>,
+        top: Option<f32>,
+        bottom: Option<f32>,
+        edge: ResizeEdge,
+        cursor: CursorStyle,
+    ) -> gpui::AnyElement {
+        let mut el = div()
+            .id(id)
+            .absolute()
+            .cursor(cursor)
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                // 这几条是叠在窗口内容/标题栏拖动区上面的:不拦住冒泡的话,
+                // 同一个按下会先按到角区、又落到下面的边条(角区在边条里),
+                // 后一次 start_window_resize 把对角改成单边 —— 鼠标图标显示
+                // 对角、实际却只能上下/左右拉,就是这里来的。
+                cx.stop_propagation();
+                window.start_window_resize(edge);
+            });
+        if let Some(v) = w {
+            el = el.w(px(v));
+        }
+        if let Some(v) = h {
+            el = el.h(px(v));
+        }
+        if let Some(v) = left {
+            el = el.left(px(v));
+        }
+        if let Some(v) = right {
+            el = el.right(px(v));
+        }
+        if let Some(v) = top {
+            el = el.top(px(v));
+        }
+        if let Some(v) = bottom {
+            el = el.bottom(px(v));
+        }
+        el.into_any_element()
+    }
+
+    vec![
+        // 四边:两端都让出角区宽度。**四边与四角互不重叠** —— 重叠时同一个
+        // 按下会先命中角区、再命中边条,后一次 start_window_resize 把对角
+        // 改成单边(鼠标图标是双向、按下去却只能单向,就是这个原因)。
+        grip(
+            "resize-left",
+            Some(EDGE),
+            None,
+            Some(0.0),
+            None,
+            Some(CORNER),
+            Some(CORNER),
+            ResizeEdge::Left,
+            CursorStyle::ResizeLeft,
+        ),
+        grip(
+            "resize-right",
+            Some(EDGE),
+            None,
+            None,
+            Some(0.0),
+            Some(CORNER),
+            Some(CORNER),
+            ResizeEdge::Right,
+            CursorStyle::ResizeRight,
+        ),
+        grip(
+            "resize-top",
+            None,
+            Some(EDGE),
+            Some(CORNER),
+            Some(CORNER),
+            Some(0.0),
+            None,
+            ResizeEdge::Top,
+            CursorStyle::ResizeUp,
+        ),
+        grip(
+            "resize-bottom",
+            None,
+            Some(EDGE),
+            Some(CORNER),
+            Some(CORNER),
+            None,
+            Some(0.0),
+            ResizeEdge::Bottom,
+            CursorStyle::ResizeDown,
+        ),
+        // 四角(比边条晚画 → 命中优先,拿到对角缩放)
+        grip(
+            "resize-top-left",
+            Some(CORNER),
+            Some(CORNER),
+            Some(0.0),
+            None,
+            Some(0.0),
+            None,
+            ResizeEdge::TopLeft,
+            CursorStyle::ResizeUpLeftDownRight,
+        ),
+        grip(
+            "resize-top-right",
+            Some(CORNER),
+            Some(CORNER),
+            None,
+            Some(0.0),
+            Some(0.0),
+            None,
+            ResizeEdge::TopRight,
+            CursorStyle::ResizeUpRightDownLeft,
+        ),
+        grip(
+            "resize-bottom-left",
+            Some(CORNER),
+            Some(CORNER),
+            Some(0.0),
+            None,
+            None,
+            Some(0.0),
+            ResizeEdge::BottomLeft,
+            CursorStyle::ResizeUpRightDownLeft,
+        ),
+        grip(
+            "resize-bottom-right",
+            Some(CORNER),
+            Some(CORNER),
+            None,
+            Some(0.0),
+            None,
+            Some(0.0),
+            ResizeEdge::BottomRight,
+            CursorStyle::ResizeUpLeftDownRight,
+        ),
+    ]
+}
+
 impl Render for App {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 每帧都跑一次 poll:状态/进度/曲库结果当帧更新,不再靠 250ms 心跳
@@ -3291,16 +3470,44 @@ impl Render for App {
         }
         // 窗口尺寸变化(放大/缩小)时强制重新测量列表,否则虚拟列表沿用旧的测量结果,
         // 设置页等宽内容不会重排。
+        // 「重置窗口大小」:按钮回调里拿不到 Window,统一在这里改。
+        // 先退出最大化(否则合成器不认新的尺寸),再设回默认大小;
+        // 实际尺寸由下面"记住窗口大小"那段落盘。
+        let resetting = std::mem::take(&mut self.reset_window_pending);
+        if resetting {
+            let (w, h) = window_default_size(cx);
+            if window.is_maximized() {
+                window.zoom_window();
+            }
+            window.resize(gpui::size(px(w), px(h)));
+            // 下一帧按窗口真实尺寸重新记,顺带让列表重新测量一遍。
+            self.last_size = (0.0, 0.0);
+            self.toast(format!(
+                "窗口大小已重置为 {}×{}",
+                w.round() as u32,
+                h.round() as u32
+            ));
+        }
         let vs = window.viewport_size();
         let size = (f32::from(vs.width), f32::from(vs.height));
         if size != self.last_size {
             self.last_size = size;
+            // 重新测量要 reset,但 reset 会把 logical_scroll_top 清成 None
+            // (= 滚回顶部),窗口一放大/缩小列表就跳回第一行。用
+            // reset_list_keep_scroll 保住当前位置。
             let n = self.settings_list.item_count();
-            self.settings_list.reset(n);
+            Self::reset_list_keep_scroll(&self.settings_list, n);
             let l = self.lib_list.item_count();
-            self.lib_list.reset(l);
+            Self::reset_list_keep_scroll(&self.lib_list, l);
             let q = self.queue_list.item_count();
-            self.queue_list.reset(q);
+            Self::reset_list_keep_scroll(&self.queue_list, q);
+            // 记住窗口大小:最大化时是屏幕尺寸、最小化时是 0,都不算用户
+            // 选的大小。拖拽缩放会连续变很多次,去抖后再写文件。
+            if !resetting && !window.is_maximized() && size.0 >= 320.0 && size.1 >= 240.0 {
+                self.settings.window_w = Some(size.0);
+                self.settings.window_h = Some(size.1);
+                self.queue_window_size_save(cx);
+            }
         }
         let titlebar = div()
             .id("custom-titlebar")
@@ -3563,6 +3770,14 @@ impl Render for App {
         }
         if self.star_popup {
             root = root.child(self.star_popup_modal(cx));
+        }
+        // 缩放边:放在最后(最上层) —— 菜单/弹窗都画在窗口内部,只有贴边的
+        // 几像素让给"拉窗口大小"。最大化时合成器本来就不让拉,跳过。
+        #[cfg(not(windows))]
+        if !window.is_maximized() {
+            for grip in window_resize_grips() {
+                root = root.child(grip);
+            }
         }
         root
     }
@@ -6108,6 +6323,10 @@ impl App {
                     // Windows 特有:桌面层次乱了 / 壁纸挂不上去时,重启 shell 重建
                     // Progman / DefView / WorkerW(任务栏会闪一下;壁纸进程自己重挂)。
                     .children(restart_explorer)
+                    .child(self.small_btn("重置窗口大小", cx, |this, _| {
+                        // 回调里没有 Window,标记一下交给下一帧 render 处理
+                        this.reset_window_pending = true;
+                    }))
                     .child(self.small_btn(
                         format!("清除全部个性设置 ({})", self.settings.set_overrides.len()),
                         cx,
@@ -8571,6 +8790,38 @@ fn single_instance() -> bool {
     }
 }
 
+/// 主窗口所在显示器的区域。Wayland 后端 primary_display() 恒为 None,
+/// 退回 displays() 里面积最大的那块;它的 bounds 是"物理尺寸 / 整数缩放"
+/// 口径,偏保守,拿它算出来的窗口不会比屏幕大。
+fn ui_screen_bounds(cx: &gpui::App) -> Option<gpui::Bounds<gpui::Pixels>> {
+    let display = cx.primary_display().or_else(|| {
+        // 屏幕上有多块时挑面积最大的那块;area 只在比较里用。
+        let area = |d: &std::rc::Rc<dyn gpui::PlatformDisplay>| {
+            let s = d.bounds().size;
+            f32::from(s.width) * f32::from(s.height)
+        };
+        cx.displays()
+            .into_iter()
+            .reduce(|a, b| if area(&b) > area(&a) { b } else { a })
+    });
+    display.map(|d| d.bounds())
+}
+
+/// 主窗口默认尺寸:1180×720,按显示器留 40px 边收缩,再夹在最小尺寸之上。
+fn clamp_window_size(w: f32, h: f32, screen_w: f32, screen_h: f32) -> (f32, f32) {
+    (
+        w.min(screen_w - 40.0).max(560.0),
+        h.min(screen_h - 40.0).max(400.0),
+    )
+}
+
+fn window_default_size(cx: &gpui::App) -> (f32, f32) {
+    let (sw, sh) = ui_screen_bounds(cx)
+        .map(|b| (f32::from(b.size.width), f32::from(b.size.height)))
+        .unwrap_or((1366.0, 768.0));
+    clamp_window_size(1180.0, 720.0, sw, sh)
+}
+
 pub fn run() {
     #[cfg(target_os = "linux")]
     if !single_instance() {
@@ -8579,14 +8830,43 @@ pub fn run() {
     // 开机自启的命令行带 --hidden:不弹出主窗口,只留托盘。
     let start_hidden = std::env::args().any(|a| a == "--hidden");
     Application::new().run(move |cx: &mut gpui::App| {
+        // 主窗口按「普通窗口」打开(不是最大化),尺寸用上次记下的、没有就用
+        // 默认 1180×720,再按显示器留边收缩 —— 以前直接以最大化启动
+        // (gpui:Maximized → zoom()),用户既不能拖边框改大小,看着也像
+        // "窗口被锁死"。屏幕小 / 高分屏同样不会被撑到屏幕外。
+        let saved = crate::settings::load_from(&data_dir());
+        let (screen_x, screen_y, screen_w, screen_h) = ui_screen_bounds(cx)
+            .map(|b| {
+                (
+                    f32::from(b.origin.x),
+                    f32::from(b.origin.y),
+                    f32::from(b.size.width),
+                    f32::from(b.size.height),
+                )
+            })
+            .unwrap_or((0.0, 0.0, 1366.0, 768.0));
+        let (default_w, default_h) = clamp_window_size(1180.0, 720.0, screen_w, screen_h);
+        let (win_w, win_h) = clamp_window_size(
+            saved.window_w.unwrap_or(default_w),
+            saved.window_h.unwrap_or(default_h),
+            screen_w,
+            screen_h,
+        );
         let options = WindowOptions {
-            // 用最大化:窗口尺寸随屏幕,不会再出现窗口比屏幕大/跑出屏幕
-            window_bounds: Some(gpui::WindowBounds::Maximized(gpui::Bounds {
-                origin: gpui::point(px(40.), px(40.)),
-                size: gpui::size(px(1100.), px(640.)),
+            window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
+                origin: gpui::point(
+                    px(screen_x + ((screen_w - win_w) / 2.0).max(0.0)),
+                    px(screen_y + ((screen_h - win_h) / 2.0).max(0.0)),
+                ),
+                size: gpui::size(px(win_w), px(win_h)),
             })),
             titlebar: None,
             window_decorations: Some(gpui::WindowDecorations::Client),
+            // 拖到多小都不至于把布局挤散(小屏幕上跟着初始尺寸一起收)
+            window_min_size: Some(gpui::size(
+                px(win_w.min(860.0)),
+                px(win_h.min(560.0)),
+            )),
             // Wayland 托盘恢复窗口需要用 app_id 申请激活令牌。
             app_id: Some("com.ohdmire.aria".into()),
             show: !start_hidden,
@@ -8597,7 +8877,7 @@ pub fn run() {
         // 调试窗口模式画面在独立窗口里,不占用桌面壁纸。
         #[cfg(target_os = "linux")]
         {
-            if crate::settings::load_from(&data_dir()).debug_window {
+            if saved.debug_window {
                 if let Err(e) = crate::kde::restore_wallpaper() {
                     log::warn!("[kde] 还原桌面壁纸失败: {e}");
                 }
@@ -8709,7 +8989,10 @@ pub fn run() {
                     });
                 });
             }
-            cx.on_action(move |_: &crate::tray::QuitApp, _cx: &mut gpui::App| {
+            let quit_view = weak.clone();
+            cx.on_action(move |_: &crate::tray::QuitApp, cx: &mut gpui::App| {
+                // 退出前把窗口尺寸等最后一次改动落盘
+                let _ = quit_view.update(cx, |this, _| this.persist());
                 #[cfg(target_os = "linux")]
                 let _ = crate::kde::restore_wallpaper();
                 std::process::exit(0);
