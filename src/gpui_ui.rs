@@ -3192,10 +3192,25 @@ impl Render for App {
             .items_center()
             .bg(rgb(pal().panel))
             .text_color(rgb(pal().text))
-            .on_mouse_down(gpui::MouseButton::Left, |_event, window, _cx| {
-                window.start_window_move();
-            })
-            .child(div().flex_1().px_3().text_sm().child("Aria"))
+            .child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .text_sm()
+                    .on_mouse_down(gpui::MouseButton::Left, |event, window, _cx| {
+                        if event.click_count >= 2 {
+                            // GPUI 的 titlebar_double_click 在 Windows/Linux 后端是空实现;
+                            // 客户端装饰必须自己切换最大化状态。
+                            window.zoom_window();
+                        } else {
+                            window.start_window_move();
+                        }
+                    })
+                    .child("Aria"),
+            )
             .child(
                 div()
                     .flex_none()
@@ -3239,7 +3254,21 @@ impl Render for App {
                             .cursor_pointer()
                             .hover(|this| this.bg(rgb(0xc42b3c)).text_color(rgb(0xffffff)))
                             .child("×")
-                            .on_click(|_, window, _| window.remove_window()),
+                            .on_click(cx.listener(|this, _event, window, cx| {
+                                if CLOSE_TO_TRAY.load(std::sync::atomic::Ordering::Relaxed) {
+                                    // 标题栏按钮直接操作当前窗口，和普通最小化按钮保持同一事件路径。
+                                    window.minimize_window();
+                                } else if CLOSE_TO_EXIT.load(std::sync::atomic::Ordering::Relaxed) {
+                                    #[cfg(target_os = "linux")]
+                                    let _ = crate::kde::restore_wallpaper();
+                                    this.persist();
+                                    std::process::exit(0);
+                                } else {
+                                    this.close_ask = true;
+                                    this.close_remember = false;
+                                    cx.notify();
+                                }
+                            })),
                     ),
             );
 
@@ -8427,6 +8456,8 @@ pub fn run() {
             })),
             titlebar: None,
             window_decorations: Some(gpui::WindowDecorations::Client),
+            // Wayland 托盘恢复窗口需要用 app_id 申请激活令牌。
+            app_id: Some("com.ohdmire.aria".into()),
             ..Default::default()
         };
         // KDE 壁纸插件:装包 + 切到 Aria(退出/关窗时还原)。
@@ -8475,6 +8506,8 @@ pub fn run() {
                 } else {
                     // 询问:交给主线程弹确认框
                     CLOSE_ASK.store(true, std::sync::atomic::Ordering::Relaxed);
+                    // 关闭请求本身不会自动安排重绘，否则询问框只能等到下一次心跳。
+                    window.refresh();
                     false
                 }
             });
