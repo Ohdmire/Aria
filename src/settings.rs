@@ -204,8 +204,8 @@ pub struct Settings {
     /// 强调色:blue(默认)/ purple / green / pink / orange。
     #[serde(default = "default_accent")]
     pub accent: String,
-    /// 关闭主窗口的行为:None = 每次询问;"tray" = 最小化到托盘;
-    /// "exit" = 退出程序。
+    /// 关闭主窗口的行为:None = 每次询问;"min" = 最小化到任务栏;
+    /// "tray" = 收到托盘;"exit" = 退出程序。
     #[serde(default)]
     pub close_action: Option<String>,
     /// 日志记录开关:开 = 本进程与壁纸子进程的运行日志写入数据目录

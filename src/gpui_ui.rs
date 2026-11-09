@@ -81,10 +81,11 @@ impl raw_window_handle::HasDisplayHandle for RawParent {
     }
 }
 
-/// 关闭主窗口时是否最小化到托盘(由 settings.close_action 同步)。
+/// 关闭主窗口的行为(由 settings.close_action 同步)。
+static CLOSE_TO_MIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CLOSE_TO_TRAY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CLOSE_TO_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static CLOSE_ASK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 
 static PICKED: Mutex<Vec<(Field, PathBuf)>> = Mutex::new(Vec::new());
 static SHOW_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -92,8 +93,65 @@ static REPLACE_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 
 /// 策略:询问 / 最小化 / 退出。
 fn sync_close_mode(s: &crate::settings::Settings) {
+    CLOSE_TO_MIN.store(s.close_action.as_deref() == Some("min"), std::sync::atomic::Ordering::Relaxed);
     CLOSE_TO_TRAY.store(s.close_action.as_deref() == Some("tray"), std::sync::atomic::Ordering::Relaxed);
     CLOSE_TO_EXIT.store(s.close_action.as_deref() == Some("exit"), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 关闭按钮。询问直接改界面状态,不丢给轮询。
+/// 窗口最小化/隐藏,或刚从那种状态回来时,不弹询问。
+fn on_should_close(window: &mut gpui::Window, cx: &mut gpui::App, view: &gpui::Entity<App>) -> bool {
+    if CLOSE_TO_TRAY.load(std::sync::atomic::Ordering::Relaxed) {
+        #[cfg(windows)]
+        {
+            crate::win::block_ask();
+            crate::win::hide_window(MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        #[cfg(not(windows))]
+        window.minimize_window();
+        let _ = view.update(cx, |this, cx| {
+            this.close_ask = false;
+            this.release_ui_caches();
+            cx.notify();
+        });
+        return false;
+    }
+    if CLOSE_TO_MIN.load(std::sync::atomic::Ordering::Relaxed) {
+        #[cfg(windows)]
+        crate::win::block_ask();
+        let _ = view.update(cx, |this, cx| {
+            this.close_ask = false;
+            cx.notify();
+        });
+        window.minimize_window();
+        return false;
+    }
+    if CLOSE_TO_EXIT.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    // 只有关闭按钮按下(或 Alt+F4)才弹。显示窗口时补来的 WM_CLOSE 没有这个状态。
+    #[cfg(windows)]
+    let open_ask = crate::win::take_close_intent()
+        && crate::win::main_window_shown(MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed));
+    #[cfg(not(windows))]
+    let open_ask = true;
+    if !open_ask {
+        #[cfg(windows)]
+        crate::win::block_ask();
+        let _ = view.update(cx, |this, cx| {
+            this.close_ask = false;
+            cx.notify();
+        });
+        return false;
+    }
+    #[cfg(windows)]
+    crate::win::set_ask_open(true);
+    let _ = view.update(cx, |this, cx| {
+        this.close_ask = true;
+        this.close_remember = false;
+        cx.notify();
+    });
+    false
 }
 
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2226,7 +2284,8 @@ impl App {
             }
             "close_action" => {
                 self.settings.close_action = match self.settings.close_action.as_deref() {
-                    None => Some("tray".into()),
+                    None => Some("min".into()),
+                    Some("min") => Some("tray".into()),
                     Some("tray") => Some("exit".into()),
                     _ => None,
                 };
@@ -2683,6 +2742,9 @@ impl App {
     }
 
     fn minimize_window(&mut self, cx: &mut Context<Self>) {
+        self.close_ask = false;
+        #[cfg(windows)]
+        crate::win::block_ask();
         let handle = WINDOW.lock().ok().and_then(|g| *g);
         if let Some(handle) = handle {
             cx.defer(move |cx: &mut gpui::App| {
@@ -2691,8 +2753,51 @@ impl App {
         }
     }
 
+    /// 收到托盘:藏窗口,任务栏不再留按钮。标题栏最小化不走这里。
+    /// 先让下一帧把询问框画掉并交出去,再藏。否则还原时会闪出藏起来前的那一帧。
+    fn hide_to_tray(&mut self, cx: &mut Context<Self>) {
+        self.close_ask = false;
+        self.release_ui_caches();
+        #[cfg(windows)]
+        {
+            crate::win::block_ask();
+            let handle = WINDOW.lock().ok().and_then(|g| *g);
+            if let Some(handle) = handle {
+                cx.notify();
+                cx.defer(move |cx: &mut gpui::App| {
+                    let _ = handle.update(cx, |_, window, _| {
+                        window.on_next_frame(|window, _| {
+                            // 这一帧会先把询问框画掉并 present。藏窗口放到再下一帧开头。
+                            window.on_next_frame(|_, _| {
+                                crate::win::hide_window(
+                                    MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed),
+                                );
+                            });
+                        });
+                    });
+                });
+            } else {
+                crate::win::hide_window(MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed));
+            }
+        }
+        #[cfg(not(windows))]
+        self.minimize_window(cx);
+    }
+
+    /// 放掉界面上的解码封面。曲库索引留下,否则托盘切歌和再打开窗口都要重读 realm。
+    fn release_ui_caches(&mut self) {
+        self.thumbs.lock().unwrap().clear();
+        self.thumb_order.lock().unwrap().clear();
+        self.hero.clear();
+        self.hero_order.clear();
+        #[cfg(windows)]
+        crate::win::trim_working_set();
+    }
+
     /// 延后一帧激活窗口:不能在 update 内部再 update 同一个 App(会 panic)。
     fn activate_window(&mut self, cx: &mut Context<Self>) {
+        #[cfg(windows)]
+        crate::win::show_window(MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed));
         let handle = WINDOW.lock().ok().and_then(|g| *g);
         if let Some(handle) = handle {
             cx.defer(move |cx: &mut gpui::App| {
@@ -2735,11 +2840,6 @@ impl App {
         if self.dragging.is_some() && !cx.has_active_drag() {
             self.dragging = None;
             self.drag_over = None;
-            dirty = true;
-        }
-        if CLOSE_ASK.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            self.close_ask = true;
-            self.close_remember = false;
             dirty = true;
         }
         if REPLACE_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
@@ -3327,6 +3427,11 @@ impl Render for App {
         }
         if self.reset_confirm {
             root = root.child(self.reset_modal(cx));
+        }
+        #[cfg(windows)]
+        {
+            // 最小化/隐藏时窗口过程会把询问清掉。这里跟那个状态,避免还原后再画一帧。
+            self.close_ask = crate::win::ask_open();
         }
         if self.close_ask {
             root = root.child(self.close_ask_modal(cx));
@@ -4863,16 +4968,6 @@ impl App {
             }
             (bid, sid)
         };
-        // 谱面集状态(ranked / loved / …):信息卡也显示一枚
-        let set_status = set_id
-            .as_ref()
-            .and_then(|id| {
-                self.lib.as_ref().and_then(|l| {
-                    self.set_idx.get(id.as_str()).and_then(|i| l.sets.get(*i))
-                })
-            })
-            .map(|s| s.status)
-            .unwrap_or(-3);
 
         div()
             .id("info-card")
@@ -4973,7 +5068,6 @@ impl App {
                             }))
                     })
                     .child(star_badge(diff_star))
-                    .child(status_badge(set_status))
                     .child(div().flex_1())
                     .child(self.small_btn("个性设置…", cx, |this, _| this.open_overrides())),
             )
@@ -5844,6 +5938,7 @@ impl App {
                 s.close_action.clone().unwrap_or_default(),
                 vec![
                     ("".into(), "询问".into()),
+                    ("min".into(), "最小化".into()),
                     ("tray".into(), "最小化到托盘".into()),
                     ("exit".into(), "退出".into()),
                 ],
@@ -7567,7 +7662,7 @@ impl App {
                         div()
                             .text_sm()
                             .text_color(rgb(pal().dim))
-                            .child("最小化到托盘可继续在后台播放;退出会还原桌面壁纸。"),
+                            .child("最小化到托盘会收起窗口并放掉封面缓存,后台继续播放。退出会还原桌面壁纸。"),
                     )
                     .child(
                         div()
@@ -7600,7 +7695,11 @@ impl App {
                             .justify_end()
                             .gap_2()
                             .pt_2()
-                            .child(self.small_btn("取消", cx, |this, _| this.close_ask = false))
+                            .child(self.small_btn("取消", cx, |this, _| {
+                                this.close_ask = false;
+                                #[cfg(windows)]
+                                crate::win::set_ask_open(false);
+                            }))
                             .child(self.small_btn("最小化到托盘", cx, |this, cx| {
                                 if this.close_remember {
                                     this.settings.close_action = Some("tray".to_string());
@@ -7608,7 +7707,7 @@ impl App {
                                     this.persist();
                                 }
                                 this.close_ask = false;
-                                this.minimize_window(cx);
+                                this.hide_to_tray(cx);
                             }))
                             .child(self.danger_btn("退出", cx, |this, _| {
                                 if this.close_remember {
@@ -8409,28 +8508,22 @@ pub fn run() {
         .detach();
         let mut view_slot: Option<gpui::Entity<App>> = None;
         if let Ok(handle) = cx.open_window(options, |window, cx| {
-            window.on_window_should_close(cx, |window, _cx| {
-                if CLOSE_TO_TRAY.load(std::sync::atomic::Ordering::Relaxed) {
-                    window.minimize_window();
-                    false
-                } else if CLOSE_TO_EXIT.load(std::sync::atomic::Ordering::Relaxed) {
-                    true
-                } else {
-                    // 询问:交给主线程弹确认框
-                    CLOSE_ASK.store(true, std::sync::atomic::Ordering::Relaxed);
-                    false
-                }
-            });
             // 记下主窗口 HWND:原生文件对话框拿它当 owner(否则可能弹在窗口后面)
             #[cfg(windows)]
             {
                 if let Ok(h) = raw_window_handle::HasWindowHandle::window_handle(&*window) {
                     if let raw_window_handle::RawWindowHandle::Win32(w32) = h.as_raw() {
-                        MAIN_HWND.store(w32.hwnd.get(), std::sync::atomic::Ordering::Relaxed);
+                        let raw = w32.hwnd.get();
+                        MAIN_HWND.store(raw, std::sync::atomic::Ordering::Relaxed);
+                        crate::win::watch_ask(raw);
                     }
                 }
             }
             let view = cx.new(App::new);
+            let close_view = view.clone();
+            window.on_window_should_close(cx, move |window, cx| {
+                on_should_close(window, cx, &close_view)
+            });
             view_slot = Some(view.clone());
             view
         }) {

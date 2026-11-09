@@ -37,11 +37,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, EnumWindows, FindWindowExW,
     FindWindowW, GA_PARENT, GWLP_HWNDPARENT, GWL_EXSTYLE, GWL_STYLE, RegisterClassExW, WNDCLASSEXW,
     WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
-    GetAncestor,
+    CallWindowProcW, GetAncestor,
     GetDesktopWindow, GetParent,
-    GetClientRect, GetWindowLongPtrW, GetWindowThreadProcessId, HWND_BOTTOM, IsIconic, IsWindow,
-    IsWindowVisible, LWA_ALPHA, MONITORINFOF_PRIMARY, SMTO_NORMAL, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE, SendMessageTimeoutW,
+    GetClientRect, GetWindowLongPtrW, GetWindowThreadProcessId, GWLP_WNDPROC, HWND_BOTTOM, IsIconic, IsWindow,
+    IsWindowVisible, LWA_ALPHA, MONITORINFOF_PRIMARY, SIZE_MINIMIZED, SMTO_NORMAL, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW,
+    SW_SHOWNOACTIVATE, SendMessageTimeoutW, WM_NCLBUTTONDOWN, WM_SHOWWINDOW, WM_SIZE,
+    WM_SYSCOMMAND, HTCLOSE, SC_CLOSE,
     SetLayeredWindowAttributes, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow, WS_CAPTION,
     WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
@@ -861,6 +863,100 @@ pub fn reattach(child: HWND, bounds: Option<MonitorBounds>) -> WallpaperHost {
 pub fn show_no_activate(hwnd: HWND) {
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+}
+
+/// 收到托盘:藏窗口,任务栏按钮一起消失。和最小化不是一回事。
+pub fn hide_window(raw: isize) {
+    let Some(hwnd) = hwnd_from(raw) else { return };
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+}
+
+/// 从托盘唤回。最小化过的先还原,只是藏起来的按原大小显示。
+pub fn show_window(raw: isize) {
+    let Some(hwnd) = hwnd_from(raw) else { return };
+    unsafe {
+        let cmd = if IsIconic(hwnd).as_bool() { SW_RESTORE } else { SW_SHOW };
+        let _ = ShowWindow(hwnd, cmd);
+    }
+}
+
+fn hwnd_from(raw: isize) -> Option<HWND> {
+    if raw == 0 {
+        None
+    } else {
+        Some(HWND(raw as *mut core::ffi::c_void))
+    }
+}
+
+/// 关闭询问是否该显示。最小化/隐藏时清掉,重新显示不补弹。
+static ASK_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 只有用户真正点了关闭(或 Alt+F4)才置位。显示窗口时系统补来的 WM_CLOSE 没有这一位。
+static CLOSE_INTENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn ask_open() -> bool {
+    ASK_OPEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_ask_open(on: bool) {
+    ASK_OPEN.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn block_ask() {
+    ASK_OPEN.store(false, std::sync::atomic::Ordering::Relaxed);
+    CLOSE_INTENT.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn arm_close() {
+    CLOSE_INTENT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn take_close_intent() -> bool {
+    CLOSE_INTENT.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn main_window_shown(raw: isize) -> bool {
+    let Some(hwnd) = hwnd_from(raw) else { return false };
+    unsafe { IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() }
+}
+
+static OLD_WNDPROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// 包一层窗口过程:最小化/隐藏时封锁询问,窗口里有真正的鼠标或键盘输入后再放开。
+pub fn watch_ask(raw: isize) {
+    let Some(hwnd) = hwnd_from(raw) else { return };
+    unsafe {
+        if OLD_WNDPROC.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            return;
+        }
+        let old = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, ask_wndproc as isize);
+        if old != 0 {
+            OLD_WNDPROC.store(old, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+unsafe extern "system" fn ask_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let _ = hwnd;
+    match msg {
+        WM_SIZE if wparam.0 == SIZE_MINIMIZED as usize => block_ask(),
+        WM_SHOWWINDOW if wparam.0 == 0 => block_ask(),
+        WM_NCLBUTTONDOWN if wparam.0 == HTCLOSE as usize => arm_close(),
+        // 低 4 位是按键/菜单来源,关掉再比。
+        WM_SYSCOMMAND if wparam.0 & 0xFFF0 == SC_CLOSE as usize => arm_close(),
+        _ => {}
+    }
+    let old = OLD_WNDPROC.load(std::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        CallWindowProcW(
+            std::mem::transmute(old),
+            hwnd,
+            msg,
+            wparam,
+            lparam,
+        )
     }
 }
 
