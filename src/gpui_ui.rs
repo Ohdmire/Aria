@@ -3292,25 +3292,28 @@ impl Render for App {
             .items_center()
             .bg(rgb(pal().panel))
             .text_color(rgb(pal().text))
-            .child(
-                div()
+            .child({
+                // Windows 把这块标成标题栏后,拖动和双击最大化由系统完成。
+                // 自己在鼠标回调里发 WM_NCLBUTTONDOWN 会重入窗口过程并闪退。
+                let drag = div()
                     .flex_1()
                     .h_full()
                     .flex()
                     .items_center()
                     .px_3()
                     .text_sm()
-                    .on_mouse_down(gpui::MouseButton::Left, |event, window, _cx| {
-                        if event.click_count >= 2 {
-                            // GPUI 的 titlebar_double_click 在 Windows/Linux 后端是空实现;
-                            // 客户端装饰必须自己切换最大化状态。
-                            window.zoom_window();
-                        } else {
-                            window.start_window_move();
-                        }
-                    })
-                    .child("Aria"),
-            )
+                    .window_control_area(gpui::WindowControlArea::Drag)
+                    .child("Aria");
+                #[cfg(not(windows))]
+                let drag = drag.on_mouse_down(gpui::MouseButton::Left, |event, window, _cx| {
+                    if event.click_count >= 2 {
+                        window.zoom_window();
+                    } else {
+                        window.start_window_move();
+                    }
+                });
+                drag
+            })
             .child(
                 div()
                     .flex_none()
@@ -3338,10 +3341,13 @@ impl Render for App {
                             .h_full()
                             .items_center()
                             .justify_center()
+                            .window_control_area(gpui::WindowControlArea::Max)
                             .cursor_pointer()
                             .hover(|this| this.bg(rgb(pal().ctl)))
                             .child(if window.is_maximized() { "❐" } else { "□" })
-                            .on_click(|_, window, _| window.zoom_window()),
+                            .when(cfg!(not(windows)), |this| {
+                                this.on_click(|_, window, _| window.zoom_window())
+                            }),
                     )
                     .child(
                         div()
@@ -3360,6 +3366,8 @@ impl Render for App {
                                     this.hide_to_tray(cx);
                                     #[cfg(not(windows))]
                                     window.minimize_window();
+                                } else if CLOSE_TO_MIN.load(std::sync::atomic::Ordering::Relaxed) {
+                                    window.minimize_window();
                                 } else if CLOSE_TO_EXIT.load(std::sync::atomic::Ordering::Relaxed) {
                                     #[cfg(target_os = "linux")]
                                     let _ = crate::kde::restore_wallpaper();
@@ -3368,6 +3376,8 @@ impl Render for App {
                                 } else {
                                     this.close_ask = true;
                                     this.close_remember = false;
+                                    #[cfg(windows)]
+                                    crate::win::set_ask_open(true);
                                     cx.notify();
                                 }
                             })),
