@@ -108,7 +108,7 @@ fn on_should_close(window: &mut gpui::Window, cx: &mut gpui::App, view: &gpui::E
             crate::win::hide_window(MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed));
         }
         #[cfg(not(windows))]
-        let _ = window;
+        window.minimize_window();
         let _ = view.update(cx, |this, cx| {
             this.close_ask = false;
             this.release_ui_caches();
@@ -2781,9 +2781,7 @@ impl App {
             }
         }
         #[cfg(not(windows))]
-        {
-            let _ = cx;
-        }
+        self.minimize_window(cx);
     }
 
     /// 放掉界面上的解码封面。曲库索引留下,否则托盘切歌和再打开窗口都要重读 realm。
@@ -3361,7 +3359,7 @@ impl Render for App {
                                     #[cfg(windows)]
                                     this.hide_to_tray(cx);
                                     #[cfg(not(windows))]
-                                    let _ = window;
+                                    window.minimize_window();
                                 } else if CLOSE_TO_EXIT.load(std::sync::atomic::Ordering::Relaxed) {
                                     #[cfg(target_os = "linux")]
                                     let _ = crate::kde::restore_wallpaper();
