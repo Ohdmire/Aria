@@ -108,7 +108,7 @@ fn on_should_close(window: &mut gpui::Window, cx: &mut gpui::App, view: &gpui::E
             crate::win::hide_window(MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed));
         }
         #[cfg(not(windows))]
-        window.minimize_window();
+        let _ = window;
         let _ = view.update(cx, |this, cx| {
             this.close_ask = false;
             this.release_ui_caches();
@@ -2781,7 +2781,9 @@ impl App {
             }
         }
         #[cfg(not(windows))]
-        self.minimize_window(cx);
+        {
+            let _ = cx;
+        }
     }
 
     /// 放掉界面上的解码封面。曲库索引留下,否则托盘切歌和再打开窗口都要重读 realm。
@@ -3284,6 +3286,96 @@ impl Render for App {
             let q = self.queue_list.item_count();
             self.queue_list.reset(q);
         }
+        let titlebar = div()
+            .id("custom-titlebar")
+            .flex_none()
+            .flex()
+            .h(px(34.0))
+            .items_center()
+            .bg(rgb(pal().panel))
+            .text_color(rgb(pal().text))
+            .child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .text_sm()
+                    .on_mouse_down(gpui::MouseButton::Left, |event, window, _cx| {
+                        if event.click_count >= 2 {
+                            // GPUI 的 titlebar_double_click 在 Windows/Linux 后端是空实现;
+                            // 客户端装饰必须自己切换最大化状态。
+                            window.zoom_window();
+                        } else {
+                            window.start_window_move();
+                        }
+                    })
+                    .child("Aria"),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .h_full()
+                    .items_center()
+                    .child(
+                        div()
+                            .id("minimize-window")
+                            .flex()
+                            .w(px(46.0))
+                            .h_full()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|this| this.bg(rgb(pal().ctl)))
+                            .child("-")
+                            .on_click(|_, window, _| window.minimize_window()),
+                    )
+                    .child(
+                        div()
+                            .id("zoom-window")
+                            .flex()
+                            .w(px(46.0))
+                            .h_full()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|this| this.bg(rgb(pal().ctl)))
+                            .child(if window.is_maximized() { "❐" } else { "□" })
+                            .on_click(|_, window, _| window.zoom_window()),
+                    )
+                    .child(
+                        div()
+                            .id("close-window")
+                            .flex()
+                            .w(px(46.0))
+                            .h_full()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|this| this.bg(rgb(0xc42b3c)).text_color(rgb(0xffffff)))
+                            .child("×")
+                            .on_click(cx.listener(|this, _event, window, cx| {
+                                if CLOSE_TO_TRAY.load(std::sync::atomic::Ordering::Relaxed) {
+                                    #[cfg(windows)]
+                                    this.hide_to_tray(cx);
+                                    #[cfg(not(windows))]
+                                    let _ = window;
+                                } else if CLOSE_TO_EXIT.load(std::sync::atomic::Ordering::Relaxed) {
+                                    #[cfg(target_os = "linux")]
+                                    let _ = crate::kde::restore_wallpaper();
+                                    this.persist();
+                                    std::process::exit(0);
+                                } else {
+                                    this.close_ask = true;
+                                    this.close_remember = false;
+                                    cx.notify();
+                                }
+                            })),
+                    ),
+            );
+
         let header = div()
             .flex_none()
             .flex()
@@ -3397,6 +3489,7 @@ impl Render for App {
             .flex_col()
             .bg(rgb(pal().bg))
             .text_color(rgb(pal().text))
+            .child(titlebar)
             .child(header)
             .child(body)
             .child(bar);
@@ -5631,6 +5724,21 @@ impl App {
         let mut skins = vec![("".to_string(), "内置 Argon".to_string())];
         skins.extend(self.skins.iter().filter_map(|(label, v)| v.clone().map(|v| (v, label.clone()))));
 
+        #[cfg(windows)]
+        let restart_explorer = Some(
+            self.small_btn("重启资源管理器", cx, |this, _| {
+                std::thread::spawn(|| {
+                    if let Err(e) = crate::win::restart_explorer() {
+                        log::warn!("[shell] 重启资源管理器失败: {e}");
+                    }
+                });
+                this.toast("正在重启资源管理器…");
+            })
+            .into_any_element(),
+        );
+        #[cfg(not(windows))]
+        let restart_explorer: Option<gpui::AnyElement> = None;
+
         div()
             .relative()
             .size_full()
@@ -5973,23 +6081,7 @@ impl App {
                     .child(self.small_btn("重启壁纸进程", cx, |this, _| this.restart_child()))
                     // Windows 特有:桌面层次乱了 / 壁纸挂不上去时,重启 shell 重建
                     // Progman / DefView / WorkerW(任务栏会闪一下;壁纸进程自己重挂)。
-                    .children({
-                        #[cfg(windows)]
-                        {
-                            Some(self.small_btn("重启资源管理器", cx, |this, _| {
-                                std::thread::spawn(|| {
-                                    if let Err(e) = crate::win::restart_explorer() {
-                                        log::warn!("[shell] 重启资源管理器失败: {e}");
-                                    }
-                                });
-                                this.toast("正在重启资源管理器…");
-                            }))
-                        }
-                        #[cfg(not(windows))]
-                        {
-                            None
-                        }
-                    })
+                    .children(restart_explorer)
                     .child(self.small_btn(
                         format!("清除全部个性设置 ({})", self.settings.set_overrides.len()),
                         cx,
@@ -8465,10 +8557,10 @@ pub fn run() {
                 origin: gpui::point(px(40.), px(40.)),
                 size: gpui::size(px(1100.), px(640.)),
             })),
-            titlebar: Some(gpui::TitlebarOptions {
-                title: Some("Aria".into()),
-                ..Default::default()
-            }),
+            titlebar: None,
+            window_decorations: Some(gpui::WindowDecorations::Client),
+            // Wayland 托盘恢复窗口需要用 app_id 申请激活令牌。
+            app_id: Some("com.ohdmire.aria".into()),
             ..Default::default()
         };
         // KDE 壁纸插件:装包 + 切到 Aria(退出/关窗时还原)。
