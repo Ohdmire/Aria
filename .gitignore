@@ -18,3 +18,6 @@ packaging/arch/*.tar.zst
 packaging/arch/*.pkg.tar.zst
 packaging/arch/src/
 packaging/arch/pkg/
+
+# Windows 安装包产物(packaging/windows/build-installer.ps1 生成)
+/dist

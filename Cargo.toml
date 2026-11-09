@@ -1,13 +1,15 @@
 [package]
 name = "aria"
-version = "1.4.0"
+version = "1.4.1"
 edition = "2024"
 license = "MIT"
 description = "Aria(ATRI rhythm interactive animation)—— osu! storyboard 桌面动态壁纸播放器"
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
 cc = "1"
+# 把 icons/icon.ico 编进 Windows exe(任务栏 / Alt-Tab 图标;GPUI 取资源 id 1)
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
 
 [dependencies]
 osu_replay_render = { git = "https://github.com/Ohdmire/osu-replay-render.git", branch = "master" }
@@ -32,12 +34,16 @@ realm-db-reader = { git = "https://github.com/Ohdmire/realm-db-reader", branch =
 # osu!stable osu!.db / collection.db 只读解析
 osu-db = "0.2.1"
 
-tauri = { version = "2", features = ["tray-icon"] }
-tauri-plugin-dialog = "2"
 base64 = "0.23"
-tauri-plugin-single-instance = "2.4.4"
+# 封面缩略图(GPUI 的 img() 按原图解码,直接喂 1080p 封面会 OOM)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # ---------- Windows:桌面挂接 + WASAPI 设备事件 ----------
+# 前端:GPUI(原 Tauri 已移除)
+gpui = "0.2.2"
+# 系统托盘:Windows/macOS/Linux 统一实现(菜单就是 gpui::MenuItem + Action)
+gpui-tray = "0.3"
+
 [target.'cfg(windows)'.dependencies]
 winit = "0.30"
 # 设备热拔插事件(IMMNotificationClient 封装):默认设备切换/加入/移除,
@@ -54,6 +60,9 @@ windows = { version = "0.62", features = [
     "Win32_System_Com",
 ] }
 winreg = "0.56"
+# 原生文件/目录选择:IFileDialog(走 COM,不需要 GTK);common-controls-v6 让
+# 对话框跟随系统视觉样式。Linux 侧仍走 XDG portal(见下面的 linux 段)。
+rfd = { version = "0.16", default-features = false, features = ["common-controls-v6"] }
 
 # ---------- Linux/Wayland:layer-shell 壁纸层 + 调试窗口 ----------
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -73,8 +82,8 @@ calloop = "0.14"
 calloop-wayland-source = "0.4"
 # KDE 壁纸插件桥:POSIX 共享内存(shm_open/mmap)
 libc = "0.2"
-# 让 WebKitGTK 的原生控件(<select> 弹出列表等)跟随应用内明暗主题
-gtk = "0.18"
+# 原生文件选择(走 XDG portal,不引入 GTK2 循环冲突)
+rfd = "0.16"
 # SIGTERM/SIGINT 时还原桌面壁纸(否则被 kill 后桌面停在最后一帧)
 signal-hook = "0.3"
 # dmabuf 零拷贝输出(Vulkan external memory)
@@ -82,6 +91,11 @@ ash = "0.38"
 # 与 wgpu 同版本的 wgpu-types:hal 纹理描述里的 TextureUses
 wgpu-types = "25"
 
+
+# gpui 依赖的 xattr 0.2.3 引用了 libc::ENOATTR,新版 libc 在 Linux 上删了
+# 这个常量,本地打补丁(见 vendor/xattr)。
+[patch.crates-io]
+xattr = { path = "vendor/xattr" }
 
 [profile.dev]
 opt-level = 1

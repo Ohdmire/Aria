@@ -49,6 +49,9 @@ pub struct Settings {
     #[serde(default)]
     pub loop_playback: bool,
     pub autostart: bool,
+    /// 启动后自动播放上次的曲目(默认开)。
+    #[serde(default = "default_true")]
+    pub play_on_start: bool,
     /// 曲库源:"lazer" / "stable"。
     #[serde(default = "default_source")]
     pub source: String,
@@ -125,8 +128,8 @@ pub struct Settings {
     pub cursor_ripples: bool,
     /// 隐藏游玩画面模式:只渲染背景 + storyboard(隐藏 note/光标等;音频照常)。
     pub gameplay_hidden: bool,
-    /// 渲染模式:"always"(始终渲染)/ "autopause"(全屏/最大化遮挡时不渲染
-    /// 画面,默认)/ "off"(播放器模式:不渲染,只播音乐 + 音效)。
+    /// 渲染模式:"always"(始终渲染,默认)/ "autopause"(全屏/最大化遮挡时
+    /// 不渲染画面)/ "off"(播放器模式:不渲染,只播音乐 + 音效)。
     #[serde(default = "default_render_mode")]
     pub render_mode: String,
     /// 手动指定的 ffmpeg 完整路径(视频层解码;None = PATH 查找)。
@@ -173,16 +176,36 @@ pub struct Settings {
     /// 点播难度目标星数(None = 播最难;Some(x) = 播最接近 x 星的难度)。
     #[serde(default)]
     pub target_star: Option<f64>,
+    /// 最近一次使用的「自定义星级」目标值:全局记住,所有"自定义星级"
+    /// 入口都读它(缺字段时回退 target_star / quick_star / 5.0)。
+    #[serde(default)]
+    pub custom_star: Option<f64>,
     /// 曲库全局星级下限(0 = 不过滤;例如 6 = 只显示含 6★+ 谱面的谱面集)。
     #[serde(default)]
     pub star_min: f64,
+    /// 曲库全局星级上限(0 = 不设上限,与 star_min 组成区间过滤)。
+    /// 用 Option 区分"老存档没有这个字段"(None)和"明确设成不过滤"(Some(0))。
+    #[serde(default)]
+    pub star_max: Option<f64>,
+    /// 曲库"只看带 storyboard/视频"筛选(默认关 = 不过滤)。
+    #[serde(default)]
+    pub sb_only: bool,
     /// 上次曲库播放的谱面集/难度(启动恢复优先于手动 path)。
     #[serde(default)]
     pub lazer_set: Option<String>,
     #[serde(default)]
     pub lazer_sha2: Option<String>,
-    /// 关闭主窗口的行为:None = 每次询问;"tray" = 最小化到托盘;
-    /// "exit" = 退出程序。
+    /// 上次播放难度的显示名:曲库还没加载完的那几秒,播放条用它而不是 sha2。
+    #[serde(default)]
+    pub lazer_diff: Option<String>,
+    /// 界面主题:"dark"(默认)/ "light"。
+    #[serde(default = "default_theme")]
+    pub theme_mode: String,
+    /// 强调色:blue(默认)/ purple / green / pink / orange。
+    #[serde(default = "default_accent")]
+    pub accent: String,
+    /// 关闭主窗口的行为:None = 每次询问;"min" = 最小化到任务栏;
+    /// "tray" = 收到托盘;"exit" = 退出程序。
     #[serde(default)]
     pub close_action: Option<String>,
     /// 日志记录开关:开 = 本进程与壁纸子进程的运行日志写入数据目录
@@ -199,6 +222,12 @@ pub struct Settings {
     /// 快速导入应用的默认 mods(osu! legacy 位,0 = 无)。
     #[serde(default)]
     pub quick_mods: u32,
+    /// 快速加入的默认难度策略:hardest / easiest / custom。
+    #[serde(default = "default_quick_policy")]
+    pub quick_policy: String,
+    /// 自定义策略下的目标星级。
+    #[serde(default)]
+    pub quick_star: Option<f32>,
     /// 曲名 / 作者优先显示 Unicode 原名(默认开;关 = 罗马音 / 英文)。
     #[serde(default = "default_true")]
     pub display_unicode: bool,
@@ -236,8 +265,13 @@ pub struct SavedTrack {
     pub mods: u32,
     #[serde(default)]
     pub title: String,
+    /// 原名标题的另一种写法(osu! 的 romaji / unicode 两套名字都存,显示时按开关挑)
+    #[serde(default)]
+    pub title_u: String,
     #[serde(default)]
     pub artist: String,
+    #[serde(default)]
+    pub artist_u: String,
     #[serde(default)]
     pub length_ms: f64,
 }
@@ -254,6 +288,16 @@ fn default_hitsound() -> bool {
     true
 }
 
+fn default_theme() -> String {
+    "dark".into()
+}
+
+fn default_accent() -> String {
+    "blue".into()
+}
+
+/// 默认始终渲染(与设置页「渲染模式」默认项「始终渲染」一致;
+/// 新装/缺字段都不会退到 autopause)。
 fn default_render_mode() -> String {
     "always".to_string()
 }
@@ -278,6 +322,10 @@ fn default_hits_volume() -> f32 {
     0.6
 }
 
+fn default_quick_policy() -> String {
+    "hardest".to_string()
+}
+
 fn default_true() -> bool {
     true
 }
@@ -299,6 +347,7 @@ impl Default for Settings {
             speed: 1.0,
             loop_playback: false,
             autostart: false,
+        play_on_start: true,
             source: default_source(),
             lazer_dir: None,
             stable_dir: None,
@@ -337,14 +386,22 @@ impl Default for Settings {
             debug_window: false,
             fps: 0,
             target_star: None,
+            custom_star: None,
             star_min: 0.0,
+            star_max: Some(0.0),
+            sb_only: false,
             lazer_set: None,
             lazer_sha2: None,
+            lazer_diff: None,
+            theme_mode: default_theme(),
+            accent: default_accent(),
             close_action: None,
             log_enabled: false,
             dblclick_add: false,
             quick_add: true,
             quick_mods: 0,
+            quick_policy: default_quick_policy(),
+            quick_star: None,
             display_unicode: true,
             hotkeys_enabled: false,
             hotkey_prev: None,
@@ -358,6 +415,16 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// 全局「自定义星级」:最近一次设置优先,其次旧字段,最后 5.0;
+    /// 统一钳到 0.5–12.0。
+    pub fn custom_star_value(&self) -> f64 {
+        self.custom_star
+            .or_else(|| self.target_star.filter(|t| *t > 0.0))
+            .or_else(|| self.quick_star.map(f64::from))
+            .unwrap_or(5.0)
+            .clamp(0.5, 12.0)
+    }
+
     /// 某谱面集实际生效的播放参数:个性设置开启时逐项覆盖全局,
     /// 未填(None)的项继续跟随全局。数值统一钳位,避免坏存档。
     pub fn effective_for(&self, set_id: &str) -> EffectiveMedia {
@@ -389,11 +456,8 @@ impl Settings {
     }
 }
 
-pub fn load(app: &tauri::AppHandle) -> Settings {
-    use tauri::Manager;
-    let Ok(dir) = app.path().app_data_dir() else {
-        return Settings::default();
-    };
+/// 从指定数据目录读设置(非 Tauri 前端用,如 GPUI)。
+pub fn load_from(dir: &std::path::Path) -> Settings {
     let file = dir.join("settings.json");
     let mut s: Settings = std::fs::read_to_string(file)
         .ok()
@@ -402,16 +466,29 @@ pub fn load(app: &tauri::AppHandle) -> Settings {
     if !matches!(s.render_mode.as_str(), "always" | "autopause" | "fs_pause" | "fs_sleep" | "off") {
         s.render_mode = default_render_mode();
     }
+    // 旧存档没有 star_max 字段(旧版只有下限过滤,新界面也从未持久化过
+    // 区间):一次性清成"不过滤",避免升级后被残留的星级下限一直过滤;
+    // 之后用户在星级过滤里设置的区间会正常保存。
+    if s.star_max.is_none() {
+        s.star_min = 0.0;
+        s.star_max = Some(0.0);
+    }
+    // 旧存档还没有自定义星级字段:从旧的目标星级 / 快速加入星级补一次,
+    // 之后用户在任意入口设置的自定义星级都会记到这里。
+    if s.custom_star.is_none() {
+        s.custom_star = s
+            .target_star
+            .filter(|t| *t > 0.0)
+            .or_else(|| s.quick_star.map(f64::from));
+    }
     s
 }
 
-pub fn save(app: &tauri::AppHandle, s: &Settings) {
-    use tauri::Manager;
-    if let Ok(dir) = app.path().app_data_dir() {
-        let _ = std::fs::create_dir_all(&dir);
-        if let Ok(json) = serde_json::to_string_pretty(s) {
-            let _ = std::fs::write(dir.join("settings.json"), json);
-        }
+/// 写入指定数据目录(非 Tauri 前端用)。
+pub fn save_to(dir: &std::path::Path, s: &Settings) {
+    let _ = std::fs::create_dir_all(dir);
+    if let Ok(json) = serde_json::to_string_pretty(s) {
+        let _ = std::fs::write(dir.join("settings.json"), json);
     }
 }
 
@@ -540,6 +617,95 @@ mod tests {
         )
         .unwrap();
         assert!(legacy.display_unicode, "缺字段应回落默认开");
+    }
+
+    /// 渲染模式默认始终渲染(设置页默认项、字段注释、缺字段回落三者一致)。
+    #[test]
+    fn render_mode_defaults_always() {
+        assert_eq!(Settings::default().render_mode, "always", "默认始终渲染");
+        let legacy = serde_json::from_str::<Settings>(
+            "{\"path\":null,\"diff\":null,\"fail\":false,\"speed\":1.0,\"autostart\":false,\"gameplay_hidden\":false}",
+        )
+        .unwrap();
+        assert_eq!(legacy.render_mode, "always", "缺字段应回落 always");
+    }
+
+    /// 星级过滤默认不过滤;旧存档残留的下限一次性清掉;用户设置区间能记住。
+    #[test]
+    fn star_filter_defaults_none_and_remembers_range() {
+        let d = Settings::default();
+        assert_eq!(d.star_min, 0.0, "默认不设星级下限");
+        assert_eq!(d.star_max, Some(0.0), "默认不设星级上限");
+        assert!(!d.sb_only, "默认不过滤 SB/视频");
+
+        let dir = std::env::temp_dir().join(format!("aria-star-filter-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 旧格式:只有 star_min(10.0),没有 star_max 字段
+        std::fs::write(
+            dir.join("settings.json"),
+            "{\"path\":null,\"diff\":null,\"fail\":false,\"speed\":1.0,\"autostart\":false,\"gameplay_hidden\":false,\"star_min\":10.0}",
+        )
+        .unwrap();
+        let migrated = load_from(&dir);
+        assert_eq!(migrated.star_min, 0.0, "旧存档残留的星级下限应清成不过滤");
+        assert_eq!(migrated.star_max, Some(0.0));
+        assert!(!migrated.sb_only, "缺字段 = 不过滤");
+
+        // 用户设置区间并落盘后,重启读取必须原样保留
+        let mut saved = migrated;
+        saved.star_min = 5.0;
+        saved.star_max = Some(7.5);
+        saved.sb_only = true;
+        save_to(&dir, &saved);
+        let reread = load_from(&dir);
+        assert_eq!(reread.star_min, 5.0, "用户设置的下限要记住");
+        assert_eq!(reread.star_max, Some(7.5), "用户设置的上限要记住");
+        assert!(reread.sb_only, "用户设置的 SB 过滤要记住");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 全局「自定义星级」:最近设置优先,旧字段兜底,范围钳位。
+    #[test]
+    fn custom_star_is_global_and_clamped() {
+        let mut s = Settings::default();
+        assert_eq!(s.custom_star_value(), 5.0, "默认 5.0");
+        s.custom_star = Some(7.5);
+        assert_eq!(s.custom_star_value(), 7.5);
+        // 还没写过 custom_star 时回退旧的 target_star / quick_star
+        let legacy = serde_json::from_str::<Settings>(
+            "{\"path\":null,\"diff\":null,\"fail\":false,\"speed\":1.0,\"autostart\":false,\"gameplay_hidden\":false,\"target_star\":6.5}",
+        )
+        .unwrap();
+        assert_eq!(legacy.custom_star, None);
+        assert_eq!(legacy.custom_star_value(), 6.5, "旧 target_star 兜底");
+        let quick = serde_json::from_str::<Settings>(
+            "{\"path\":null,\"diff\":null,\"fail\":false,\"speed\":1.0,\"autostart\":false,\"gameplay_hidden\":false,\"quick_policy\":\"custom\",\"quick_star\":8.0}",
+        )
+        .unwrap();
+        assert_eq!(quick.custom_star_value(), 8.0, "旧 quick_star 兜底");
+        // 越界钳位
+        s.custom_star = Some(99.0);
+        assert_eq!(s.custom_star_value(), 12.0);
+        s.custom_star = Some(0.0);
+        assert_eq!(s.custom_star_value(), 0.5);
+    }
+
+    /// 旧存档迁移:缺 custom_star 时用旧 quick_star 补一次,之后落盘记住。
+    #[test]
+    fn custom_star_migrates_from_legacy_fields() {
+        let dir = std::env::temp_dir().join(format!("aria-custom-star-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            "{\"path\":null,\"diff\":null,\"fail\":false,\"speed\":1.0,\"autostart\":false,\"gameplay_hidden\":false,\"quick_policy\":\"custom\",\"quick_star\":7.0}",
+        )
+        .unwrap();
+        let s = load_from(&dir);
+        assert_eq!(s.custom_star, Some(7.0), "旧 quick_star 迁成全局自定义星级");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 谱面集个性设置:关闭时整体跟随全局;开启后逐项覆盖,未填项回退全局。

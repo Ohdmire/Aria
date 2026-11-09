@@ -503,24 +503,6 @@ pub fn pick_diff<'a>(set: &'a LazerSet, policy: PickPolicy) -> &'a LazerBeatmap 
 
 /// [`pick_diff`] 的离线版:在路径缓存的难度表上按同一策略挑选,
 /// 播放列表快路径(不解析数据库)用。
-pub fn pick_cached_diff<'a>(
-    diffs: &'a [crate::pathcache::CachedDiff],
-    policy: PickPolicy,
-) -> Option<&'a crate::pathcache::CachedDiff> {
-    let mut it = diffs.iter();
-    let mut best = it.next()?;
-    for b in it {
-        let better = match policy {
-            PickPolicy::Hardest => b.star > best.star,
-            PickPolicy::Easiest => b.star < best.star,
-            PickPolicy::Custom(t) => (b.star - t).abs() < (best.star - t).abs(),
-        };
-        if better {
-            best = b;
-        }
-    }
-    Some(best)
-}
 
 #[cfg(test)]
 mod tests {
@@ -531,6 +513,7 @@ mod tests {
         let set = LazerSet {
             id: "s".into(),
             online_id: 0,
+            status: 1,
             date_added_ms: 0,
             artist: "Artist".into(),
             artist_unicode: "歌手".into(),
@@ -552,8 +535,6 @@ mod tests {
 
     #[test]
     fn add_remove_clear_current() {
-        let mut p = Playlist::default();
-        // 去重:同一谱面集重复入列被跳过(默认行为)
         let mut p = Playlist::default();
         p.add("a".into(), Some("x".into()), 0, String::new(), String::new(), 0.0);
         // 重复入列 = 原位替换参数(位置/qid 不变),不是跳过

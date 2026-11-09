@@ -30,17 +30,21 @@ use windows::Win32::Foundation::{
     GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, RECT, SetLastError, WPARAM, WIN32_ERROR,
 };
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW, MapWindowPoints,
+    DISPLAY_DEVICEW, EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR,
+    MONITORINFOEXW, MapWindowPoints,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, EnumWindows, FindWindowExW,
     FindWindowW, GA_PARENT, GWLP_HWNDPARENT, GWL_EXSTYLE, GWL_STYLE, RegisterClassExW, WNDCLASSEXW,
     WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
-    GetAncestor,
+    CallWindowProcW, GetAncestor,
     GetDesktopWindow, GetParent,
-    GetClientRect, GetWindowLongPtrW, GetWindowThreadProcessId, HWND_BOTTOM, IsIconic, IsWindow,
-    IsWindowVisible, LWA_ALPHA, MONITORINFOF_PRIMARY, SMTO_NORMAL, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE, SendMessageTimeoutW,
+    GetClientRect, GetWindowLongPtrW, GetWindowThreadProcessId, GWLP_WNDPROC, HWND_BOTTOM, IsIconic,
+    IsWindow,
+    IsWindowVisible, LWA_ALPHA, MONITORINFOF_PRIMARY, SIZE_MINIMIZED, SMTO_NORMAL, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOW,
+    SW_SHOWNOACTIVATE, SendMessageTimeoutW, WM_NCLBUTTONDOWN, WM_SHOWWINDOW, WM_SIZE,
+    WM_SYSCOMMAND, HTCLOSE, SC_CLOSE,
     SetLayeredWindowAttributes, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow, WS_CAPTION,
     WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
@@ -52,6 +56,9 @@ use windows::core::{PCWSTR, w};
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Monitor {
     pub device: String,
+    /// 显示器型号(EDID 里的名字,如 `DELL U2720Q`),给设置页的显示器列表用;
+    /// 读不到就退回设备标识(`DISPLAY2`)。与 Wayland 侧同名字段同义。
+    pub model: String,
     pub x: i32,
     pub y: i32,
     pub w: i32,
@@ -88,8 +95,10 @@ pub fn list_monitors() -> Vec<Monitor> {
                             .unwrap_or(mi.szDevice.len())],
                     );
                     let r = mi.monitorInfo.rcMonitor;
+                    let model = monitor_model(&device);
                     out.push(Monitor {
                         device,
+                        model,
                         x: r.left,
                         y: r.top,
                         w: r.right - r.left,
@@ -109,6 +118,61 @@ pub fn list_monitors() -> Vec<Monitor> {
         );
         out
     }
+}
+
+/// 显示器型号:`EnumDisplayDevicesW(<device>)` 报的 EDID 名字(如 `DELL U2720Q`)。
+/// 驱动只给 "Generic PnP Monitor" 时退回设备标识段(`MONITOR\DELA1C3` → `DELA1C3`),
+/// 再退回 `DISPLAY2` 这种设备名。
+fn monitor_model(device: &str) -> String {
+    let wide: Vec<u16> = device.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let mut dd = DISPLAY_DEVICEW {
+            cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+            ..Default::default()
+        };
+        if EnumDisplayDevicesW(PCWSTR(wide.as_ptr()), 0, &mut dd, 0).as_bool() {
+            let name = wide_str(&dd.DeviceString);
+            if !name.is_empty() && !name.eq_ignore_ascii_case("Generic PnP Monitor") {
+                return name;
+            }
+            let id = wide_str(&dd.DeviceID);
+            if let Some(code) = id.strip_prefix("MONITOR\\").and_then(|r| r.split('\\').next()) {
+                if !code.is_empty() {
+                    return code.to_string();
+                }
+            }
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    device.trim_start_matches("\\\\.\\").to_string()
+}
+
+/// Win32 定长 UTF-16 字段 → String(截到第一个 NUL)。
+fn wide_str(buf: &[u16]) -> String {
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..len]).trim().to_string()
+}
+
+/// 结束并重新启动 explorer.exe,让 shell 重建 Progman / DefView / WorkerW。
+/// 任务栏会闪一下;壁纸窗口挂在 Progman 下,会随 explorer 退出而销毁,
+/// 由壁纸子进程自己重挂(见 `wall` 模块的"被外部销毁"重试)。
+pub fn restart_explorer() -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let status = std::process::Command::new("taskkill")
+        .args(["/F", "/IM", "explorer.exe"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()?;
+    if !status.success() {
+        bail!("结束 explorer 失败,退出码 {}", status.code().unwrap_or(-1));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::process::Command::new("explorer.exe")
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()?;
+    Ok(())
 }
 
 /// 未公开的 Progman 消息:让 shell 整理桌面层(生成 WorkerW)。
@@ -800,6 +864,100 @@ pub fn reattach(child: HWND, bounds: Option<MonitorBounds>) -> WallpaperHost {
 pub fn show_no_activate(hwnd: HWND) {
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+}
+
+/// 收到托盘:藏窗口,任务栏按钮一起消失。和最小化不是一回事。
+pub fn hide_window(raw: isize) {
+    let Some(hwnd) = hwnd_from(raw) else { return };
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+}
+
+/// 从托盘唤回。最小化过的先还原,只是藏起来的按原大小显示。
+pub fn show_window(raw: isize) {
+    let Some(hwnd) = hwnd_from(raw) else { return };
+    unsafe {
+        let cmd = if IsIconic(hwnd).as_bool() { SW_RESTORE } else { SW_SHOW };
+        let _ = ShowWindow(hwnd, cmd);
+    }
+}
+
+fn hwnd_from(raw: isize) -> Option<HWND> {
+    if raw == 0 {
+        None
+    } else {
+        Some(HWND(raw as *mut core::ffi::c_void))
+    }
+}
+
+/// 关闭询问是否该显示。最小化/隐藏时清掉,重新显示不补弹。
+static ASK_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 只有用户真正点了关闭(或 Alt+F4)才置位。显示窗口时系统补来的 WM_CLOSE 没有这一位。
+static CLOSE_INTENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn ask_open() -> bool {
+    ASK_OPEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_ask_open(on: bool) {
+    ASK_OPEN.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn block_ask() {
+    ASK_OPEN.store(false, std::sync::atomic::Ordering::Relaxed);
+    CLOSE_INTENT.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn arm_close() {
+    CLOSE_INTENT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn take_close_intent() -> bool {
+    CLOSE_INTENT.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn main_window_shown(raw: isize) -> bool {
+    let Some(hwnd) = hwnd_from(raw) else { return false };
+    unsafe { IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() }
+}
+
+static OLD_WNDPROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// 包一层窗口过程:最小化/隐藏时封锁询问,窗口里有真正的鼠标或键盘输入后再放开。
+pub fn watch_ask(raw: isize) {
+    let Some(hwnd) = hwnd_from(raw) else { return };
+    unsafe {
+        if OLD_WNDPROC.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            return;
+        }
+        let old = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, ask_wndproc as isize);
+        if old != 0 {
+            OLD_WNDPROC.store(old, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+unsafe extern "system" fn ask_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let _ = hwnd;
+    match msg {
+        WM_SIZE if wparam.0 == SIZE_MINIMIZED as usize => block_ask(),
+        WM_SHOWWINDOW if wparam.0 == 0 => block_ask(),
+        WM_NCLBUTTONDOWN if wparam.0 == HTCLOSE as usize => arm_close(),
+        // 低 4 位是按键/菜单来源,关掉再比。
+        WM_SYSCOMMAND if wparam.0 & 0xFFF0 == SC_CLOSE as usize => arm_close(),
+        _ => {}
+    }
+    let old = OLD_WNDPROC.load(std::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        CallWindowProcW(
+            std::mem::transmute(old),
+            hwnd,
+            msg,
+            wparam,
+            lparam,
+        )
     }
 }
 

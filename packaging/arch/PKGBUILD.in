@@ -9,15 +9,14 @@ arch=('x86_64')
 url='https://github.com/Ohdmire/Aria'
 license=('MIT')
 depends=(
-    'webkit2gtk-4.1' 'gtk3' 'libayatana-appindicator' 'librsvg'
     'alsa-lib' 'vulkan-icd-loader' 'libglvnd' 'wayland' 'libxkbcommon'
-    'fontconfig' 'freetype2' 'harfbuzz' 'libsoup3'
-    'gstreamer' 'gst-plugins-base-libs'
-    'qt6-declarative'
+    'fontconfig' 'freetype2' 'harfbuzz'
+    # GPUI 窗口/渲染与 KDE 壁纸插件(QML + Quick)
+    'qt6-base' 'qt6-declarative'
     # 视频 storyboard 解码与视频探测(ffmpeg 包同时提供 ffprobe)
     'ffmpeg'
 )
-makedepends=('rust' 'cargo' 'git' 'cmake' 'qt6-base' 'pkgconf' 'zstd')
+makedepends=('rust' 'cargo' 'git' 'cmake' 'qt6-base' 'qt6-declarative' 'pkgconf')
 # native/soundtouch 的 .o 由 cc 编译后交给 rust-lld 链接;makepkg 的
 # -flto=auto 会产出 GCC LTO bitcode,rust-lld 解析不了(undefined symbol
 # st_new/st_set_channels),所以本包关掉 LTO。

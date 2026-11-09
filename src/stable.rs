@@ -272,6 +272,7 @@ pub fn library(root: &Path) -> Result<LazerLibrary, String> {
                             out.push(LazerSet {
                                 id: folder.clone(),
                                 online_id: acc.online_id,
+                                status: -3,
                                 date_added_ms,
                                 artist: std::mem::take(&mut acc.artist),
                                 artist_unicode: std::mem::take(&mut acc.artist_unicode),

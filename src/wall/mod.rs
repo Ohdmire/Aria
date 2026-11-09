@@ -29,11 +29,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::keyboard::{Key, NamedKey};
 #[cfg(windows)]
 use winit::platform::windows::WindowAttributesExtWindows;
-use winit::window::{Window, WindowAttributes};
+use winit::window::{Fullscreen, Window, WindowAttributes};
 
 /// 壁纸窗口被外部销毁后,重挂桌面的等待间隔(给 explorer 重启留时间)。
 const REATTACH_DELAY: Duration = Duration::from_secs(3);
@@ -1760,7 +1761,7 @@ impl WallApp {
             return Err(String::new()); // 错误事件已在 create_window 内上报
         }
         #[cfg(target_os = "linux")]
-        let target = if self.kde_output {
+        let target = if self.kde_output && !self.window_is_debug() {
             Target::Shm
         } else {
             let (raw_display, raw_window) = self.raw_handles()?;
@@ -1859,7 +1860,7 @@ impl WallApp {
     fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
         // ---- Linux KDE 壁纸插件形态:不建窗口,离屏渲染 + 共享内存发布 ----
         #[cfg(target_os = "linux")]
-        if self.kde_output {
+        if self.kde_output && !self.window_is_debug() {
             let host = win::host_of(self.monitor);
             self.host = Some(host);
             self.window = None;
@@ -3458,7 +3459,7 @@ impl WallApp {
                 if self.preview_size.is_none() && on != self.debug_window {
                     self.debug_window = on;
                     log::info!("[window] 调试窗口模式: {on},重建窗口");
-                    if self.window.is_some() {
+                    if self.window.is_some() || self.kde_output {
                         // 拆会话 + 销毁窗口,立即按新形态重走加载(挂桌面
                         // 或开调试窗口)。Destroyed 事件随后到达:两个方向
                         // 都不会重复 Reload —— 开启方向 helper 为真直接跳过;
@@ -3528,6 +3529,32 @@ impl ApplicationHandler<UserEvent> for WallApp {
                 }
             }
             WindowEvent::RedrawRequested => self.on_redraw(),
+            WindowEvent::KeyboardInput { event, .. } => {
+                if !self.window_is_debug()
+                    || event.state != ElementState::Pressed
+                    || event.repeat
+                {
+                    return;
+                }
+                match event.logical_key {
+                    Key::Named(NamedKey::F11) => {
+                        if let Some(window) = &self.window {
+                            let fullscreen = window.fullscreen().is_some();
+                            window.set_fullscreen(if fullscreen {
+                                None
+                            } else {
+                                Some(Fullscreen::Borderless(None))
+                            });
+                        }
+                    }
+                    Key::Named(NamedKey::Escape) => {
+                        self.drop_stretch();
+                        self.out.send(&Event::Exited);
+                        event_loop.exit();
+                    }
+                    _ => {}
+                }
+            }
             WindowEvent::CloseRequested => {
                 // 调试窗口:关闭即退出渲染子进程;壁纸窗口不接受用户关闭
                 if self.window_is_debug() {
@@ -3584,16 +3611,16 @@ impl ApplicationHandler<UserEvent> for WallApp {
                     }
                 }
             }
-            // 遮挡检测(带迟滞:连续遮挡 2s 才触发,桌面重新可见 0.5s 即恢复)。
-            // 窗口销毁的暂停态用保留的 wall_hwnd 检测,恢复才能触发。
-            // AutoPause/FsPause/FsSleep 都吃遮挡;FsPause 只暂停播放
-            // (壁纸会话保留,画面冻结),FsSleep 暂停播放 + 拆会话释放内存。
-            // 预览模式无桌面挂接,遮挡概念不适用,整块跳过。
+            // 遮挡检测(带迟滞:连续遮挡 1s 才触发,桌面重新可见 0.5s 即恢复)。
+            // AutoPause/FsSleep 确认遮挡后会拆窗口并把 host 清空。暂停态
+            // 必须继续用保留的 wall_hwnd 检测,退出全屏才能把画面建回来。
+            // 预览/调试窗口无桌面挂接,整块跳过。
             #[cfg(windows)]
             if !self.render_mode.pure()
                 && self.render_mode != RenderMode::Always
                 && self.game.is_some()
-                && self.host.is_some()
+                && !self.window_is_debug()
+                && (self.host.is_some() || self.wall_hwnd.is_some())
             {
                 let covered = self.wall_hwnd.map(win::desktop_covered).unwrap_or(false);
                 if covered != self.covered {
@@ -3635,7 +3662,7 @@ impl ApplicationHandler<UserEvent> for WallApp {
         }
         // ---- KDE 壁纸插件:没有窗口可 request_redraw,自己按帧率节流 ----
         #[cfg(target_os = "linux")]
-        if self.kde_output {
+        if self.kde_output && !self.window_is_debug() {
             if self.surf.is_some() {
                 // 0 = 跟随屏幕刷新率(设置项语义),否则严格按用户设定。
                 // 共享内存三缓冲 + QML 侧 4ms 轮询能跟上高刷;GPU 渲染

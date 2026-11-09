@@ -1,4 +1,4 @@
-//! 全局快捷键(Windows `RegisterHotKey`;Wayland 无对应协议,见文末)。
+//! 全局快捷键(Windows `RegisterHotKey`;其它平台没有对应协议,见文末)。
 //!
 //! 设置里默认**不开启**、也没有任何默认组合;只有用户自己填写并启用后
 //! 才会注册。注册/注销与 `WM_HOTKEY` 分发都在同一条专用线程上完成:
@@ -6,12 +6,17 @@
 //! 所以这条线程必须自己泵消息;配置变更通过 mpsc 下发,并在设置命令里
 //! 等一次确认(注册冲突等错误可以直接反馈到 UI)。
 //!
-//! 动作与托盘菜单一致:上一首 / 播放·暂停 / 下一首。
+//! 动作与托盘菜单一致:上一首 / 播放·暂停 / 下一首。触发后只往全局队列
+//! 里压一条,由 GPUI 心跳取走执行(托盘已经改用 gpui-tray 的 Action 分发,
+//! 只有快捷键还需要这个队列,因为它是系统级 RegisterHotKey 消息泵),这里不碰
+//! 播放器状态,也不阻塞快捷键线程的消息泵。
 
+use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::Duration;
 
-use tauri::AppHandle;
+use crate::settings::Settings;
+
 #[cfg(windows)]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey,
@@ -26,8 +31,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage, WM_HOTKEY,
 };
 
-use crate::settings::Settings;
-
 /// 快捷键动作(注册 id 固定,便于注销/重新注册)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -37,6 +40,7 @@ pub enum Action {
 }
 
 impl Action {
+    #[cfg(windows)]
     pub fn label(self) -> &'static str {
         match self {
             Action::Prev => "上一首",
@@ -45,6 +49,7 @@ impl Action {
         }
     }
 
+    #[cfg(windows)]
     fn id(self) -> i32 {
         match self {
             Action::Prev => 1,
@@ -53,6 +58,7 @@ impl Action {
         }
     }
 
+    #[cfg(windows)]
     fn from_id(id: i32) -> Option<Self> {
         match id {
             1 => Some(Action::Prev),
@@ -63,7 +69,21 @@ impl Action {
     }
 }
 
+static ACTIONS: Mutex<Vec<Action>> = Mutex::new(Vec::new());
+
+/// 取出待执行动作(由 GPUI 心跳调用)。
+pub fn poll() -> Vec<Action> {
+    std::mem::take(&mut *ACTIONS.lock().unwrap())
+}
+
+/// 只有 Windows 的消息泵会往队列里压动作
+#[cfg(windows)]
+fn push(a: Action) {
+    ACTIONS.lock().unwrap().push(a);
+}
+
 /// 解析后的一个组合键。
+#[cfg(windows)]
 #[derive(Debug, Clone)]
 pub struct Binding {
     pub action: Action,
@@ -74,29 +94,30 @@ pub struct Binding {
     pub text: String,
 }
 
+#[cfg(windows)]
 impl Binding {
     fn same_combo(&self, other: &Binding) -> bool {
         self.mods == other.mods && self.vk == other.vk
     }
 }
 
-/// `set_hotkeys` 的解析结果(文本已规范化,供设置持久化/回显)。
-pub struct ParsedConfig {
-    pub bindings: Vec<Binding>,
+/// 规范化后的三条文本(供设置持久化/回显)。
+pub struct Text {
     pub prev: Option<String>,
     pub toggle: Option<String>,
     pub next: Option<String>,
 }
 
-/// 托管到 Tauri 的快捷键管理器句柄。
-#[derive(Clone)]
-pub struct HotkeyManager {
-    #[cfg(windows)]
-    tx: Sender<Cmd>,
-    #[cfg(not(windows))]
-    _private: (),
+#[cfg(windows)]
+struct ParsedConfig {
+    bindings: Vec<Binding>,
+    text: Text,
 }
 
+#[cfg(windows)]
+static TX: Mutex<Option<Sender<Cmd>>> = Mutex::new(None);
+
+#[cfg(windows)]
 enum Cmd {
     Set {
         bindings: Vec<Binding>,
@@ -105,61 +126,78 @@ enum Cmd {
 }
 
 /// 启动快捷键线程并按已保存的设置注册(启动即生效;默认关闭 = 空表)。
-#[cfg(windows)]
-pub fn init(app: AppHandle, settings: &Settings) -> HotkeyManager {
-    let (tx, rx) = mpsc::channel();
-    let initial = if settings.hotkeys_enabled {
-        bindings_from_settings(settings)
-    } else {
-        Vec::new()
-    };
-    let app2 = app.clone();
-    let spawned = std::thread::Builder::new()
-        .name("aria-hotkeys".into())
-        .spawn(move || worker(rx, app2, initial));
-    if let Err(e) = spawned {
-        log::error!("[hotkeys] 启动快捷键线程失败: {e}");
+/// 幂等:窗口重建时再调用不会起第二个线程。
+pub fn start(settings: &Settings) {
+    #[cfg(windows)]
+    {
+        use std::sync::Once;
+        static STARTED: Once = Once::new();
+        STARTED.call_once(|| {
+            let initial = if settings.hotkeys_enabled {
+                bindings_from_settings(settings)
+            } else {
+                Vec::new()
+            };
+            let (tx, rx) = mpsc::channel();
+            *TX.lock().unwrap() = Some(tx);
+            let spawned =
+                std::thread::Builder::new().name("aria-hotkeys".into()).spawn(move || worker(rx, initial));
+            if let Err(e) = spawned {
+                log::error!("[hotkeys] 启动快捷键线程失败: {e}");
+            }
+        });
     }
-    HotkeyManager { tx }
-}
-
-/// Wayland 没有全局快捷键协议(xdg-desktop-portal GlobalShortcuts 目前
-/// KDE 未实现),这里保留同名 API:启动不注册任何组合,设置时明确报错,
-/// 让 UI 把"不支持"如实展示,而不是静默失败。
-#[cfg(not(windows))]
-pub fn init(_app: AppHandle, _settings: &Settings) -> HotkeyManager {
-    if _settings.hotkeys_enabled {
-        log::warn!("[hotkeys] Wayland 不支持全局快捷键,已保存的组合不会生效");
-    }
-    HotkeyManager { _private: () }
-}
-
-#[cfg(not(windows))]
-impl HotkeyManager {
-    pub fn register(&self, bindings: Vec<Binding>) -> Result<(), String> {
-        if bindings.is_empty() {
-            return Ok(());
+    #[cfg(not(windows))]
+    {
+        if settings.hotkeys_enabled {
+            log::warn!("[hotkeys] 当前平台不支持全局快捷键,已保存的组合不会生效");
         }
-        Err("Wayland 不允许应用注册全局快捷键;请用托盘菜单或设置窗口切歌".into())
+    }
+}
+
+/// 应用设置里的三条文本:`enabled` 为假时全部注销。返回规范化后的文本,
+/// 调用方写回设置供下次启动用;注册失败(冲突/非法组合)带错误信息返回。
+pub fn apply(
+    enabled: bool,
+    prev: Option<&str>,
+    toggle: Option<&str>,
+    next: Option<&str>,
+) -> Result<Text, String> {
+    #[cfg(windows)]
+    {
+        let parsed = parse_inputs(prev, toggle, next)?;
+        let bindings = if enabled { parsed.bindings } else { Vec::new() };
+        register_bindings(bindings)?;
+        Ok(parsed.text)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = enabled;
+        let norm = |t: Option<&str>| {
+            t.map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+        };
+        let (prev, toggle, next) = (norm(prev), norm(toggle), norm(next));
+        if enabled && (prev.is_some() || toggle.is_some() || next.is_some()) {
+            return Err("当前平台不支持全局快捷键;请用托盘菜单或设置窗口切歌".into());
+        }
+        Ok(Text { prev, toggle, next })
     }
 }
 
 #[cfg(windows)]
-impl HotkeyManager {
-    /// 用新的组合集合替换当前注册(空表 = 全部注销)。同步等待线程确认,
-    /// 冲突/非法组合等错误会带回来。
-    pub fn register(&self, bindings: Vec<Binding>) -> Result<(), String> {
-        let (ack, rx) = mpsc::channel();
-        self.tx
-            .send(Cmd::Set { bindings, ack })
-            .map_err(|_| "快捷键服务未运行".to_string())?;
-        rx.recv_timeout(Duration::from_secs(2))
-            .map_err(|_| "快捷键设置超时".to_string())?
-    }
+fn register_bindings(bindings: Vec<Binding>) -> Result<(), String> {
+    let (ack, rx) = mpsc::channel();
+    let tx = TX.lock().unwrap().clone().ok_or("快捷键服务未运行")?;
+    tx.send(Cmd::Set { bindings, ack })
+        .map_err(|_| "快捷键服务未运行".to_string())?;
+    rx.recv_timeout(Duration::from_secs(2))
+        .map_err(|_| "快捷键设置超时".to_string())?
 }
 
 #[cfg(windows)]
-fn worker(rx: Receiver<Cmd>, app: AppHandle, initial: Vec<Binding>) {
+fn worker(rx: Receiver<Cmd>, initial: Vec<Binding>) {
     let mut current = Vec::new();
     if let Err(e) = register_all(&initial, &mut current) {
         log::warn!("[hotkeys] 启动注册失败: {e}");
@@ -168,7 +206,7 @@ fn worker(rx: Receiver<Cmd>, app: AppHandle, initial: Vec<Binding>) {
         loop {
             match rx.try_recv() {
                 Ok(Cmd::Set { bindings, ack }) => {
-                    let res = apply(&bindings, &mut current);
+                    let res = swap(&bindings, &mut current);
                     if let Err(e) = &res {
                         log::warn!("[hotkeys] {e}");
                     }
@@ -181,7 +219,7 @@ fn worker(rx: Receiver<Cmd>, app: AppHandle, initial: Vec<Binding>) {
                 }
             }
         }
-        pump(&app);
+        pump();
         // 20ms 轮询:WM_HOTKEY 通常在消息队列里立即被取走,延迟可忽略;
         // 也避免用 MsgWaitForMultipleObjects 额外同步事件句柄。
         std::thread::sleep(Duration::from_millis(20));
@@ -190,7 +228,7 @@ fn worker(rx: Receiver<Cmd>, app: AppHandle, initial: Vec<Binding>) {
 
 /// 注销旧配置 → 注册新配置;新配置有任一失败则回滚到旧配置。
 #[cfg(windows)]
-fn apply(next: &[Binding], current: &mut Vec<Binding>) -> Result<(), String> {
+fn swap(next: &[Binding], current: &mut Vec<Binding>) -> Result<(), String> {
     unregister_all(current);
     let old = std::mem::take(current);
     let mut fresh = Vec::new();
@@ -252,13 +290,13 @@ fn friendly(e: &windows::core::Error) -> String {
 }
 
 #[cfg(windows)]
-fn pump(app: &AppHandle) {
+fn pump() {
     unsafe {
         let mut msg = MSG::default();
         while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
             if msg.message == WM_HOTKEY {
                 if let Some(action) = Action::from_id(msg.wParam.0 as i32) {
-                    dispatch(app.clone(), action);
+                    push(action);
                 }
             }
             let _ = TranslateMessage(&msg);
@@ -267,33 +305,9 @@ fn pump(app: &AppHandle) {
     }
 }
 
-#[cfg(windows)]
-fn dispatch(app: AppHandle, action: Action) {
-    // 切歌/重载可能走慢路径(解析曲库),不能阻塞快捷键线程的消息泵
-    std::thread::spawn(move || match action {
-        Action::Prev => {
-            if let Err(e) = crate::ctl::playlist_prev(&app) {
-                log::warn!("[hotkeys] 上一首失败: {e}");
-            }
-        }
-        Action::Next => {
-            if let Err(e) = crate::ctl::playlist_next(&app) {
-                log::warn!("[hotkeys] 下一首失败: {e}");
-            }
-        }
-        Action::Toggle => {
-            let cmd = if crate::ctl::is_playing(&app) {
-                crate::ipc::Command::Pause
-            } else {
-                crate::ipc::Command::Resume
-            };
-            let _ = crate::ctl::send_cmd(&app, cmd);
-        }
-    });
-}
-
 /// 已保存配置 → 组合列表(无效项记日志后跳过,不阻止启动)。
-pub fn bindings_from_settings(s: &Settings) -> Vec<Binding> {
+#[cfg(windows)]
+fn bindings_from_settings(s: &Settings) -> Vec<Binding> {
     let mut out = Vec::new();
     for (action, text) in [
         (Action::Prev, s.hotkey_prev.as_deref()),
@@ -312,7 +326,8 @@ pub fn bindings_from_settings(s: &Settings) -> Vec<Binding> {
 }
 
 /// 解析 UI 提交的三条文本;空 = 不绑定。两个动作不能共用同一组合。
-pub fn parse_inputs(
+#[cfg(windows)]
+fn parse_inputs(
     prev: Option<&str>,
     toggle: Option<&str>,
     next: Option<&str>,
@@ -340,9 +355,7 @@ pub fn parse_inputs(
     let [prev, toggle, next] = texts;
     Ok(ParsedConfig {
         bindings,
-        prev,
-        toggle,
-        next,
+        text: Text { prev, toggle, next },
     })
 }
 
@@ -409,7 +422,7 @@ pub fn parse_binding(action: Action, text: &str) -> Result<Binding, String> {
     })
 }
 
-/// 单独按（无修饰键）也相对安全的键:功能键与媒体键。
+/// 单独按(无修饰键)也相对安全的键:功能键与媒体键。
 #[cfg(windows)]
 fn allows_bare(vk: u32) -> bool {
     // F1–F24,以及媒体键(系统本来就把它们当播放控制)
@@ -430,10 +443,7 @@ fn parse_key(token: &str) -> Result<(u32, String), String> {
         }
     }
     // Numpad0–9
-    if let Some(n) = low
-        .strip_prefix("numpad")
-        .and_then(|n| n.parse::<u32>().ok())
-    {
+    if let Some(n) = low.strip_prefix("numpad").and_then(|n| n.parse::<u32>().ok()) {
         if n <= 9 {
             return Ok((VK_NUMPAD0.0 as u32 + n, format!("Numpad{n}")));
         }
@@ -553,12 +563,7 @@ mod tests {
     fn empty_fields_mean_no_binding() {
         let parsed = parse_inputs(Some("  "), None, Some("Ctrl+Alt+N")).unwrap();
         assert_eq!(parsed.bindings.len(), 1);
-        assert_eq!(parsed.prev, None);
-        assert_eq!(parsed.next.as_deref(), Some("Ctrl+Alt+N"));
+        assert_eq!(parsed.text.prev, None);
+        assert_eq!(parsed.text.next.as_deref(), Some("Ctrl+Alt+N"));
     }
-}
-
-#[cfg(not(windows))]
-pub fn parse_binding(_action: Action, text: &str) -> Result<Binding, String> {
-    Err(format!("Wayland 不支持全局快捷键({text})"))
 }
