@@ -5537,6 +5537,21 @@ impl App {
         let mut skins = vec![("".to_string(), "内置 Argon".to_string())];
         skins.extend(self.skins.iter().filter_map(|(label, v)| v.clone().map(|v| (v, label.clone()))));
 
+        #[cfg(windows)]
+        let restart_explorer = Some(
+            self.small_btn("重启资源管理器", cx, |this, _| {
+                std::thread::spawn(|| {
+                    if let Err(e) = crate::win::restart_explorer() {
+                        log::warn!("[shell] 重启资源管理器失败: {e}");
+                    }
+                });
+                this.toast("正在重启资源管理器…");
+            })
+            .into_any_element(),
+        );
+        #[cfg(not(windows))]
+        let restart_explorer: Option<gpui::AnyElement> = None;
+
         div()
             .relative()
             .size_full()
@@ -5878,23 +5893,7 @@ impl App {
                     .child(self.small_btn("重启壁纸进程", cx, |this, _| this.restart_child()))
                     // Windows 特有:桌面层次乱了 / 壁纸挂不上去时,重启 shell 重建
                     // Progman / DefView / WorkerW(任务栏会闪一下;壁纸进程自己重挂)。
-                    .children({
-                        #[cfg(windows)]
-                        {
-                            Some(self.small_btn("重启资源管理器", cx, |this, _| {
-                                std::thread::spawn(|| {
-                                    if let Err(e) = crate::win::restart_explorer() {
-                                        log::warn!("[shell] 重启资源管理器失败: {e}");
-                                    }
-                                });
-                                this.toast("正在重启资源管理器…");
-                            }))
-                        }
-                        #[cfg(not(windows))]
-                        {
-                            None
-                        }
-                    })
+                    .children(restart_explorer)
                     .child(self.small_btn(
                         format!("清除全部个性设置 ({})", self.settings.set_overrides.len()),
                         cx,
