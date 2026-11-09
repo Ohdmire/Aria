@@ -8558,7 +8558,9 @@ pub fn run() {
     if !single_instance() {
         return;
     }
-    Application::new().run(|cx: &mut gpui::App| {
+    // 开机自启的命令行带 --hidden:不弹出主窗口,只留托盘。
+    let start_hidden = std::env::args().any(|a| a == "--hidden");
+    Application::new().run(move |cx: &mut gpui::App| {
         let options = WindowOptions {
             // 用最大化:窗口尺寸随屏幕,不会再出现窗口比屏幕大/跑出屏幕
             window_bounds: Some(gpui::WindowBounds::Maximized(gpui::Bounds {
@@ -8569,6 +8571,8 @@ pub fn run() {
             window_decorations: Some(gpui::WindowDecorations::Client),
             // Wayland 托盘恢复窗口需要用 app_id 申请激活令牌。
             app_id: Some("com.ohdmire.aria".into()),
+            show: !start_hidden,
+            focus: !start_hidden,
             ..Default::default()
         };
         // KDE 壁纸插件:装包 + 切到 Aria(退出/关窗时还原)。
@@ -8627,7 +8631,15 @@ pub fn run() {
             view_slot = Some(view.clone());
             view
         }) {
-            let _ = handle.update(cx, |_, window, _| window.activate_window());
+            if start_hidden {
+                // Windows:窗口创建时就不显示。Linux:最小化,和「最小化到托盘」同一行为。
+                #[cfg(windows)]
+                crate::win::block_ask();
+                #[cfg(not(windows))]
+                let _ = handle.update(cx, |_, window, _| window.minimize_window());
+            } else {
+                let _ = handle.update(cx, |_, window, _| window.activate_window());
+            }
             *WINDOW.lock().unwrap() = Some(handle);
         }
         // 兜底轮询:窗口最小化/被遮挡时 gpui 不再出帧,render 里的 poll 也就不会跑,
