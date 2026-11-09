@@ -2198,6 +2198,24 @@ impl App {
             "debug_window" => {
                 self.settings.debug_window = !self.settings.debug_window;
                 self.send(json!({"cmd": "set_debug_window", "on": self.settings.debug_window}));
+                #[cfg(target_os = "linux")]
+                {
+                    let on = self.settings.debug_window;
+                    std::thread::spawn(move || {
+                        if on {
+                            if let Err(e) = crate::kde::restore_wallpaper() {
+                                log::warn!("[kde] 还原桌面壁纸失败: {e}");
+                            }
+                        } else {
+                            if let Err(e) = crate::kde::install_plugin() {
+                                log::warn!("[kde] 安装壁纸插件失败: {e}");
+                            }
+                            if let Err(e) = crate::kde::enable_wallpaper() {
+                                log::warn!("[kde] 启用壁纸插件失败: {e}");
+                            }
+                        }
+                    });
+                }
             }
             "hotkeys_enabled" => {
                 self.settings.hotkeys_enabled = !self.settings.hotkeys_enabled;
@@ -6047,7 +6065,7 @@ impl App {
             .child(self.toggle_row("启动后自动播放", s.play_on_start, "play_on_start", cx))
             .child(self.toggle_row("开机自启", s.autostart, "autostart", cx))
             .child(self.toggle_row("记录日志", s.log_enabled, "log", cx))
-            .child(self.toggle_row("调试窗口(下次启动)", s.debug_window, "debug_window", cx))
+            .child(self.toggle_row("调试窗口", s.debug_window, "debug_window", cx))
             .child(self.dropdown_row(
                 "关闭窗口",
                 DropKind::CloseAction,
@@ -8576,15 +8594,22 @@ pub fn run() {
             ..Default::default()
         };
         // KDE 壁纸插件:装包 + 切到 Aria(退出/关窗时还原)。
+        // 调试窗口模式画面在独立窗口里,不占用桌面壁纸。
         #[cfg(target_os = "linux")]
         {
-            if let Err(e) = crate::kde::install_plugin() {
-                log::warn!("[kde] 安装壁纸插件失败: {e}");
-            }
-            if !crate::kde::plugin_installed() {
-                log::warn!("[kde] 壁纸插件未安装,壁纸不会显示(libariaplugin.so 缺失?)");
-            } else if let Err(e) = crate::kde::enable_wallpaper() {
-                log::warn!("[kde] 切换壁纸失败: {e}");
+            if crate::settings::load_from(&data_dir()).debug_window {
+                if let Err(e) = crate::kde::restore_wallpaper() {
+                    log::warn!("[kde] 还原桌面壁纸失败: {e}");
+                }
+            } else {
+                if let Err(e) = crate::kde::install_plugin() {
+                    log::warn!("[kde] 安装壁纸插件失败: {e}");
+                }
+                if !crate::kde::plugin_installed() {
+                    log::warn!("[kde] 壁纸插件未安装,壁纸不会显示(libariaplugin.so 缺失?)");
+                } else if let Err(e) = crate::kde::enable_wallpaper() {
+                    log::warn!("[kde] 切换壁纸失败: {e}");
+                }
             }
         }
         // 被 kill(SIGTERM/SIGINT)时也要还原壁纸,否则桌面停在最后一帧。
