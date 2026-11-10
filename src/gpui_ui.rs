@@ -3228,6 +3228,25 @@ fn pick_text(a: &str, b: &str, unicode: bool) -> String {
     }
 }
 
+/// 点击复制:把传进来的这段文字写进剪贴板。显示什么就复制什么。
+/// 用 arboard(跨平台系统剪贴板):Wayland 上它走 data-control 协议,
+/// 不依赖输入 serial —— gpui 内置的 write_to_clipboard 用的是 KeyPress
+/// serial,纯鼠标点击时会被合成器丢掉,表现就是"点了没复制"。arboard
+/// 失败时再退回 gpui。
+fn copy_on_click(
+    text: String,
+    cx: &mut Context<App>,
+) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static {
+    cx.listener(move |_this, _e, _w, cx| {
+        let ok = arboard::Clipboard::new()
+            .and_then(|mut clipboard| clipboard.set_text(text.clone()))
+            .is_ok();
+        if !ok {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+        }
+    })
+}
+
 fn cover_path(set: &crate::lazer::LazerSet, root: Option<&Path>) -> Option<PathBuf> {
     let file = crate::lazer::pick_cover_file(&set.files, None)?;
     if let Some(root) = set.root.as_deref() {
@@ -5362,28 +5381,27 @@ impl App {
                 let c = if title.is_empty() { "未播放".to_string() } else { title.clone() };
                 div()
                     .id("info-title")
+                    .flex_none()
                     .text_sm()
                     .cursor_pointer()
                     .child(c.clone())
-                    .on_click(cx.listener(move |_t, _e, _w, cx| {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(c.clone()));
-                    }))
+                    .on_click(copy_on_click(c.clone(), cx))
             })
             .child({
                 let c = artist.clone();
                 div()
                     .id("info-artist")
+                    .flex_none()
                     .text_xs()
                     .overflow_hidden()
                     .cursor_pointer()
                     .text_color(rgb(pal().dim))
                     .child(c.clone())
-                    .on_click(cx.listener(move |_t, _e, _w, cx| {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(c.clone()));
-                    }))
+                    .on_click(copy_on_click(c.clone(), cx))
             })
             .child(
                 div()
+                    .flex_none()
                     .flex()
                     .flex_row()
                     .items_center()
@@ -5397,18 +5415,22 @@ impl App {
                             .cursor_pointer()
                             .text_color(rgb(pal().dim))
                             .child(c.clone())
-                            .on_click(cx.listener(move |_t, _e, _w, cx| {
-                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(c.clone()));
-                            }))
+                            .on_click(copy_on_click(c.clone(), cx))
                     })
                     .child(star_badge(diff_star))
                     .child(div().flex_1())
                     .child(self.small_btn("个性设置…", cx, |this, _| this.open_overrides())),
             )
             .children(stats.into_iter().map(|(k, v)| {
-                let copy = format!("{}: {}", k, v);
+                // 点击整行复制"值"本身,不带 "标签: " 前缀(复制谱面集 ID /
+                // Beatmap ID 时只要那串数字)。
+                let copy = v.clone();
                 div()
                     .id(gpui::ElementId::Name(format!("info{k}").into()))
+                    // 不许被压扁:卡片不够高时让内容溢出、卡片滚动(以前子元素
+                    // 默认 flex_shrink=1,artist 行带 overflow_hidden,被压扁后
+                    // 字直接裁没,看起来就是"右侧信息栏漏了 artist")
+                    .flex_none()
                     .flex()
                     .flex_row()
                     .justify_between()
@@ -5417,9 +5439,7 @@ impl App {
                     .cursor_pointer()
                     .child(div().text_color(rgb(pal().dim)).child(k))
                     .child(div().child(v))
-                    .on_click(cx.listener(move |_t, _e, _w, cx| {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.clone()));
-                    }))
+                    .on_click(copy_on_click(copy.clone(), cx))
             }))
             .children(if tags.is_empty() {
                 None
@@ -5448,15 +5468,14 @@ impl App {
                                         .text_color(rgb(pal().dim))
                                         .cursor_pointer()
                                         .child(label)
-                                        .on_click(cx.listener(move |_t, _e, _w, cx| {
-                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(t.clone()));
-                                        }))
+                                        .on_click(copy_on_click(t.clone(), cx))
                                 }),
                         ),
                 )
             })
             .child(
                 div()
+                    .flex_none()
                     .flex()
                     .flex_row()
                     .items_center()

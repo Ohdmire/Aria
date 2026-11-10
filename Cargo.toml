@@ -43,6 +43,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 gpui = "0.2.2"
 # 系统托盘:Windows/macOS/Linux 统一实现(菜单就是 gpui::MenuItem + Action)
 gpui-tray = "0.3"
+arboard = { version = "3.7.0", default-features = false, features = ["wayland-data-control"] }
 
 [target.'cfg(windows)'.dependencies]
 winit = "0.30"
