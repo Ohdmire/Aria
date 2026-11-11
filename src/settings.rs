@@ -61,7 +61,7 @@ pub struct Settings {
     /// 手动指定的 osu!stable 安装目录(None = 自动检测)。
     #[serde(default)]
     pub stable_dir: Option<String>,
-    /// 曲库播放模式(单曲循环/顺序/随机)。
+    /// 曲库播放模式(单曲循环/顺序/随机/不重复随机)。
     #[serde(default)]
     pub play_mode: PlayMode,
     /// 顺序/随机播放的来源收藏夹(None = 全部谱面)。
