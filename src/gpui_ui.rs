@@ -3046,32 +3046,29 @@ fn sample_gradient(spectrum: &[(f64, [u8; 3])], value: f64) -> [u8; 3] {
     spectrum[spectrum.len() - 1].1
 }
 
-/// 谱面集状态文字标签(osu!lazer `BeatmapSetStatus`)。
+/// 谱面状态徽章,取值和配色跟 LazerExporter / osu-web list-view 一致。
 ///
-/// 取值(见 `lazer::LazerSet::status`):-3 Unknown / -2 Unsubmitted /
-/// 0 Pending / 1 Ranked / 2 Approved / 3 Qualified / 4 Loved /
-/// 5 Graveyard / 6 WIP / 7 NeedsUpdate。
-/// -3 不显示:osu!stable 源没有在线状态,整库都是 -3,画出来会满屏灰标。
+/// `BeatmapOnlineStatus`:-4 本地修改 / -3 未知不显示;
+/// -2 graveyard / -1 wip / 0 pending / 1 ranked / 2 approved /
+/// 3 qualified / 4 loved。
 fn status_badge(status: i32) -> impl IntoElement {
     let (label, bg, fg) = match status {
-        1 => ("ranked", 0xb3ff66u32, 0x1a2a00u32),
-        2 => ("approved", 0x99ee55, 0x1a2a00),
-        3 => ("qualified", 0xffd966, 0x2a2000),
-        4 => ("loved", 0xff66aa, 0xffffff),
-        0 => ("pending", 0x6aa0e0, 0xffffff),
-        5 => ("graveyard", 0x777788, 0xffffff),
-        6 => ("wip", 0xd8a24a, 0x2a1c00),
-        7 => ("needs update", 0xe06666, 0xffffff),
-        -2 => ("unsubmitted", 0x777788, 0xffffff),
-        _ => ("", 0x777788, 0xffffff),
+        1 => ("RANKED", 0xb3e680u32, 0x46393fu32),
+        2 => ("APPROVED", 0xb3e680, 0x46393f),
+        3 => ("QUALIFIED", 0x80c4e6, 0x46393f),
+        4 => ("LOVED", 0xe680ad, 0x46393f),
+        0 => ("PENDING", 0xe5cc80, 0x46393f),
+        -1 => ("WIP", 0xe5a280, 0x46393f),
+        -2 => ("GRAVEYARD", 0x000000, 0x705c65),
+        _ => ("", 0, 0),
     };
     if label.is_empty() {
         return div().into_any_element();
     }
     div()
         .flex_none()
-        .px(px(5.0))
-        .py(px(1.0))
+        .px(px(8.0))
+        .py(px(2.0))
         .rounded_full()
         .bg(rgb(bg))
         .text_color(rgb(fg))
