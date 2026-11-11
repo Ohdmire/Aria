@@ -136,6 +136,22 @@ fn stable_root_auto() -> Option<PathBuf> {
     None
 }
 
+/// `osu!.db` 的 RankedStatus 收成和 lazer 一样的 `BeatmapOnlineStatus`。
+///
+/// 库里 pending、wip、graveyard 是同一个字节,分不开,都显示成 pending。
+/// unknown 和 unsubmitted 没有对应徽章。
+fn stable_status(status: osu_db::listing::RankedStatus) -> i32 {
+    use osu_db::listing::RankedStatus::*;
+    match status {
+        Ranked => 1,
+        Approved => 2,
+        Qualified => 3,
+        Loved => 4,
+        PendingWipGraveyard => 0,
+        Unknown | Unsubmitted => -3,
+    }
+}
+
 /// 无 Mod 星级(osu!.db 星级表按 ModSet 位掩码存,0 = NM)。
 fn nomod_star(ratings: &[(osu_db::ModSet, f64)]) -> f64 {
     ratings
@@ -216,6 +232,7 @@ pub fn library(root: &Path) -> Result<LazerLibrary, String> {
             hp: b.hp_drain as f64,
             bpm: bpm_max(&b.timing_points),
             online_id: b.beatmap_id as i64,
+            status: stable_status(b.status),
         });
     }
 
@@ -272,7 +289,7 @@ pub fn library(root: &Path) -> Result<LazerLibrary, String> {
                             out.push(LazerSet {
                                 id: folder.clone(),
                                 online_id: acc.online_id,
-                                status: -3,
+                                status: acc.beatmaps.first().map(|b| b.status).unwrap_or(-3),
                                 date_added_ms,
                                 artist: std::mem::take(&mut acc.artist),
                                 artist_unicode: std::mem::take(&mut acc.artist_unicode),
