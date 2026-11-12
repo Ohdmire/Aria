@@ -1,4 +1,4 @@
-//! 播放列表:单曲循环 / 顺序 / 随机。曲目只来自用户显式添加(单曲 /
+//! 播放列表:单曲循环 / 顺序 / 随机 / 不重复随机。曲目只来自用户显式添加(单曲 /
 //! 批量),任何曲库操作都不自动填充;曲目结束(子进程 Ended 事件)时由
 //! 父进程 advance 并加载下一首。
 
@@ -14,8 +14,10 @@ pub enum PlayMode {
     /// 顺序播放:收藏夹按收藏顺序,否则全部谱面按曲库顺序(默认)。
     #[default]
     ListOrder,
-    /// 随机播放(同一来源列表内随机,不与上一首重复)。
+    /// 随机播放:每次随机挑一首,只避开正在播的那首(短期内可能重复)。
     Random,
+    /// 不重复随机:洗好一整轮顺序依次播,一轮播完之前不重复,播完重洗。
+    Shuffle,
 }
 
 impl PlayMode {
@@ -24,6 +26,7 @@ impl PlayMode {
             "single_loop" => Some(PlayMode::SingleLoop),
             "list_order" => Some(PlayMode::ListOrder),
             "random" => Some(PlayMode::Random),
+            "shuffle" => Some(PlayMode::Shuffle),
             _ => None,
         }
     }

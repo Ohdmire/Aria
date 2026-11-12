@@ -653,7 +653,7 @@ struct App {
     // 队列
     queue: Vec<QueueTrack>,
     pos: usize,
-    /// 随机模式:队列下标的一次性洗牌排列(整轮播完前不重复)。
+    /// 不重复随机:队列下标的一次性洗牌排列(整轮播完前不重复)。
     rand_order: Vec<usize>,
     /// 当前曲目在 `rand_order` 中的位置。
     rand_pos: usize,
@@ -1615,9 +1615,16 @@ impl App {
         if self.queue.is_empty() {
             return;
         }
-        if self.settings.play_mode == crate::playlist::PlayMode::Random {
-            self.step_random(delta);
-            return;
+        match self.settings.play_mode {
+            crate::playlist::PlayMode::Random => {
+                self.step_pure_random();
+                return;
+            }
+            crate::playlist::PlayMode::Shuffle => {
+                self.step_shuffle(delta);
+                return;
+            }
+            _ => {}
         }
         let n = self.queue.len() as isize;
         let next = (self.pos as isize + delta).rem_euclid(n) as usize;
@@ -1630,10 +1637,29 @@ impl App {
         shuffled_indices(&mut self.rand_state, n, avoid)
     }
 
-    /// 随机模式的前进/后退:沿一次性洗好的排列走,整轮播完前不重复;
+    /// 纯随机:每次随机挑一首,只避开正在播的那首(可能短期重复)。
+    fn step_pure_random(&mut self) {
+        let n = self.queue.len();
+        if n == 0 {
+            return;
+        }
+        if n == 1 {
+            self.play_index(0);
+            return;
+        }
+        let cur = self.pos.min(n - 1);
+        // 在其余 n-1 首里均匀挑一首,天然避开当前曲
+        let mut idx = (xorshift(&mut self.rand_state) as usize) % (n - 1);
+        if idx >= cur {
+            idx += 1;
+        }
+        self.play_index(idx);
+    }
+
+    /// 不重复随机的前进/后退:沿一次性洗好的排列走,整轮播完前不重复;
     /// 走完一轮重洗(首项避开刚播完的那首)。队列增删或手动点播后会按
     /// 当前曲目重新定位游标,不会因为换了歌就从头开始。
-    fn step_random(&mut self, delta: isize) {
+    fn step_shuffle(&mut self, delta: isize) {
         let n = self.queue.len();
         if n == 0 {
             return;
@@ -2302,7 +2328,8 @@ impl App {
                 self.settings.play_mode = match self.settings.play_mode {
                     crate::playlist::PlayMode::SingleLoop => crate::playlist::PlayMode::ListOrder,
                     crate::playlist::PlayMode::ListOrder => crate::playlist::PlayMode::Random,
-                    crate::playlist::PlayMode::Random => crate::playlist::PlayMode::SingleLoop,
+                    crate::playlist::PlayMode::Random => crate::playlist::PlayMode::Shuffle,
+                    crate::playlist::PlayMode::Shuffle => crate::playlist::PlayMode::SingleLoop,
                 };
             }
             "source" => {
@@ -2884,8 +2911,8 @@ impl App {
             self.sb_hover.set(None);
             dirty = true;
         }
-        // 曲终自动切歌:单曲循环重播本曲;顺序/随机都走 step(),
-        // 随机模式沿洗好的整轮排列前进(不再是"下一首 +1")。
+        // 曲终自动切歌:单曲循环重播本曲;其余模式都走 step():
+        // 顺序 +1,随机每次随机挑,不重复随机沿洗好的整轮排列前进。
         let ended = {
             let mut st = self.status.lock().unwrap();
             std::mem::take(&mut st.ended)
@@ -4024,6 +4051,7 @@ impl App {
                 self.settings.play_mode = match value.as_str() {
                     "single" => crate::playlist::PlayMode::SingleLoop,
                     "random" => crate::playlist::PlayMode::Random,
+                    "shuffle" => crate::playlist::PlayMode::Shuffle,
                     _ => crate::playlist::PlayMode::ListOrder,
                 };
                 self.send(json!({"cmd": "set_loop",
@@ -5772,7 +5800,7 @@ impl App {
                                 // 源以拖动状态为准,避免陈旧载荷。
                                 let from = this.dragging.unwrap_or(src);
                                 let target = this.drag_over.unwrap_or(from);
-                                if this.settings.play_mode != crate::playlist::PlayMode::Random {
+                                if !matches!(this.settings.play_mode, crate::playlist::PlayMode::Random | crate::playlist::PlayMode::Shuffle) {
                                     this.move_to(from, target);
                                 }
                                 this.dragging = None;
@@ -5792,7 +5820,7 @@ impl App {
                             // 多选模式下禁止拖动排序,否则会打乱已选中的条目;
                             // 随机模式下顺序无意义,也不给拖。
                             let can_drag = !app.select_mode
-                                && app.settings.play_mode != crate::playlist::PlayMode::Random;
+                                && !matches!(app.settings.play_mode, crate::playlist::PlayMode::Random | crate::playlist::PlayMode::Shuffle);
                             let mut handle = div()
                                 .id(gpui::ElementId::Name(format!("drag{i}").into()))
                                 .w(px(16.0))
@@ -7504,13 +7532,15 @@ impl App {
                             crate::playlist::PlayMode::SingleLoop => "single".to_string(),
                             crate::playlist::PlayMode::ListOrder => "list".to_string(),
                             crate::playlist::PlayMode::Random => "random".to_string(),
+                            crate::playlist::PlayMode::Shuffle => "shuffle".to_string(),
                         },
                         vec![
                             ("list".into(), crate::t!("play.order").into()),
                             ("single".into(), crate::t!("play.single").into()),
                             ("random".into(), crate::t!("play.random").into()),
+                            ("shuffle".into(), crate::t!("play.shuffle").into()),
                         ],
-                        Some(104.0),
+                        Some(120.0),
                         cx,
                     ))
 

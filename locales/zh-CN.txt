@@ -147,6 +147,7 @@ override.saved = 个性设置已保存
 override.title = 当前曲目个性设置
 play.order = 顺序
 play.random = 随机
+play.shuffle = 不重复随机
 play.single = 单曲循环
 queue.empty = 播放列表是空的
 queue.empty_hint = 播放列表为空,先去曲库添加
