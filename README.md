@@ -70,7 +70,7 @@ pnpm build:setup:all          # Windows 安装包
 ## 特别感谢
 
 - [xlfish233](https://osu.ppy.sh/users/34424018) —— Token Provider
-- [Citrusis](https://osu.ppy.sh/users/30298378) —— Logo 设计
+- [Citrusis](https://osu.ppy.sh/users/30298378) —— Logo Design
 - pxyxy —— 5元赞助~
 - [telecomadm1145](https://osu.ppy.sh/users/30656658) —— 5元赞助~
 - 有人 —— 5元赞助~

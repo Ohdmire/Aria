@@ -333,7 +333,7 @@ enum Field {
     NumStarMin,
     /// 批量导入对话框里的自定义星级(只改对话框草稿,不动全局设置)。
     NumBatchStar,
-    /// 默认快速加入选项里的"最接近指定星级"数值(与全局自定义星级共用)。
+    /// 默认快速加入选项里的crate::t!("diff.closest_policy")数值(与全局自定义星级共用)。
     NumQuickStar,
     /// 曲目个性设置里的数值项(草稿,保存后才写入)。
     OvOffset,
@@ -901,10 +901,28 @@ fn lerp_rgb(a: u32, b: u32, t: f32) -> u32 {
     ch(16) | ch(8) | ch(0)
 }
 
+fn monitor_choices() -> Vec<(String, String)> {
+    crate::win::list_monitors()
+        .into_iter()
+        .map(|m| {
+            let suffix = if m.primary {
+                crate::t!("fmt.monitor_suffix")
+            } else {
+                ""
+            };
+            (
+                crate::tf!("fmt.monitor", model = m.model, w = m.w, h = m.h, suffix = suffix),
+                m.device,
+            )
+        })
+        .collect()
+}
+
 impl App {
     fn new(cx: &mut Context<Self>) -> Self {
         let dir = data_dir();
         let s = crate::settings::load_from(&dir);
+        crate::i18n::set_current(&s.language);
         apply_palette(s.theme_mode != "light", &s.accent);
         // 随机播放种子:时间纳秒 ^ 进程 id,避免每次启动洗牌序列相同
         let rand_seed = std::time::SystemTime::now()
@@ -1009,23 +1027,9 @@ impl App {
             pending_play: None,
             path_cache: load_path_cache(),
             status_line: String::new(),
-            monitors: crate::win::list_monitors()
-                .into_iter()
-                .map(|m| {
-                    (
-                        format!(
-                            "显示器 {}({}×{}{})",
-                            m.model,
-                            m.w,
-                            m.h,
-                            if m.primary { ",主屏" } else { "" }
-                        ),
-                        m.device,
-                    )
-                })
-                .collect(),
+            monitors: monitor_choices(),
             audio_devs: crate::audio::output_devices(),
-            skins: vec![("内置 Argon".to_string(), None)],
+            skins: vec![(crate::t!("settings.skin_argon").to_string(), None)],
             logo: Arc::new(gpui::Image::from_bytes(
                 gpui::ImageFormat::Png,
                 include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/icons/128x128.png")).to_vec(),
@@ -1094,7 +1098,7 @@ impl App {
         // 曲库源/目录可能刚变过:顺手重新采集自动检测路径(不逐帧做)
         self.refresh_probes();
         self.loading = true;
-        self.status_line = "曲库加载中…".to_string();
+        self.status_line = crate::t!("library.loading_ellipsis").to_string();
         let source = self.settings.source.clone();
         let lazer_dir = self.settings.lazer_dir.clone();
         let stable_dir = self.settings.stable_dir.clone();
@@ -1154,7 +1158,7 @@ impl App {
                     }
                     let collections =
                         lib.collections.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
-                    let mut skins = vec![("内置 Argon".to_string(), None)];
+                    let mut skins = vec![(crate::t!("settings.skin_argon").to_string(), None)];
                     for sk in &lib.skins {
                         let label = if sk.creator.is_empty() {
                             sk.name.clone()
@@ -1178,7 +1182,7 @@ impl App {
                     }
                     LibPayload {
                         thumbs: HashMap::new(),
-                        status_line: format!("{} 个谱面集", all.len()),
+                        status_line: crate::tf!("fmt.library_count", n = all.len()),
                         lib,
                         all_rows: all,
                         collections,
@@ -1192,8 +1196,8 @@ impl App {
                     all_rows: Vec::new(),
                     collections: Vec::new(),
                     cover_paths: HashMap::new(),
-                    skins: vec![("内置 Argon".to_string(), None)],
-                    status_line: format!("曲库解析失败:{e}"),
+                    skins: vec![(crate::t!("settings.skin_argon").to_string(), None)],
+                    status_line: crate::tf!("fmt.library_failed", err = e),
                 },
                 None => LibPayload {
                     thumbs: HashMap::new(),
@@ -1201,8 +1205,8 @@ impl App {
                     all_rows: Vec::new(),
                     collections: Vec::new(),
                     cover_paths: HashMap::new(),
-                    skins: vec![("内置 Argon".to_string(), None)],
-                    status_line: "未找到 osu! 数据目录".to_string(),
+                    skins: vec![(crate::t!("settings.skin_argon").to_string(), None)],
+                    status_line: crate::t!("library.no_data").to_string(),
                 },
             };
             *slot.lock().unwrap() = Some(payload);
@@ -1385,7 +1389,7 @@ impl App {
             .filter(|e| Path::new(&e.path).is_file());
         if self.lib.is_none() && cached_explicit.is_none() {
             self.pending_play = Some((set_id.to_string(), sha2.map(|s| s.to_string()), mods));
-            self.toast("曲库加载中…完成后自动播放");
+            self.toast(crate::t!("library.then_play"));
             return;
         }
         // 难度策略:显式难度优先,否则按设置(最难 / 最容易 / 指定星级)
@@ -1415,11 +1419,11 @@ impl App {
             Some(e) => (e.path, e.manifest),
             None => {
                 let Some((path, manifest)) = self.resolve_path(set_id, &chosen) else {
-                    self.toast("找不到谱面文件(曲库可能已更新,刷新曲库试试)");
+                    self.toast(crate::t!("toast.missing_file"));
                     return;
                 };
                 if !Path::new(&path).is_file() {
-                    self.toast("谱面文件不存在,刷新曲库后重试");
+                    self.toast(crate::t!("toast.file_missing"));
                     return;
                 }
                 self.path_cache.insert(
@@ -1434,7 +1438,7 @@ impl App {
         let eff = self.settings.effective_for(set_id);
         self.spawn_if_needed();
         let Some(child) = &self.child else {
-            self.toast("壁纸进程启动失败");
+            self.toast(crate::t!("toast.wallpaper_failed"));
             return;
         };
         // 开始播放 = 退出预览:右侧信息卡要跟着新歌走,不能停在之前预览的那首
@@ -1488,7 +1492,7 @@ impl App {
                 }
             }
         } else {
-            self.toast("下发 Load 失败");
+            self.toast(crate::t!("toast.load_failed"));
         }
     }
 
@@ -1590,7 +1594,7 @@ impl App {
         };
         if !loaded {
             if self.queue.is_empty() {
-                self.toast("播放列表为空,先去曲库添加");
+                self.toast(crate::t!("queue.empty_hint"));
                 return;
             }
             let i = self.pos.min(self.queue.len() - 1);
@@ -1702,6 +1706,25 @@ impl App {
         sync_close_mode(&self.settings);
     }
 
+    /// 切换界面语言:立刻重画文案,并重做依赖语言的显示器名 / 状态行 / 托盘菜单。
+    fn apply_language(&mut self, code: &str, cx: &mut Context<Self>) {
+        self.settings.language = code.to_string();
+        crate::i18n::set_current(code);
+        self.monitors = monitor_choices();
+        if let Some(first) = self.skins.first_mut() {
+            if first.1.is_none() {
+                first.0 = crate::t!("settings.skin_argon").to_string();
+            }
+        }
+        if self.loading {
+            self.status_line = crate::t!("library.loading_ellipsis").to_string();
+        } else if self.lib.is_some() {
+            self.status_line = crate::tf!("fmt.library_count", n = self.all_rows.len());
+        }
+        self.persist();
+        crate::tray::refresh(cx);
+    }
+
     /// 窗口尺寸变化后延迟落盘:拖拽缩放时每帧都在变,别每一帧都写文件。
     /// 序号自增,只有"最后一次变化"的定时器会真正保存。
     fn queue_window_size_save(&mut self, cx: &mut Context<Self>) {
@@ -1731,6 +1754,8 @@ impl App {
         fresh.lazer_set = old.lazer_set;
         fresh.lazer_sha2 = old.lazer_sha2;
         fresh.lazer_diff = old.lazer_diff;
+        // 语言是安装时选定、之后在界面里改的偏好,恢复默认不动它。
+        fresh.language = old.language;
         self.settings = fresh;
 
         apply_palette(self.settings.theme_mode != "light", &self.settings.accent);
@@ -1752,7 +1777,7 @@ impl App {
         self.apply_filter();
         // 能热更新的参数立刻生效
         self.send_live_settings();
-        self.toast("已恢复默认设置");
+        self.toast(crate::t!("toast.defaults_restored"));
     }
 
     /// 子进程刚(重)启动时,把保存的会话参数一次性下发。
@@ -1932,7 +1957,7 @@ impl App {
             t.artist_u = r.artist_u.clone();
             t.length_ms = len;
             self.save_queue();
-            self.toast("已更新现有条目");
+            self.toast(crate::t!("toast.updated_entry"));
             return;
         }
         self.queue.push(QueueTrack {
@@ -1946,7 +1971,7 @@ impl App {
             mods,
         });
         self.save_queue();
-        self.toast("已加入播放列表");
+        self.toast(crate::t!("toast.added_playlist"));
     }
 
     fn add_to_queue(&mut self, set_id: &str) {
@@ -1975,7 +2000,7 @@ impl App {
             t.artist_u = r.artist_u.clone();
             t.length_ms = len;
             self.save_queue();
-            self.toast("已更新现有条目");
+            self.toast(crate::t!("toast.updated_entry"));
             return;
         }
         self.queue.push(QueueTrack {
@@ -1989,7 +2014,7 @@ impl App {
             mods,
         });
         self.save_queue();
-        self.toast("已加入播放列表");
+        self.toast(crate::t!("toast.added_playlist"));
     }
 
     /// 把当前筛选结果全部加入播放列表:新条目追加,已存在条目原位更新,
@@ -2033,7 +2058,7 @@ impl App {
             added += 1;
         }
         self.save_queue();
-        self.toast(format!("已加入 {added} 条,更新 {updated} 条"));
+        self.toast(crate::tf!("fmt.toast_added", added = added, updated = updated));
     }
 
     fn unload(&mut self) {
@@ -2201,7 +2226,7 @@ impl App {
                 let on = !self.settings.autostart;
                 match crate::settings::set_autostart(on) {
                     Ok(()) => self.settings.autostart = on,
-                    Err(e) => self.toast(format!("自启设置失败:{e}")),
+                    Err(e) => self.toast(crate::tf!("fmt.autostart_failed", err = e)),
                 }
             }
             "log" => {
@@ -2712,7 +2737,7 @@ impl App {
                 self.settings.hotkey_toggle = t.toggle;
                 self.settings.hotkey_next = t.next;
             }
-            Err(e) => self.toast(format!("快捷键:{e}")),
+            Err(e) => self.toast(crate::tf!("fmt.hotkey_failed", err = e)),
         }
     }
 
@@ -3212,7 +3237,7 @@ fn tri_value(key: &str) -> Option<bool> {
 fn mods_label(bits: u32) -> String {
     let names = [(8u32, "HD"), (16, "HR"), (2, "EZ"), (64, "DT"), (256, "HT"), (512, "NC")];
     let on: Vec<&str> = names.iter().filter(|(b, _)| bits & b != 0).map(|(_, n)| *n).collect();
-    if on.is_empty() { "无".to_string() } else { on.join("+") }
+    if on.is_empty() { crate::t!("label.none").to_string() } else { on.join("+") }
 }
 
 fn pick_text(a: &str, b: &str, unicode: bool) -> String {
@@ -3498,10 +3523,10 @@ impl Render for App {
             window.resize(gpui::size(px(w), px(h)));
             // 下一帧按窗口真实尺寸重新记,顺带让列表重新测量一遍。
             self.last_size = (0.0, 0.0);
-            self.toast(format!(
-                "窗口大小已重置为 {}×{}",
-                w.round() as u32,
-                h.round() as u32
+            self.toast(crate::tf!(
+                "fmt.window_reset",
+                w = w.round() as u32,
+                h = h.round() as u32
             ));
         }
         let vs = window.viewport_size();
@@ -3654,7 +3679,7 @@ impl Render for App {
                         div()
                             .text_xs()
                             .text_color(rgb(pal().dim))
-                            .child("osu! storyboard 桌面动态壁纸"),
+                            .child(crate::t!("subtitle")),
                     ),
             )
             .child(div().flex_1())
@@ -3673,9 +3698,9 @@ impl Render for App {
                     .bg(if running { rgb(pal().ok_bg) } else { rgb(pal().ctl) })
                     .text_xs()
                     .text_color(if running { rgb(pal().ok_fg) } else { rgb(pal().dim) })
-                    .child(if running { "● 运行中" } else { "○ 未运行" })
+                    .child(if running { crate::t!("status.running") } else { crate::t!("status.stopped") })
             })
-            .child(self.small_btn("关于", cx, |this, cx| {
+            .child(self.small_btn(crate::t!("ui.about"), cx, |this, cx| {
                 this.about = true;
                 cx.notify();
             }));
@@ -3689,9 +3714,9 @@ impl Render for App {
             .px_2()
             .py_1()
             .bg(rgb(pal().panel))
-            .child(self.tab(format!("播放列表 · {}", self.queue.len()), View::Queue, cx))
-            .child(self.tab("曲库".to_string(), View::Library, cx))
-            .child(self.tab("设置".to_string(), View::Settings, cx));
+            .child(self.tab(crate::tf!("fmt.tab_playlist", n = self.queue.len()), View::Queue, cx))
+            .child(self.tab(crate::t!("tab.library").to_string(), View::Library, cx))
+            .child(self.tab(crate::t!("tab.settings").to_string(), View::Settings, cx));
 
         let content = match self.view {
             View::Queue => self.queue_panel(cx).into_any_element(),
@@ -4324,15 +4349,15 @@ impl App {
             .child(if active {
                 if shown.is_empty() && Self::is_hotkey(field) {
                     // 捕获中:提示"按键",不是让你打字
-                    "按下组合键…▏".to_string()
+                    crate::t!("field.capture").to_string()
                 } else {
                     format!("{}▏", shown)
                 }
             } else if shown.is_empty() {
                 match field {
-                    Field::Search => "搜索".to_string(),
+                    Field::Search => crate::t!("btn.search").to_string(),
                     Field::HotkeyPrev | Field::HotkeyToggle | Field::HotkeyNext => {
-                        "未设置".to_string()
+                        crate::t!("field.unset").to_string()
                     }
                     _ => "…".to_string(),
                 }
@@ -4384,18 +4409,18 @@ impl App {
                         }
                         .to_string(),
                         vec![
-                            ("added".into(), "按导入时间".into()),
-                            ("artist".into(), "按作者".into()),
-                            ("title".into(), "按标题".into()),
-                            ("creator".into(), "按谱师".into()),
-                            ("star".into(), "按难度".into()),
-                            ("size".into(), "按大小".into()),
-                            ("collection".into(), "按收藏顺序".into()),
+                            ("added".into(), crate::t!("sort.added").into()),
+                            ("artist".into(), crate::t!("sort.artist").into()),
+                            ("title".into(), crate::t!("sort.title").into()),
+                            ("creator".into(), crate::t!("sort.creator").into()),
+                            ("star".into(), crate::t!("sort.star").into()),
+                            ("size".into(), crate::t!("sort.size").into()),
+                            ("collection".into(), crate::t!("sort.collection").into()),
                         ],
                         None,
                         cx,
                     ))
-                    .child(self.small_btn(if self.desc { "降序 ↓" } else { "升序 ↑" }, cx, |this, _| {
+                    .child(self.small_btn(if self.desc { crate::t!("sort.desc") } else { crate::t!("sort.asc") }, cx, |this, _| {
                         this.desc = !this.desc;
                         this.apply_filter();
                     }))
@@ -4432,7 +4457,7 @@ impl App {
                                 cx.notify();
                             }))
                     })
-                    .child(self.small_btn("刷新", cx, |this, _| this.spawn_library_load()))
+                    .child(self.small_btn(crate::t!("btn.refresh"), cx, |this, _| this.spawn_library_load()))
             )
             .child(
                 div()
@@ -4457,7 +4482,7 @@ impl App {
                             .bg(if self.sb_only { rgb(pal().accent) } else { rgb(pal().ctl) })
                             .text_color(if self.sb_only { rgb(0xffffff) } else { rgb(pal().text) })
                             .text_sm()
-                            .child("仅 SB/视频")
+                            .child(crate::t!("library.sb_only"))
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.sb_only = !this.sb_only;
                                 this.settings.sb_only = this.sb_only;
@@ -4467,16 +4492,16 @@ impl App {
                             })),
                     )
                     .child(self.dropdown_w(DropKind::Collection, self.settings.collection.clone().unwrap_or_default(), {
-                            let mut opts = vec![("".to_string(), "全部谱面".to_string())];
+                            let mut opts = vec![("".to_string(), crate::t!("library.all_maps").to_string())];
                             opts.extend(self.collections.iter().map(|c| (c.clone(), c.clone())));
                             opts
                         }, Some(152.0), cx))
 
-                    .child(self.small_btn("全部加入", cx, |this, _| {
+                    .child(self.small_btn(crate::t!("btn.add_all"), cx, |this, _| {
                         // 与旧版一致:不直接入列,先弹确认框(数量 + mods)
                         let n = this.rows.len();
                         if n == 0 {
-                            this.toast("当前过滤条件下没有谱面");
+                            this.toast(crate::t!("library.no_match"));
                             return;
                         }
                         this.mods_dialog = Some(ModsDialog {
@@ -4548,11 +4573,11 @@ impl App {
                     .py_1()
                     .text_sm()
                     .text_color(rgb(pal().dim))
-                    .child(format!(
-                        "{} · 显示 {} / 共 {}",
-                        if self.settings.source == "stable" { "osu!stable" } else { "osu!lazer" },
-                        self.rows.len(),
-                        self.all_rows.len()
+                    .child(crate::tf!(
+                        "fmt.library_shown",
+                        source = if self.settings.source == "stable" { "osu!stable" } else { "osu!lazer" },
+                        shown = self.rows.len(),
+                        total = self.all_rows.len()
                     ))
                     .child(
                         self.settings
@@ -5060,7 +5085,7 @@ impl App {
                             .child({
                                 let filtered = app.star_min > 0.0 || app.star_max > 0.0;
                                 let n = if filtered { r.diffs_in_range } else { r.diffs };
-                                format!("{} · {} · {} 难度", r.artist, r.creator, n)
+                                crate::tf!("fmt.row_meta", artist = r.artist, creator = r.creator, n = n)
                             }),
                     ),
             )
@@ -5254,13 +5279,13 @@ impl App {
                     b.map(|b| b.name.clone()).unwrap_or_default(),
                     b.map(|b| b.star_rating).unwrap_or(0.0),
                     vec![
-                        ("谱师".to_string(), set.creator.clone()),
-                        ("难度数".to_string(), set.beatmaps.len().to_string()),
-                        ("时长".to_string(), format!("{:.0}s", b.map(|x| x.length_ms / 1000.0).unwrap_or(0.0))),
+                        (crate::t!("info.creator").to_string(), set.creator.clone()),
+                        (crate::t!("info.diff_count").to_string(), set.beatmaps.len().to_string()),
+                        (crate::t!("info.length").to_string(), format!("{:.0}s", b.map(|x| x.length_ms / 1000.0).unwrap_or(0.0))),
                         ("BPM".to_string(), format!("{:.0}", b.map(|x| x.bpm).unwrap_or(0.0))),
                         ("AR / OD".to_string(), format!("{:.1} / {:.1}", b.map(|x| x.ar).unwrap_or(0.0), b.map(|x| x.od).unwrap_or(0.0))),
                         ("CS / HP".to_string(), format!("{:.1} / {:.1}", b.map(|x| x.cs).unwrap_or(0.0), b.map(|x| x.hp).unwrap_or(0.0))),
-                        ("谱面集 ID".to_string(), if set.online_id > 0 { set.online_id.to_string() } else { "—".to_string() }),
+                        (crate::t!("info.set_id").to_string(), if set.online_id > 0 { set.online_id.to_string() } else { "—".to_string() }),
                         ("Beatmap ID".to_string(), b.map(|x| if x.online_id > 0 { x.online_id.to_string() } else { "—".to_string() }).unwrap_or_else(|| "—".to_string())),
                     ],
                     set.tags.clone(),
@@ -5353,7 +5378,7 @@ impl App {
                         } else if set_online_id > 0 {
                             cx.open_url(&format!("https://osu.ppy.sh/s/{set_online_id}"));
                         } else {
-                            this.toast("这首没有 osu! 网页(缺少 online id)");
+                            this.toast(crate::t!("toast.no_web"));
                         }
                         cx.notify();
                     }))
@@ -5370,12 +5395,12 @@ impl App {
                             .justify_center()
                             .text_xs()
                             .text_color(rgb(pal().dim))
-                            .child("无封面")
+                            .child(crate::t!("library.no_cover"))
                             .into_any_element(),
                     }),
             )
             .child({
-                let c = if title.is_empty() { "未播放".to_string() } else { title.clone() };
+                let c = if title.is_empty() { crate::t!("queue.not_playing").to_string() } else { title.clone() };
                 div()
                     .id("info-title")
                     .flex_none()
@@ -5416,7 +5441,7 @@ impl App {
                     })
                     .child(star_badge(diff_star))
                     .child(div().flex_1())
-                    .child(self.small_btn("个性设置…", cx, |this, _| this.open_overrides())),
+                    .child(self.small_btn(crate::t!("menu.override"), cx, |this, _| this.open_overrides())),
             )
             .children(stats.into_iter().map(|(k, v)| {
                 // 点击整行复制"值"本身,不带 "标签: " 前缀(复制谱面集 ID /
@@ -5479,7 +5504,7 @@ impl App {
                     .gap_2()
                     .pt_1()
                     .children(if overridden {
-                        Some(div().text_xs().text_color(rgb(pal().warn)).child("已启用个性设置"))
+                        Some(div().text_xs().text_color(rgb(pal().warn)).child(crate::t!("override.enabled")))
                     } else {
                         None
                     }),
@@ -5524,25 +5549,25 @@ impl App {
                 // 总时长只报估算值:1 小时以内按分钟,超过按“X 小时 Y 分钟”,
                 // 不再显示 mm:ss(那是精确进度,不是估算)。
                 if self.queue.is_empty() {
-                    "队列空闲".to_string()
+                    crate::t!("queue.idle").to_string()
                 } else if total <= 0.0 {
-                    format!("{} 首 · 时长未知", self.queue.len())
+                    crate::tf!("fmt.queue_unknown", n = self.queue.len())
                 } else {
                     let total_mins = (secs + 30) / 60;
                     let est = if total_mins == 0 {
-                        "不到 1 分钟".to_string()
+                        crate::t!("queue.under_min").to_string()
                     } else if total_mins < 60 {
-                        format!("约 {total_mins} 分钟")
+                        crate::tf!("fmt.about_mins", n = total_mins)
                     } else {
                         let h = total_mins / 60;
                         let m = total_mins % 60;
                         if m == 0 {
-                            format!("约 {h} 小时")
+                            crate::tf!("fmt.about_hours", h = h)
                         } else {
-                            format!("约 {h} 小时 {m} 分钟")
+                            crate::tf!("fmt.about_hours_mins", h = h, m = m)
                         }
                     };
-                    format!("{} 首 · {}", self.queue.len(), est)
+                    crate::tf!("fmt.queue_summary", n = self.queue.len(), est = est)
                 }
             })
             // 多选模式时「完成」用主题色高亮,提示当前处于选择状态
@@ -5565,7 +5590,7 @@ impl App {
                     .bg(if on { rgb(pal().accent) } else { rgb(pal().ctl) })
                     .text_color(if on { rgb(0xffffff) } else { rgb(pal().text) })
                     .hover(move |st| st.bg(rgb(hover_bg)))
-                    .child(if on { "完成" } else { "多选" })
+                    .child(if on { crate::t!("btn.done") } else { crate::t!("label.multi") })
                     .on_click(cx.listener(|this, _e, _w, cx| {
                         this.commit_num_edit();
                         this.select_mode = !this.select_mode;
@@ -5574,7 +5599,7 @@ impl App {
                     }))
             })
             .children(if self.select_mode {
-                Some(self.small_btn("全选", cx, |this, _| {
+                Some(self.small_btn(crate::t!("btn.select_all"), cx, |this, _| {
                     if this.selected.len() == this.queue.len() {
                         this.selected.clear();
                     } else {
@@ -5584,7 +5609,7 @@ impl App {
             } else {
                 None
             })
-            .child(self.small_btn_w("清空", Some(88.0), cx, |this, _| {
+            .child(self.small_btn_w(crate::t!("btn.clear_queue"), Some(88.0), cx, |this, _| {
                 this.clear_confirm = true;
             }));
 
@@ -5879,7 +5904,7 @@ impl App {
                                         .text_color(rgb(pal().dim))
                                         .child({
                                             let mut sub = if row_artist.is_empty() {
-                                                "曲库加载中".to_string()
+                                                crate::t!("library.loading").to_string()
                                             } else {
                                                 row_artist.clone()
                                             };
@@ -5955,8 +5980,8 @@ impl App {
                             this.view = View::Library;
                             cx.notify();
                         }))
-                        .child(div().text_sm().text_color(rgb(pal().dim)).child("播放列表是空的"))
-                        .child(self.small_btn("去曲库添加", cx, |this, _| this.view = View::Library)),
+                        .child(div().text_sm().text_color(rgb(pal().dim)).child(crate::t!("queue.empty")))
+                        .child(self.small_btn(crate::t!("library.go"), cx, |this, _| this.view = View::Library)),
                 )
             } else {
                 None
@@ -5972,24 +5997,24 @@ impl App {
 
     fn settings_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let s = &self.settings;
-        let mut collections = vec![("".to_string(), "全部".to_string())];
+        let mut collections = vec![("".to_string(), crate::t!("label.all").to_string())];
         collections.extend(self.collections.iter().map(|c| (c.clone(), c.clone())));
-        let mut monitors = vec![("".to_string(), "主屏".to_string())];
+        let mut monitors = vec![("".to_string(), crate::t!("settings.monitor_primary").to_string())];
         monitors.extend(self.monitors.iter().map(|(l, d)| (d.clone(), l.clone())));
-        let mut audio = vec![("".to_string(), "系统默认".to_string())];
+        let mut audio = vec![("".to_string(), crate::t!("settings.device_default").to_string())];
         audio.extend(self.audio_devs.iter().map(|(id, name)| (id.clone(), name.clone())));
-        let mut skins = vec![("".to_string(), "内置 Argon".to_string())];
+        let mut skins = vec![("".to_string(), crate::t!("settings.skin_argon").to_string())];
         skins.extend(self.skins.iter().filter_map(|(label, v)| v.clone().map(|v| (v, label.clone()))));
 
         #[cfg(windows)]
         let restart_explorer = Some(
-            self.small_btn("重启资源管理器", cx, |this, _| {
+            self.small_btn(crate::t!("btn.restart_explorer"), cx, |this, _| {
                 std::thread::spawn(|| {
                     if let Err(e) = crate::win::restart_explorer() {
                         log::warn!("[shell] 重启资源管理器失败: {e}");
                     }
                 });
-                this.toast("正在重启资源管理器…");
+                this.toast(crate::t!("toast.restarting_explorer"));
             })
             .into_any_element(),
         );
@@ -6010,7 +6035,49 @@ impl App {
             .flex_col()
             .pl(px(12.0))
             .pr(px(26.0))
-            .child(section("外观"))
+            .child(section(crate::t!("section.appearance")))
+            .child({
+                let cur = s.language.as_str();
+                let btn = |label: &'static str, value: &'static str, cx: &mut Context<Self>| {
+                    let on = cur == value;
+                    div()
+                        .id(gpui::ElementId::Name(format!("lang{value}").into()))
+                        .px_4()
+                        .py_2()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|st| st.bg(rgb(pal().ctl_hover)))
+                        .bg(if on { rgb(pal().accent) } else { rgb(pal().ctl) })
+                        .text_color(if on { rgb(0xffffff) } else { rgb(pal().text) })
+                        .text_sm()
+                        .child(label)
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            if this.settings.language != value {
+                                this.apply_language(value, cx);
+                            }
+                            cx.notify();
+                        }))
+                };
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .items_center()
+                    .px_2()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(rgb(pal().line2))
+                    .text_sm()
+                    .child(crate::t!("settings.language"))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .child(btn("简体中文", crate::i18n::ZH_CN, cx))
+                            .child(btn("English", crate::i18n::EN, cx)),
+                    )
+            })
             .child({
                 let btn = |label: &'static str, value: &'static str, cur: &str, cx: &mut Context<Self>| {
                     let on = cur == value;
@@ -6042,14 +6109,14 @@ impl App {
                     .border_b_1()
                     .border_color(rgb(pal().line2))
                     .text_sm()
-                    .child("主题")
+                    .child(crate::t!("settings.theme"))
                     .child(
                         div()
                             .flex()
                             .flex_row()
                             .gap_2()
-                            .child(btn("深色", "dark", &s.theme_mode, cx))
-                            .child(btn("浅色", "light", &s.theme_mode, cx)),
+                            .child(btn(crate::t!("settings.theme_dark"), "dark", &s.theme_mode, cx))
+                            .child(btn(crate::t!("settings.theme_light"), "light", &s.theme_mode, cx)),
                     )
             })
             .child({
@@ -6081,7 +6148,7 @@ impl App {
                     .border_b_1()
                     .border_color(rgb(pal().line2))
                     .text_sm()
-                    .child("主题色")
+                    .child(crate::t!("settings.accent"))
                     .child(
                         div()
                             .flex()
@@ -6097,9 +6164,9 @@ impl App {
                     )
             })
             // 曲库/播放条显示原曲名还是 unicode 名(默认开)
-            .child(self.toggle_row("以 Unicode 显示", s.display_unicode, "display_unicode", cx))
+            .child(self.toggle_row(crate::t!("settings.unicode"), s.display_unicode, "display_unicode", cx))
             // 播放分组的题头:内容整体在画面上面,但保留分组标题
-            .child(section("播放"))
+            .child(section(crate::t!("section.playback")))
             // 曲库源(从曲库读取哪一份数据)
             .child({
                 // 用采集好的结果(不逐帧读注册表 / storage.ini)
@@ -6117,7 +6184,7 @@ impl App {
                         b = b
                             .bg(rgb(pal().line2))
                             .text_color(rgb(0x55555f))
-                            .child(div().text_xs().text_color(rgb(0x44444c)).child("未检测到"));
+                            .child(div().text_xs().text_color(rgb(0x44444c)).child(crate::t!("settings.not_detected")));
                     } else {
                         b = b
                             .cursor_pointer()
@@ -6143,7 +6210,7 @@ impl App {
                     .border_b_1()
                     .border_color(rgb(pal().line2))
                     .text_sm()
-                    .child("曲库源")
+                    .child(crate::t!("settings.source"))
                     .child(
                         div()
                             .flex()
@@ -6153,8 +6220,8 @@ impl App {
                             .child(btn("stable", s.source == "stable", stb_ok, cx)),
                     )
             })
-            .child(self.toggle_row("单击封面快速加入", s.quick_add, "quick_add", cx))
-            .child(self.toggle_row("双击后添加到播放列表", s.dblclick_add, "dblclick_add", cx))
+            .child(self.toggle_row(crate::t!("settings.quick_add"), s.quick_add, "quick_add", cx))
+            .child(self.toggle_row(crate::t!("settings.dblclick_add"), s.dblclick_add, "dblclick_add", cx))
             // 难度不再单独成行:统一在「默认快速加入选项」里设置
             .child(
                 div()
@@ -6167,7 +6234,7 @@ impl App {
                     .border_b_1()
                     .border_color(rgb(pal().line2))
                     .text_sm()
-                    .child("默认快速加入选项")
+                    .child(crate::t!("dialog.quick_title"))
                     .child(
                         div()
                             .id("quick-opts")
@@ -6177,47 +6244,47 @@ impl App {
                             .bg(rgb(pal().ctl))
                             .cursor_pointer()
                             .hover(|st| st.bg(rgb(pal().ctl_hover)))
-                            .child(format!(
-                                "mods:{} · 难度:{}",
-                                if s.quick_mods == 0 {
-                                    "无".to_string()
+                            .child({
+                                let mods = if s.quick_mods == 0 {
+                                    crate::t!("label.none").to_string()
                                 } else {
                                     mods_label(s.quick_mods)
-                                },
-                                match s.target_star {
-                                    None => "最难".to_string(),
-                                    Some(t) if t < 0.0 => "最容易".to_string(),
-                                    Some(t) => format!("最接近 ★{t:.1}"),
-                                }
-                            ))
+                                };
+                                let diff = match s.target_star {
+                                    None => crate::t!("diff.hardest").to_string(),
+                                    Some(t) if t < 0.0 => crate::t!("diff.easiest").to_string(),
+                                    Some(t) => crate::tf!("fmt.closest", star = format!("{t:.1}")),
+                                };
+                                crate::tf!("fmt.quick_mods", mods = mods, diff = diff)
+                            })
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.quick_opts = true;
                                 cx.notify();
                             })),
                     ),
             )
-            .child(section("画面"))
+            .child(section(crate::t!("section.display")))
             .child(self.dropdown_row(
-                "渲染模式",
+                crate::t!("settings.render_mode"),
                 DropKind::RenderMode,
                 s.render_mode.clone(),
                 vec![
                     // 与 Tauri 版 ui/index.html 的 #render-mode 同五项、同文案
-                    ("always".into(), "始终渲染".into()),
-                    ("autopause".into(), "全屏时不渲染画面".into()),
-                    ("fs_pause".into(), "全屏时暂停播放".into()),
-                    ("fs_sleep".into(), "全屏时暂停并休眠".into()),
-                    ("off".into(), "播放器模式".into()),
+                    ("always".into(), crate::t!("settings.render_always").into()),
+                    ("autopause".into(), crate::t!("settings.render_autopause").into()),
+                    ("fs_pause".into(), crate::t!("settings.render_fs_pause").into()),
+                    ("fs_sleep".into(), crate::t!("settings.render_fs_sleep").into()),
+                    ("off".into(), crate::t!("settings.render_off").into()),
                 ],
                 cx,
             ))
             // 帧率属于画面渲染,放在画面组靠前位置
             .child(self.dropdown_row(
-                "帧率",
+                crate::t!("settings.fps"),
                 DropKind::Fps,
                 s.fps.to_string(),
                 vec![
-                    ("0".into(), "跟随刷新率".into()),
+                    ("0".into(), crate::t!("settings.fps_follow").into()),
                     ("30".into(), "30 fps".into()),
                     ("60".into(), "60 fps".into()),
                     ("120".into(), "120 fps".into()),
@@ -6226,13 +6293,13 @@ impl App {
                 ],
                 cx,
             ))
-            .child(self.dropdown_row("显示器", DropKind::Monitor, s.monitor.clone().unwrap_or_default(), monitors, cx))
+            .child(self.dropdown_row(crate::t!("settings.monitor"), DropKind::Monitor, s.monitor.clone().unwrap_or_default(), monitors, cx))
             .child(self.dropdown_row(
-                "超分",
+                crate::t!("settings.upscale"),
                 DropKind::Upscale,
                 s.upscale.clone(),
                 vec![
-                    ("off".into(), "关闭".into()),
+                    ("off".into(), crate::t!("btn.close").into()),
                     ("fsr".into(), "FSR".into()),
                     ("anime4k-a".into(), "Anime4K A".into()),
                     ("anime4k-aa".into(), "Anime4K A+A".into()),
@@ -6245,7 +6312,7 @@ impl App {
             ))
             .children(if s.upscale.starts_with("anime4k") {
                 Some(self.dropdown_row(
-                "超分质量",
+                crate::t!("settings.upscale_quality"),
                 DropKind::UpscaleQuality,
                 s.upscale_quality.clone(),
                 vec![
@@ -6260,58 +6327,58 @@ impl App {
             } else {
                 None
             })
-            .child(self.toggle_row("storyboard/视频", s.storyboard, "storyboard", cx))
+            .child(self.toggle_row(crate::t!("settings.storyboard"), s.storyboard, "storyboard", cx))
             .child(self.toggle_row("HD (Hidden)", s.hidden, "hidden", cx))
             .child(self.toggle_row("HUD", s.hud, "hud", cx))
-            .child(self.toggle_row("PP 计数", s.pp, "pp", cx))
-            .child(self.toggle_row("隐藏游玩画面", s.gameplay_hidden, "gameplay_hidden", cx))
-            .child(self.toggle_row("休息段变亮", s.break_lighten, "break_lighten", cx))
-            .child(self.toggle_row("减少打击动画", s.reduce_anim, "reduce_anim", cx))
-            .child(self.slider_row("背景亮度", "bg_opacity", s.bg_opacity, format!("{:.0}%", s.bg_opacity * 100.0), cx))
-            .child(self.toggle_row("滑条渐入", s.snaking_in, "snaking_in", cx))
-            .child(self.toggle_row("滑条渐出", s.snaking_out, "snaking_out", cx))
-            .child(section("音频"))
-            .child(self.toggle_row("打击音效", s.hitsound, "hitsound", cx))
-            .child(self.toggle_row("谱面自带音效", s.beatmap_hitsounds, "beatmap_hitsounds", cx))
-            .child(self.toggle_row("BGM 淡入淡出", s.fade_audio, "fade_audio", cx))
-            .child(self.step_row("音效偏移", format!("{:.0} ms", s.audio_offset_ms), "offset", cx))
-            .child(self.slider_row("BGM 音量", "bgm", s.volume, format!("{:.0}%", s.volume * 100.0), cx))
-            .child(self.slider_row("打击音效音量", "hits", s.hits_volume, format!("{:.0}%", s.hits_volume * 100.0), cx))
-            .child(self.step_row("播放速度", format!("{:.2}x", s.speed), "speed", cx))
-            .child(self.slider_row("总音量", "volume", s.master_volume, format!("{:.0}%", s.master_volume * 100.0), cx))
-            .child(self.dropdown_row("音频输出", DropKind::AudioDevice, s.audio_device.clone().unwrap_or_default(), audio, cx))
-            .child(section("皮肤"))
-            .child(self.dropdown_row("皮肤", DropKind::Skin, s.skin.clone().unwrap_or_default(), skins, cx))
-            .child(self.toggle_row("强制皮肤颜色", s.force_skin_colours, "force_skin_colours", cx))
-            .child(self.toggle_row("光标", s.cursor, "cursor", cx))
-            .child(self.toggle_row("光标轨迹", s.cursor_trail, "cursor_trail", cx))
-            .child(self.toggle_row("光标波纹", s.cursor_ripples, "cursor_ripples", cx))
-            .child(self.step_row("光标大小", format!("{:.2}", s.cursor_size), "cursor_size", cx))
-            .child(section("快捷键"))
-            .child(self.toggle_row("启用全局快捷键", s.hotkeys_enabled, "hotkeys_enabled", cx))
-            .child(self.hotkey_row("上一首", Field::HotkeyPrev, s.hotkey_prev.clone(), cx))
-            .child(self.hotkey_row("播放 / 暂停", Field::HotkeyToggle, s.hotkey_toggle.clone(), cx))
-            .child(self.hotkey_row("下一首", Field::HotkeyNext, s.hotkey_next.clone(), cx))
-            .child(section("系统"))
-            .child(self.toggle_row("启动后自动播放", s.play_on_start, "play_on_start", cx))
-            .child(self.toggle_row("开机自启", s.autostart, "autostart", cx))
-            .child(self.toggle_row("记录日志", s.log_enabled, "log", cx))
-            .child(self.toggle_row("调试窗口", s.debug_window, "debug_window", cx))
+            .child(self.toggle_row(crate::t!("settings.pp"), s.pp, "pp", cx))
+            .child(self.toggle_row(crate::t!("settings.hide_gameplay"), s.gameplay_hidden, "gameplay_hidden", cx))
+            .child(self.toggle_row(crate::t!("settings.break_lighten"), s.break_lighten, "break_lighten", cx))
+            .child(self.toggle_row(crate::t!("settings.reduce_anim"), s.reduce_anim, "reduce_anim", cx))
+            .child(self.slider_row(crate::t!("settings.bg_opacity"), "bg_opacity", s.bg_opacity, format!("{:.0}%", s.bg_opacity * 100.0), cx))
+            .child(self.toggle_row(crate::t!("settings.snaking_in"), s.snaking_in, "snaking_in", cx))
+            .child(self.toggle_row(crate::t!("settings.snaking_out"), s.snaking_out, "snaking_out", cx))
+            .child(section(crate::t!("section.audio")))
+            .child(self.toggle_row(crate::t!("settings.hitsound"), s.hitsound, "hitsound", cx))
+            .child(self.toggle_row(crate::t!("settings.beatmap_hitsounds"), s.beatmap_hitsounds, "beatmap_hitsounds", cx))
+            .child(self.toggle_row(crate::t!("settings.fade"), s.fade_audio, "fade_audio", cx))
+            .child(self.step_row(crate::t!("settings.offset"), format!("{:.0} ms", s.audio_offset_ms), "offset", cx))
+            .child(self.slider_row(crate::t!("settings.bgm_volume"), "bgm", s.volume, format!("{:.0}%", s.volume * 100.0), cx))
+            .child(self.slider_row(crate::t!("settings.hits_volume"), "hits", s.hits_volume, format!("{:.0}%", s.hits_volume * 100.0), cx))
+            .child(self.step_row(crate::t!("settings.speed"), format!("{:.2}x", s.speed), "speed", cx))
+            .child(self.slider_row(crate::t!("settings.master"), "volume", s.master_volume, format!("{:.0}%", s.master_volume * 100.0), cx))
+            .child(self.dropdown_row(crate::t!("settings.audio_device"), DropKind::AudioDevice, s.audio_device.clone().unwrap_or_default(), audio, cx))
+            .child(section(crate::t!("section.skin")))
+            .child(self.dropdown_row(crate::t!("section.skin"), DropKind::Skin, s.skin.clone().unwrap_or_default(), skins, cx))
+            .child(self.toggle_row(crate::t!("settings.force_colours"), s.force_skin_colours, "force_skin_colours", cx))
+            .child(self.toggle_row(crate::t!("settings.cursor"), s.cursor, "cursor", cx))
+            .child(self.toggle_row(crate::t!("settings.cursor_trail"), s.cursor_trail, "cursor_trail", cx))
+            .child(self.toggle_row(crate::t!("settings.cursor_ripples"), s.cursor_ripples, "cursor_ripples", cx))
+            .child(self.step_row(crate::t!("settings.cursor_size"), format!("{:.2}", s.cursor_size), "cursor_size", cx))
+            .child(section(crate::t!("section.hotkeys")))
+            .child(self.toggle_row(crate::t!("settings.hotkeys_enable"), s.hotkeys_enabled, "hotkeys_enabled", cx))
+            .child(self.hotkey_row(crate::t!("action.prev"), Field::HotkeyPrev, s.hotkey_prev.clone(), cx))
+            .child(self.hotkey_row(crate::t!("action.toggle"), Field::HotkeyToggle, s.hotkey_toggle.clone(), cx))
+            .child(self.hotkey_row(crate::t!("action.next"), Field::HotkeyNext, s.hotkey_next.clone(), cx))
+            .child(section(crate::t!("section.system")))
+            .child(self.toggle_row(crate::t!("settings.play_on_start"), s.play_on_start, "play_on_start", cx))
+            .child(self.toggle_row(crate::t!("settings.autostart"), s.autostart, "autostart", cx))
+            .child(self.toggle_row(crate::t!("settings.log"), s.log_enabled, "log", cx))
+            .child(self.toggle_row(crate::t!("settings.debug_window"), s.debug_window, "debug_window", cx))
             .child(self.dropdown_row(
-                "关闭窗口",
+                crate::t!("settings.on_close"),
                 DropKind::CloseAction,
                 s.close_action.clone().unwrap_or_default(),
                 vec![
-                    ("".into(), "询问".into()),
-                    ("min".into(), "最小化".into()),
-                    ("tray".into(), "最小化到托盘".into()),
-                    ("exit".into(), "退出".into()),
+                    ("".into(), crate::t!("settings.close_ask").into()),
+                    ("min".into(), crate::t!("settings.close_min").into()),
+                    ("tray".into(), crate::t!("settings.close_tray").into()),
+                    ("exit".into(), crate::t!("action.quit").into()),
                 ],
                 cx,
             ))
-            .child(section("路径"))
-            .child(self.path_row("osu!lazer 目录", Field::LazerDir, s.lazer_dir.clone(), cx))
-            .child(self.path_row("osu!stable 目录", Field::StableDir, s.stable_dir.clone(), cx))
+            .child(section(crate::t!("section.paths")))
+            .child(self.path_row(crate::t!("settings.lazer_dir"), Field::LazerDir, s.lazer_dir.clone(), cx))
+            .child(self.path_row(crate::t!("settings.stable_dir"), Field::StableDir, s.stable_dir.clone(), cx))
             .child(self.path_row("ffmpeg", Field::Ffmpeg, s.ffmpeg.clone(), cx))
             .child(self.path_row("ffprobe", Field::Ffprobe, s.ffprobe.clone(), cx))
             // 安装包不再内置 ffmpeg:给一个直达下载页的按钮
@@ -6321,7 +6388,7 @@ impl App {
                     .flex_row()
                     .justify_end()
                     .pb_2()
-                    .child(self.small_btn("下载 ffmpeg", cx, |_this, cx| {
+                    .child(self.small_btn(crate::t!("btn.download_ffmpeg"), cx, |_this, cx| {
                         cx.open_url("https://ffmpeg.org/download.html");
                         cx.notify();
                     })),
@@ -6333,31 +6400,31 @@ impl App {
                     .flex_wrap()
                     .gap_2()
                     .py_3()
-                    .child(self.small_btn("导出日志", cx, |this, _| this.export_log()))
-                    .child(self.small_btn("还原桌面壁纸", cx, |this, _| this.restore_wallpaper()))
-                    .child(self.small_btn("重启壁纸进程", cx, |this, _| this.restart_child()))
+                    .child(self.small_btn(crate::t!("btn.export_log"), cx, |this, _| this.export_log()))
+                    .child(self.small_btn(crate::t!("btn.restore_wallpaper"), cx, |this, _| this.restore_wallpaper()))
+                    .child(self.small_btn(crate::t!("btn.restart_wallpaper"), cx, |this, _| this.restart_child()))
                     // Windows 特有:桌面层次乱了 / 壁纸挂不上去时,重启 shell 重建
                     // Progman / DefView / WorkerW(任务栏会闪一下;壁纸进程自己重挂)。
                     .children(restart_explorer)
-                    .child(self.small_btn("重置窗口大小", cx, |this, _| {
+                    .child(self.small_btn(crate::t!("btn.reset_window"), cx, |this, _| {
                         // 回调里没有 Window,标记一下交给下一帧 render 处理
                         this.reset_window_pending = true;
                     }))
                     .child(self.small_btn(
-                        format!("清除全部个性设置 ({})", self.settings.set_overrides.len()),
+                        crate::tf!("fmt.clear_overrides_btn", n = self.settings.set_overrides.len()),
                         cx,
                         |this, _| {
                             if this.settings.set_overrides.is_empty() {
-                                this.toast("还没有任何个性设置");
+                                this.toast(crate::t!("toast.no_overrides"));
                             } else {
                                 this.ov_clear_confirm = true;
                             }
                         },
                     ))
-                    .child(self.small_btn("恢复默认设置", cx, |this, _| {
+                    .child(self.small_btn(crate::t!("btn.restore_defaults"), cx, |this, _| {
                         this.reset_confirm = true;
                     }))
-                    .child(self.danger_btn("退出 Aria", cx, |this, _| {
+                    .child(self.danger_btn(crate::t!("action.quit_app"), cx, |this, _| {
                         #[cfg(target_os = "linux")]
                         let _ = crate::kde::restore_wallpaper();
                         this.persist();
@@ -6384,7 +6451,7 @@ impl App {
             .current_set_id()
             .or_else(|| self.queue.first().map(|t| t.set_id.clone()));
         let Some(set_id) = set_id else {
-            self.toast("先在曲库点选一首曲目");
+            self.toast(crate::t!("library.pick_first"));
             return;
         };
         let ov = self.settings.set_overrides.get(&set_id).cloned().unwrap_or_default();
@@ -6407,9 +6474,9 @@ impl App {
             self.play_index(i);
         }
         self.toast(if self.settings.set_overrides.contains_key(&ed.set_id) {
-            "已启用本谱面集个性设置"
+            crate::t!("override.enabled_this")
         } else {
-            "个性设置已保存"
+            crate::t!("override.saved")
         });
     }
 
@@ -6423,7 +6490,7 @@ impl App {
             let i = self.pos.min(self.queue.len() - 1);
             self.play_index(i);
         }
-        self.toast("已恢复全局设置");
+        self.toast(crate::t!("toast.global_restored"));
     }
 
     /// 原生文件/目录选择(Windows IFileDialog / Linux XDG portal;后台线程,
@@ -6528,16 +6595,16 @@ impl App {
                 .unwrap_or(0)
         ));
         match std::fs::copy(&src, &dst) {
-            Ok(_) => self.toast(format!("日志已导出:{}", dst.display())),
-            Err(e) => self.toast(format!("导出失败:{e}")),
+            Ok(_) => self.toast(crate::tf!("fmt.log_exported", path = dst.display())),
+            Err(e) => self.toast(crate::tf!("fmt.export_failed", err = e)),
         }
     }
 
     fn restore_wallpaper(&mut self) {
         #[cfg(target_os = "linux")]
         match crate::kde::restore_wallpaper() {
-            Ok(()) => self.toast("已还原桌面壁纸"),
-            Err(e) => self.toast(format!("还原失败:{e}")),
+            Ok(()) => self.toast(crate::t!("toast.wallpaper_restored")),
+            Err(e) => self.toast(crate::tf!("fmt.restore_failed", err = e)),
         }
     }
 
@@ -6551,7 +6618,7 @@ impl App {
         if self.child.is_some() {
             self.send_child_settings();
         }
-        self.toast("壁纸进程已重启");
+        self.toast(crate::t!("toast.wallpaper_restarted"));
     }
 
     fn dropdown_row(
@@ -6820,7 +6887,7 @@ impl App {
                     .px_2()
                     .rounded_md()
                     .bg(if on { rgb(pal().accent) } else { rgb(pal().ctl) })
-                    .child(if on { "开" } else { "关" })
+                    .child(if on { crate::t!("label.on") } else { crate::t!("label.off") })
                     .on_click(cx.listener(move |this, _e, _w, cx| {
                         this.toggle(kind);
                         cx.notify();
@@ -6847,7 +6914,7 @@ impl App {
             _ => None,
         });
         let is_default = value.is_none();
-        let shown = effective.clone().unwrap_or_else(|| "未找到(点击浏览选择)".to_string());
+        let shown = effective.clone().unwrap_or_else(|| crate::t!("field.not_found").to_string());
         div()
             .flex()
             .flex_row()
@@ -6879,14 +6946,14 @@ impl App {
                             .child(shown),
                     )
                     .children(if is_default {
-                        Some(div().text_xs().text_color(rgb(pal().dim)).child("自动检测(默认)"))
+                        Some(div().text_xs().text_color(rgb(pal().dim)).child(crate::t!("field.auto_detect")))
                     } else {
                         None
                     }),
             )
             // 四行按钮同标签、同调用点:必须带 field 当 key,否则只有第一行能点
-            .child(self.small_btn_keyed("浏览…", format!("{field:?}"), None, cx, move |this, _| this.browse(field)))
-            .child(self.small_btn_keyed("恢复默认", format!("{field:?}"), Some(96.0), cx, move |this, _| {
+            .child(self.small_btn_keyed(crate::t!("btn.browse"), format!("{field:?}"), None, cx, move |this, _| this.browse(field)))
+            .child(self.small_btn_keyed(crate::t!("btn.restore_default"), format!("{field:?}"), Some(96.0), cx, move |this, _| {
                 match field {
                     Field::LazerDir => this.settings.lazer_dir = None,
                     Field::StableDir => this.settings.stable_dir = None,
@@ -6945,7 +7012,7 @@ impl App {
                             .text_sm()
                             .cursor_pointer()
                             .hover(|st| st.bg(rgb(pal().ctl_hover)))
-                            .child("清除")
+                            .child(crate::t!("btn.clear"))
                             .on_click(cx.listener(move |this, _e, _w, cx| {
                                 this.commit_num_edit();
                                 match field {
@@ -7225,7 +7292,7 @@ impl App {
                         })
                 })
                 .filter(|t| t != " - ")
-                .unwrap_or_else(|| "未播放".to_string())
+                .unwrap_or_else(|| crate::t!("queue.not_playing").to_string())
         };
 
         div()
@@ -7416,7 +7483,7 @@ impl App {
                         Some(92.0),
                         cx,
                     ))
-                    .child(div().text_xs().text_color(rgb(pal().dim)).child("音量"))
+                    .child(div().text_xs().text_color(rgb(pal().dim)).child(crate::t!("info.volume")))
                     .child(self.slider(
                         "volume",
                         self.settings.master_volume,
@@ -7439,9 +7506,9 @@ impl App {
                             crate::playlist::PlayMode::Random => "random".to_string(),
                         },
                         vec![
-                            ("list".into(), "顺序".into()),
-                            ("single".into(), "单曲循环".into()),
-                            ("random".into(), "随机".into()),
+                            ("list".into(), crate::t!("play.order").into()),
+                            ("single".into(), crate::t!("play.single").into()),
+                            ("random".into(), crate::t!("play.random").into()),
                         ],
                         Some(104.0),
                         cx,
@@ -7506,18 +7573,18 @@ impl App {
                     .border_1()
                     .border_color(rgb(pal().line))
                     .child(div().text_lg().child(if is_batch {
-                        "加入播放列表"
+                        crate::t!("dialog.add_playlist")
                     } else if is_bulk {
-                        "编辑所选条目(mods / 难度)"
+                        crate::t!("dialog.edit_selected")
                     } else if dlg.queue_index.is_some() {
-                        "编辑条目(mods / 难度)"
+                        crate::t!("dialog.edit_entry")
                     } else {
-                        "加入播放列表"
+                        crate::t!("dialog.add_playlist")
                     }))
                     .child(div().text_sm().text_color(rgb(pal().dim)).child(if let Some(n) = dlg.batch {
-                        format!("{n} 个谱面集将加入播放列表(已在列表中的会更新)")
+                        crate::tf!("fmt.batch_add", n = n)
                     } else if let Some(sel) = &dlg.bulk {
-                        format!("已选 {} 首", sel.len())
+                        crate::tf!("fmt.selected", n = sel.len())
                     } else {
                         title
                     }))
@@ -7547,7 +7614,7 @@ impl App {
                                     .flex()
                                     .flex_col()
                                     .gap_1()
-                                    .child(div().text_xs().text_color(rgb(pal().dim)).child("难度"))
+                                    .child(div().text_xs().text_color(rgb(pal().dim)).child(crate::t!("info.difficulty")))
                                     .child(
                                         div()
                                             .flex()
@@ -7632,17 +7699,17 @@ impl App {
                                 .flex()
                                 .flex_col()
                                 .gap_1()
-                                .child(div().text_xs().text_color(rgb(pal().dim)).child("难度"))
+                                .child(div().text_xs().text_color(rgb(pal().dim)).child(crate::t!("info.difficulty")))
                                 .child(
                                     div()
                                         .flex()
                                         .flex_row()
                                         .items_center()
                                         .gap_1()
-                                        .child(diff_btn("最难", diff == BatchDiff::Hardest, BatchDiff::Hardest, cx))
-                                        .child(diff_btn("最容易", diff == BatchDiff::Easiest, BatchDiff::Easiest, cx))
+                                        .child(diff_btn(crate::t!("diff.hardest"), diff == BatchDiff::Hardest, BatchDiff::Hardest, cx))
+                                        .child(diff_btn(crate::t!("diff.easiest"), diff == BatchDiff::Easiest, BatchDiff::Easiest, cx))
                                         .child(diff_btn(
-                                            "自定义星级",
+                                            crate::t!("diff.custom"),
                                             matches!(diff, BatchDiff::Custom(_)),
                                             BatchDiff::Custom(custom_star),
                                             cx,
@@ -7672,8 +7739,8 @@ impl App {
                             .justify_end()
                             .gap_2()
                             .pt_2()
-                            .child(self.small_btn("取消", cx, |this, _| this.mods_dialog = None))
-                            .child(self.small_btn(if is_batch { "加入" } else { "确定" }, cx, |this, _| {
+                            .child(self.small_btn(crate::t!("btn.cancel"), cx, |this, _| this.mods_dialog = None))
+                            .child(self.small_btn(if is_batch { crate::t!("btn.add") } else { crate::t!("btn.ok") }, cx, |this, _| {
                                 if let Some(d) = this.mods_dialog.take() {
                                     if d.batch.is_some() {
                                         this.add_filtered_with_mods(d.mods, d.batch_diff);
@@ -7805,17 +7872,17 @@ impl App {
                     .bg(rgb(pal().panel))
                     .border_1()
                     .border_color(rgb(pal().line))
-                    .child(div().text_lg().child("星级过滤"))
-                    .child(row("最低星级", true, cx))
-                    .child(row("最高星级", false, cx))
+                    .child(div().text_lg().child(crate::t!("dialog.star_filter")))
+                    .child(row(crate::t!("dialog.star_min"), true, cx))
+                    .child(row(crate::t!("dialog.star_max"), false, cx))
                     .child(
                         div()
                             .text_sm()
                             .text_color(rgb(pal().dim))
-                            .child(format!(
-                                "将匹配 {} 个谱面集(共 {} 个)",
-                                matches,
-                                self.all_rows.len()
+                            .child(crate::tf!(
+                                "fmt.filter_match",
+                                n = matches,
+                                total = self.all_rows.len()
                             )),
                     )
                     .child(
@@ -7824,13 +7891,13 @@ impl App {
                             .flex_row()
                             .justify_end()
                             .gap_2()
-                            .child(self.small_btn("重置", cx, |this, _| {
+                            .child(self.small_btn(crate::t!("btn.reset"), cx, |this, _| {
                                 this.star_draft = (0.0, 0.0);
                             }))
-                            .child(self.small_btn("取消", cx, |this, _| {
+                            .child(self.small_btn(crate::t!("btn.cancel"), cx, |this, _| {
                                 this.star_popup = false;
                             }))
-                            .child(self.small_btn("确定", cx, |this, _| {
+                            .child(self.small_btn(crate::t!("btn.ok"), cx, |this, _| {
                                 this.star_min = this.star_draft.0;
                                 this.star_max = this.star_draft.1;
                                 // 记住用户设置:写回 settings 并立即落盘。
@@ -7920,14 +7987,14 @@ impl App {
                     .bg(rgb(pal().panel))
                     .border_1()
                     .border_color(rgb(pal().line))
-                    .child(div().text_lg().child("默认快速加入选项"))
-                    .child(div().text_xs().text_color(rgb(pal().dim)).child("仅影响快速加入的难度策略"))
+                    .child(div().text_lg().child(crate::t!("dialog.quick_title")))
+                    .child(div().text_xs().text_color(rgb(pal().dim)).child(crate::t!("dialog.quick_hint")))
                     .child(
                         div()
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .child(div().text_xs().text_color(rgb(pal().dim)).child("mods(可多选)"))
+                            .child(div().text_xs().text_color(rgb(pal().dim)).child(crate::t!("dialog.mods")))
                             .child(
                                 div()
                                     .flex()
@@ -7946,16 +8013,16 @@ impl App {
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .child(div().text_xs().text_color(rgb(pal().dim)).child("默认难度"))
+                            .child(div().text_xs().text_color(rgb(pal().dim)).child(crate::t!("dialog.default_diff")))
                             .child(
                                 div()
                                     .flex()
                                     .flex_row()
                                     .items_center()
                                     .gap_2()
-                                    .child(pbtn("最难", "hardest", cx))
-                                    .child(pbtn("最容易", "easiest", cx))
-                                    .child(pbtn("最接近指定星级", "custom", cx))
+                                    .child(pbtn(crate::t!("diff.hardest"), "hardest", cx))
+                                    .child(pbtn(crate::t!("diff.easiest"), "easiest", cx))
+                                    .child(pbtn(crate::t!("diff.closest_policy"), "custom", cx))
                                     .child(if policy == "custom" {
                                         self.text_field(
                                             Field::NumStar,
@@ -7979,7 +8046,7 @@ impl App {
                             .flex()
                             .flex_row()
                             .justify_end()
-                            .child(self.small_btn("关闭", cx, |this, _| this.quick_opts = false)),
+                            .child(self.small_btn(crate::t!("btn.close"), cx, |this, _| this.quick_opts = false)),
                     ),
             )
     }
@@ -8010,12 +8077,12 @@ impl App {
                     .bg(rgb(pal().panel))
                     .border_1()
                     .border_color(rgb(pal().line))
-                    .child(div().text_lg().child("关闭 Aria?"))
+                    .child(div().text_lg().child(crate::t!("dialog.close_title")))
                     .child(
                         div()
                             .text_sm()
                             .text_color(rgb(pal().dim))
-                            .child("最小化到托盘会收起窗口并放掉封面缓存,后台继续播放。退出会还原桌面壁纸。"),
+                            .child(crate::t!("dialog.close_body")),
                     )
                     .child(
                         div()
@@ -8035,7 +8102,7 @@ impl App {
                                     .bg(if remember { rgb(pal().accent) } else { rgb(pal().ctl) })
                                     .child(if remember { "✓" } else { "" }),
                             )
-                            .child(div().text_sm().child("记住我的选择(下次不再询问)"))
+                            .child(div().text_sm().child(crate::t!("dialog.remember")))
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.close_remember = !this.close_remember;
                                 cx.notify();
@@ -8048,12 +8115,12 @@ impl App {
                             .justify_end()
                             .gap_2()
                             .pt_2()
-                            .child(self.small_btn("取消", cx, |this, _| {
+                            .child(self.small_btn(crate::t!("btn.cancel"), cx, |this, _| {
                                 this.close_ask = false;
                                 #[cfg(windows)]
                                 crate::win::set_ask_open(false);
                             }))
-                            .child(self.small_btn("最小化到托盘", cx, |this, cx| {
+                            .child(self.small_btn(crate::t!("settings.close_tray"), cx, |this, cx| {
                                 if this.close_remember {
                                     this.settings.close_action = Some("tray".to_string());
                                     sync_close_mode(&this.settings);
@@ -8062,7 +8129,7 @@ impl App {
                                 this.close_ask = false;
                                 this.hide_to_tray(cx);
                             }))
-                            .child(self.danger_btn("退出", cx, |this, _| {
+                            .child(self.danger_btn(crate::t!("action.quit"), cx, |this, _| {
                                 if this.close_remember {
                                     this.settings.close_action = Some("exit".to_string());
                                     sync_close_mode(&this.settings);
@@ -8101,12 +8168,12 @@ impl App {
                     .bg(rgb(pal().panel))
                     .border_1()
                     .border_color(rgb(pal().line))
-                    .child(div().text_lg().child("清空播放列表?"))
+                    .child(div().text_lg().child(crate::t!("dialog.clear_title")))
                     .child(
                         div()
                             .text_sm()
                             .text_color(rgb(pal().dim))
-                            .child(format!("将移除全部 {} 个条目,不可撤销。", self.queue.len())),
+                            .child(crate::tf!("fmt.clear_queue_body", n = self.queue.len())),
                     )
                     .child(
                         div()
@@ -8115,8 +8182,8 @@ impl App {
                             .justify_end()
                             .gap_2()
                             .pt_2()
-                            .child(self.small_btn("取消", cx, |this, _| this.clear_confirm = false))
-                            .child(self.danger_btn("清空", cx, |this, _| {
+                            .child(self.small_btn(crate::t!("btn.cancel"), cx, |this, _| this.clear_confirm = false))
+                            .child(self.danger_btn(crate::t!("btn.clear_queue"), cx, |this, _| {
                                 this.queue.clear();
                                 this.selected.clear();
                                 this.pos = 0;
@@ -8150,10 +8217,10 @@ impl App {
                     .bg(rgb(pal().panel))
                     .border_1()
                     .border_color(rgb(pal().line))
-                    .child(div().text_lg().child("清除全部个性设置?"))
-                    .child(div().text_sm().text_color(rgb(pal().dim)).child(format!(
-                        "将删除全部 {} 个谱面集的个性设置,恢复跟随全局,不可撤销。",
-                        self.settings.set_overrides.len()
+                    .child(div().text_lg().child(crate::t!("dialog.clear_overrides_title")))
+                    .child(div().text_sm().text_color(rgb(pal().dim)).child(crate::tf!(
+                        "fmt.clear_overrides_body",
+                        n = self.settings.set_overrides.len()
                     )))
                     .child(
                         div()
@@ -8162,12 +8229,12 @@ impl App {
                             .justify_end()
                             .gap_2()
                             .pt_2()
-                            .child(self.small_btn("取消", cx, |this, _| this.ov_clear_confirm = false))
-                            .child(self.danger_btn("清除", cx, |this, _| {
+                            .child(self.small_btn(crate::t!("btn.cancel"), cx, |this, _| this.ov_clear_confirm = false))
+                            .child(self.danger_btn(crate::t!("btn.clear"), cx, |this, _| {
                                 this.settings.set_overrides.clear();
                                 this.ov_clear_confirm = false;
                                 this.persist();
-                                this.toast("已清除全部个性设置");
+                                this.toast(crate::t!("toast.overrides_cleared"));
                             })),
                     ),
             )
@@ -8196,9 +8263,9 @@ impl App {
                     .bg(rgb(pal().panel))
                     .border_1()
                     .border_color(rgb(pal().line))
-                    .child(div().text_lg().child("恢复默认设置?"))
+                    .child(div().text_lg().child(crate::t!("dialog.reset_title")))
                     .child(div().text_sm().text_color(rgb(pal().dim)).child(
-                        "外观、画面、音频、播放、皮肤、系统与路径设置都会恢复默认值;播放列表与谱面集个性设置保持不变。此操作不可撤销。",
+                        crate::t!("dialog.reset_body"),
                     ))
                     .child(
                         div()
@@ -8207,8 +8274,8 @@ impl App {
                             .justify_end()
                             .gap_2()
                             .pt_2()
-                            .child(self.small_btn("取消", cx, |this, _| this.reset_confirm = false))
-                            .child(self.danger_btn("恢复默认", cx, |this, _| this.reset_settings())),
+                            .child(self.small_btn(crate::t!("btn.cancel"), cx, |this, _| this.reset_confirm = false))
+                            .child(self.danger_btn(crate::t!("btn.restore_default"), cx, |this, _| this.reset_settings())),
                     ),
             )
     }
@@ -8220,12 +8287,12 @@ impl App {
         let mut items: Vec<gpui::AnyElement> = Vec::new();
         if self.ctx_multi {
             // 多选:mods 与难度放在同一个弹窗里选(与「全部加入」一致)
-            items.push(self.ctx_item(format!("选择 mods / 难度…({} 首)", n_sel), "bulk_mods", cx).into_any_element());
-            items.push(self.ctx_item(format!("移除({} 首)", n_sel), "bulk_remove", cx).into_any_element());
+            items.push(self.ctx_item(crate::tf!("fmt.bulk_mods", n = n_sel), "bulk_mods", cx).into_any_element());
+            items.push(self.ctx_item(crate::tf!("fmt.bulk_remove", n = n_sel), "bulk_remove", cx).into_any_element());
         } else {
-            items.push(self.ctx_item("修改…(mods / 难度)".to_string(), "mods", cx).into_any_element());
-            items.push(self.ctx_item("个性设置…".to_string(), "override", cx).into_any_element());
-            items.push(self.ctx_item("移除".to_string(), "remove", cx).into_any_element());
+            items.push(self.ctx_item(crate::t!("dialog.edit_menu").to_string(), "mods", cx).into_any_element());
+            items.push(self.ctx_item(crate::t!("menu.override").to_string(), "override", cx).into_any_element());
+            items.push(self.ctx_item(crate::t!("btn.remove").to_string(), "remove", cx).into_any_element());
         }
         // 记录菜单实际 bounds:只有点在菜单外才关闭。否则全屏遮罩会在
         // 鼠标按下时先关菜单,菜单项永远点不中。
@@ -8401,14 +8468,14 @@ impl App {
         let enabled = ed.ov.enabled;
         let text_c = if enabled { rgb(pal().text) } else { rgb(pal().dim) };
         let tri_opts = vec![
-            ("global".to_string(), "跟随全局".to_string()),
-            ("on".to_string(), "开".to_string()),
-            ("off".to_string(), "关".to_string()),
+            ("global".to_string(), crate::t!("override.follow").to_string()),
+            ("on".to_string(), crate::t!("label.on").to_string()),
+            ("off".to_string(), crate::t!("label.off").to_string()),
         ];
         let tri_label = |v: Option<bool>| match v {
-            None => "跟随全局".to_string(),
-            Some(true) => "开".to_string(),
-            Some(false) => "关".to_string(),
+            None => crate::t!("override.follow").to_string(),
+            Some(true) => crate::t!("label.on").to_string(),
+            Some(false) => crate::t!("label.off").to_string(),
         };
         // 三态项:开启时是下拉;关闭个性设置时整行置灰、不可点
         let tri_row = |label: &'static str, kind: DropKind, value: Option<bool>, cx: &mut Context<Self>| {
@@ -8451,7 +8518,7 @@ impl App {
                     .bg(rgb(pal().panel))
                     .border_1()
                     .border_color(rgb(pal().line))
-                    .child(div().text_lg().child("当前曲目个性设置"))
+                    .child(div().text_lg().child(crate::t!("override.title")))
                     .child(div().text_xs().text_color(rgb(pal().dim)).child(ed.set_id.clone()))
                     // 启用开关:开 = 强调色,关 = 普通灰
                     .child(
@@ -8462,7 +8529,7 @@ impl App {
                             .items_center()
                             .py_1()
                             .text_sm()
-                            .child("启用个性设置")
+                            .child(crate::t!("override.enable"))
                             .child(
                                 div()
                                     .id("ov-enable")
@@ -8476,7 +8543,7 @@ impl App {
                                     } else {
                                         rgb(pal().dim)
                                     })
-                                    .child(if enabled { "开" } else { "关" })
+                                    .child(if enabled { crate::t!("label.on") } else { crate::t!("label.off") })
                                     .on_click(cx.listener(|this, _e, _w, cx| {
                                         if let Some(ed) = this.overrides.as_mut() {
                                             ed.ov.enabled = !ed.ov.enabled;
@@ -8485,10 +8552,10 @@ impl App {
                                     })),
                             ),
                     )
-                    .child(tri_row("storyboard/视频", DropKind::OvStoryboard, ed.ov.storyboard, cx))
-                    .child(tri_row("打击音效", DropKind::OvHitsound, ed.ov.hitsound, cx))
-                    .child(tri_row("谱面自带音效", DropKind::OvBeatmapHitsounds, ed.ov.beatmap_hitsounds, cx))
-                    .child(tri_row("隐藏游玩画面", DropKind::OvGameplayHidden, ed.ov.gameplay_hidden, cx))
+                    .child(tri_row(crate::t!("settings.storyboard"), DropKind::OvStoryboard, ed.ov.storyboard, cx))
+                    .child(tri_row(crate::t!("settings.hitsound"), DropKind::OvHitsound, ed.ov.hitsound, cx))
+                    .child(tri_row(crate::t!("settings.beatmap_hitsounds"), DropKind::OvBeatmapHitsounds, ed.ov.beatmap_hitsounds, cx))
+                    .child(tri_row(crate::t!("settings.hide_gameplay"), DropKind::OvGameplayHidden, ed.ov.gameplay_hidden, cx))
                     // 音效偏移:直接输入数值
                     .child({
                         let row = div()
@@ -8499,7 +8566,7 @@ impl App {
                             .py_1()
                             .text_sm()
                             .text_color(text_c)
-                            .child("音效偏移");
+                            .child(crate::t!("settings.offset"));
                         if enabled {
                             row.child(self.text_field(
                                 Field::OvOffset,
@@ -8527,7 +8594,7 @@ impl App {
                             .py_1()
                             .text_sm()
                             .text_color(text_c)
-                            .child("背景亮度");
+                            .child(crate::t!("settings.bg_opacity"));
                         if enabled {
                             row.child(
                                 div()
@@ -8560,29 +8627,29 @@ impl App {
                             .justify_end()
                             .gap_2()
                             .pt_2()
-                            .child(self.small_btn("保存", cx, |this, _| this.save_overrides()))
-                            .child(self.small_btn("取消", cx, |this, _| this.overrides = None)),
+                            .child(self.small_btn(crate::t!("btn.save"), cx, |this, _| this.save_overrides()))
+                            .child(self.small_btn(crate::t!("btn.cancel"), cx, |this, _| this.overrides = None)),
                     ),
             )
     }
 
     fn about_modal(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let oss: &[(&str, &str, &str)] = &[
-            ("osu-replay-render", "https://github.com/Ohdmire/osu-replay-render", "osu! 场景渲染: 游玩画面 + storyboard + 背景处理"),
-            ("osu-parse", "https://github.com/Ohdmire/osu-parse", ".osu 谱面解析(hit objects / timing)"),
-            ("osu-storyboard-render", "https://github.com/Ohdmire/osu-storyboard-render", "storyboard 指令处理与素材回调"),
-            ("osu-replay-judge", "https://github.com/Ohdmire/osu-replay-judge", "提供判定支持"),
-            ("realm-db-reader", "https://github.com/Ohdmire/realm-db-reader", "osu!lazer client.realm 只读解析"),
-            ("osu-db", "https://github.com/negamartin/osu-db", "osu!stable 曲库 / 收藏夹 / 星级读取"),
-            ("GPUI", "https://github.com/zed-industries/zed", "桌面 UI 框架(Zed)"),
-            ("wgpu", "https://github.com/gfx-rs/wgpu", "GPU 渲染"),
-            ("kira", "https://github.com/tesselode/kira", "音频播放"),
-            ("Symphonia", "https://github.com/pdeljanov/Symphonia", "音频解码"),
-            ("SoundTouch", "https://codeberg.org/soundtouch/soundtouch", "BGM 变速"),
+            ("osu-replay-render", "https://github.com/Ohdmire/osu-replay-render", crate::t!("about.oss_render")),
+            ("osu-parse", "https://github.com/Ohdmire/osu-parse", crate::t!("about.oss_parse")),
+            ("osu-storyboard-render", "https://github.com/Ohdmire/osu-storyboard-render", crate::t!("about.oss_sb")),
+            ("osu-replay-judge", "https://github.com/Ohdmire/osu-replay-judge", crate::t!("about.oss_judge")),
+            ("realm-db-reader", "https://github.com/Ohdmire/realm-db-reader", crate::t!("about.oss_realm")),
+            ("osu-db", "https://github.com/negamartin/osu-db", crate::t!("about.oss_db")),
+            ("GPUI", "https://github.com/zed-industries/zed", crate::t!("about.oss_gpui")),
+            ("wgpu", "https://github.com/gfx-rs/wgpu", crate::t!("about.oss_wgpu")),
+            ("kira", "https://github.com/tesselode/kira", crate::t!("about.oss_kira")),
+            ("Symphonia", "https://github.com/pdeljanov/Symphonia", crate::t!("about.oss_symphonia")),
+            ("SoundTouch", "https://codeberg.org/soundtouch/soundtouch", crate::t!("about.oss_soundtouch")),
         ];
         let thanks: &[(&str, &str, &str)] = &[
             ("xlfish233", "https://osu.ppy.sh/users/34424018", "Token Provider"),
-            ("Citrusis", "https://osu.ppy.sh/users/30298378", "Logo 设计"),
+            ("Citrusis", "https://osu.ppy.sh/users/30298378", "Logo Design"),
             ("七海灯子", "", "许愿一个 cinema mod"),
         ];
         let item = |name: &'static str, url: &'static str, desc: &'static str, cx: &mut Context<Self>| {
@@ -8636,13 +8703,13 @@ impl App {
                         div()
                             .text_sm()
                             .text_color(rgb(pal().dim))
-                            .child(format!("版本 {}", env!("CARGO_PKG_VERSION"))),
+                            .child(crate::tf!("fmt.version", v = env!("CARGO_PKG_VERSION"))),
                     )
                     .child(
                         div()
                             .text_sm()
                             .text_color(rgb(pal().dim))
-                            .child("osu! storyboard 桌面动态壁纸 · by ATRI1024"),
+                            .child(crate::t!("about.subtitle")),
                     )
                     .child(
                         div()
@@ -8656,7 +8723,7 @@ impl App {
                                 cx.notify();
                             })),
                     )
-                    .child(scroll_section("使用的开源库", oss.iter().map(|(n, u, d)| item(n, u, d, cx).into_any_element()).collect(), "oss"))
+                    .child(scroll_section(crate::t!("about.oss"), oss.iter().map(|(n, u, d)| item(n, u, d, cx).into_any_element()).collect(), "oss"))
                     .child(
                         div()
                             .flex()
@@ -8666,7 +8733,7 @@ impl App {
                             .border_t_1()
                             .border_color(rgb(pal().line))
                             .child(div().text_xs().text_color(rgb(pal().dim)).child(
-                                "osu! 是 Ppy Pty Ltd 的游戏;本项目与 ppy 无关 · MIT License",
+                                crate::t!("about.disclaimer"),
                             ))
                             .child(
                                 div()
@@ -8674,7 +8741,7 @@ impl App {
                                     .text_xs()
                                     .text_color(rgb(0x6aa0e0))
                                     .cursor_pointer()
-                                    .child("赞助作者(爱发电)  https://afdian.com/a/ATRI1024")
+                                    .child(crate::t!("about.sponsor"))
                                     .on_click(cx.listener(|_t, _e, _w, cx| {
                                         cx.open_url("https://afdian.com/a/ATRI1024");
                                         cx.notify();
@@ -8688,7 +8755,7 @@ impl App {
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .child(div().text_xs().text_color(rgb(0x6a6a75)).child("感谢名单"))
+                            .child(div().text_xs().text_color(rgb(0x6a6a75)).child(crate::t!("about.thanks")))
                             .child(
                                 div()
                                     .relative()
@@ -8719,7 +8786,7 @@ impl App {
                             .flex()
                             .flex_row()
                             .justify_end()
-                            .child(self.small_btn("关闭", cx, |this, _| {
+                            .child(self.small_btn(crate::t!("btn.close"), cx, |this, _| {
                                 this.about = false;
                             })),
                     ),

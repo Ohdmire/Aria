@@ -43,9 +43,9 @@ impl Action {
     #[cfg(windows)]
     pub fn label(self) -> &'static str {
         match self {
-            Action::Prev => "上一首",
-            Action::Toggle => "播放/暂停",
-            Action::Next => "下一首",
+            Action::Prev => crate::t!("action.prev"),
+            Action::Toggle => crate::t!("action.toggle_compact"),
+            Action::Next => crate::t!("action.next"),
         }
     }
 
@@ -180,7 +180,7 @@ pub fn apply(
         };
         let (prev, toggle, next) = (norm(prev), norm(toggle), norm(next));
         if enabled && (prev.is_some() || toggle.is_some() || next.is_some()) {
-            return Err("当前平台不支持全局快捷键;请用托盘菜单或设置窗口切歌".into());
+            return Err(crate::t!("hotkey.err.unsupported").into());
         }
         Ok(Text { prev, toggle, next })
     }
@@ -189,11 +189,11 @@ pub fn apply(
 #[cfg(windows)]
 fn register_bindings(bindings: Vec<Binding>) -> Result<(), String> {
     let (ack, rx) = mpsc::channel();
-    let tx = TX.lock().unwrap().clone().ok_or("快捷键服务未运行")?;
+    let tx = TX.lock().unwrap().clone().ok_or_else(|| crate::t!("hotkey.err.not_running").to_string())?;
     tx.send(Cmd::Set { bindings, ack })
-        .map_err(|_| "快捷键服务未运行".to_string())?;
+        .map_err(|_| crate::t!("hotkey.err.not_running").to_string())?;
     rx.recv_timeout(Duration::from_secs(2))
-        .map_err(|_| "快捷键设置超时".to_string())?
+        .map_err(|_| crate::t!("hotkey.err.timeout").to_string())?
 }
 
 #[cfg(windows)]
@@ -256,12 +256,10 @@ fn register_all(bindings: &[Binding], out: &mut Vec<Binding>) -> Result<(), Stri
         match unsafe { RegisterHotKey(None, b.action.id(), mods, b.vk) } {
             Ok(()) => out.push(b.clone()),
             Err(e) => {
-                return Err(format!(
-                    "{}快捷键 {} 注册失败:{}",
-                    b.action.label(),
-                    b.text,
-                    friendly(&e)
-                ));
+                let label = b.action.label();
+                let text = &b.text;
+                let why = friendly(&e);
+                return Err(crate::tf!("hotkey.err.register", label = label, text = text, why = why));
             }
         }
     }
@@ -279,11 +277,11 @@ fn unregister_all(bindings: &[Binding]) {
 fn friendly(e: &windows::core::Error) -> String {
     // ERROR_HOTKEY_ALREADY_REGISTERED = 1409(HRESULT 低 16 位)
     if (e.code().0 as u32 & 0xFFFF) == 1409 {
-        return "该组合键已被其他程序占用".into();
+        return crate::t!("hotkey.err.taken").into();
     }
     let message = e.message();
     if message.is_empty() {
-        format!("系统错误 {}", e.code().0)
+        crate::tf!("hotkey.err.sys", code = e.code().0)
     } else {
         message
     }
@@ -347,7 +345,7 @@ fn parse_inputs(
         };
         let binding = parse_binding(action, text)?;
         if bindings.iter().any(|b| b.same_combo(&binding)) {
-            return Err(format!("两个动作不能使用同一个快捷键({})", binding.text));
+            return Err(crate::tf!("hotkey.err.dup", text = binding.text));
         }
         texts[i] = Some(binding.text.clone());
         bindings.push(binding);
@@ -370,7 +368,7 @@ pub fn parse_binding(action: Action, text: &str) -> Result<Binding, String> {
     for part in text.split('+') {
         let part = part.trim();
         if part.is_empty() {
-            return Err(format!("快捷键格式不正确:{text}"));
+            return Err(crate::tf!("hotkey.err.format", text = text));
         }
         tokens.extend(part.split_whitespace());
     }
@@ -388,17 +386,17 @@ pub fn parse_binding(action: Action, text: &str) -> Result<Binding, String> {
             continue;
         }
         if vk.is_some() {
-            return Err(format!("一个快捷键只能包含一个主键:{text}"));
+            return Err(crate::tf!("hotkey.err.one_key", text = text));
         }
         let (code, label) = parse_key(token)?;
         vk = Some(code);
         key_label = label;
     }
     let Some(vk) = vk else {
-        return Err(format!("快捷键缺少主键:{text}"));
+        return Err(crate::tf!("hotkey.err.missing", text = text));
     };
     if mods == 0 && !allows_bare(vk) {
-        return Err("字母 / 数字 / 符号键至少需要一个修饰键(Ctrl / Alt / Shift / Win)".into());
+        return Err(crate::t!("hotkey.err.needs_mod").into());
     }
     let mut parts: Vec<&str> = Vec::new();
     if mods & MOD_CONTROL.0 != 0 {
@@ -471,7 +469,7 @@ fn parse_key(token: &str) -> Result<(u32, String), String> {
             '`' => (VK_OEM_3, "Backquote"),
             '[' => (VK_OEM_4, "BracketLeft"),
             ']' => (VK_OEM_6, "BracketRight"),
-            _ => return Err(format!("无法识别的按键:{token}")),
+            _ => return Err(crate::tf!("hotkey.err.unknown", token = token)),
         };
         return Ok((code.0 as u32, label.to_string()));
     }
@@ -511,7 +509,7 @@ fn parse_key(token: &str) -> Result<(u32, String), String> {
         "medianext" | "nexttrack" => (VK_MEDIA_NEXT_TRACK, "MediaNext"),
         "mediaprev" | "prevtrack" => (VK_MEDIA_PREV_TRACK, "MediaPrev"),
         "mediastop" | "stop" => (VK_MEDIA_STOP, "MediaStop"),
-        _ => return Err(format!("无法识别的按键:{token}")),
+        _ => return Err(crate::tf!("hotkey.err.unknown", token = token)),
     };
     Ok((code.0 as u32, label.to_string()))
 }

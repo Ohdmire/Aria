@@ -41,6 +41,13 @@ ShowUninstDetails show
 
 ; 安装包自己的文件属性(资源管理器「详细信息」里看得到)
 VIProductVersion "${APPVERSION}.0"
+VIAddVersionKey /LANG=1033 "ProductName" "${APP_NAME}"
+VIAddVersionKey /LANG=1033 "FileDescription" "${APP_NAME} Setup"
+VIAddVersionKey /LANG=1033 "FileVersion" "${APPVERSION}"
+VIAddVersionKey /LANG=1033 "ProductVersion" "${APPVERSION}"
+VIAddVersionKey /LANG=1033 "CompanyName" "${APP_PUBLISHER}"
+VIAddVersionKey /LANG=1033 "LegalCopyright" "MIT License"
+VIAddVersionKey /LANG=1033 "Comments" "${APP_URL}"
 VIAddVersionKey /LANG=2052 "ProductName" "${APP_NAME}"
 VIAddVersionKey /LANG=2052 "FileDescription" "${APP_NAME} 安装程序"
 VIAddVersionKey /LANG=2052 "FileVersion" "${APPVERSION}"
@@ -52,12 +59,13 @@ VIAddVersionKey /LANG=2052 "Comments" "${APP_URL}"
 ; ---- 界面 -------------------------------------------------------------------
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
+!include "WinMessages.nsh"
 
 !define MUI_ICON "${ROOT}\icons\icon.ico"
 !define MUI_UNICON "${ROOT}\icons\icon.ico"
 !define MUI_ABORTWARNING
 !define MUI_FINISHPAGE_RUN "$INSTDIR\${APP_EXE}"
-!define MUI_FINISHPAGE_RUN_TEXT "立即启动 ${APP_NAME}"
+!define MUI_FINISHPAGE_RUN_TEXT "Launch ${APP_NAME}"
 !define MUI_FINISHPAGE_LINK "${APP_URL}"
 !define MUI_FINISHPAGE_LINK_LOCATION "${APP_URL}"
 
@@ -65,15 +73,31 @@ VIAddVersionKey /LANG=2052 "Comments" "${APP_URL}"
 !insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
+!define MUI_PAGE_CUSTOMFUNCTION_SHOW FinishShow
 !insertmacro MUI_PAGE_FINISH
 
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
 
+; 第一种是对不上系统语言时的回落。对话框自己会按系统 UI 语言预选。
+!insertmacro MUI_LANGUAGE "English"
 !insertmacro MUI_LANGUAGE "SimpChinese"
 
+!insertmacro MUI_RESERVEFILE_LANGDLL
+
+LangString SEC_MAIN ${LANG_ENGLISH} "Aria (required)"
+LangString SEC_MAIN ${LANG_SIMPCHINESE} "Aria(必需)"
+LangString SEC_DESKTOP ${LANG_ENGLISH} "Desktop shortcut"
+LangString SEC_DESKTOP ${LANG_SIMPCHINESE} "桌面快捷方式"
+LangString DESC_MAIN ${LANG_ENGLISH} "The Aria program (about 34 MB) and the readme."
+LangString DESC_MAIN ${LANG_SIMPCHINESE} "Aria 主程序(约 34 MB)和说明文档。"
+LangString DESC_DESKTOP ${LANG_ENGLISH} "Create a shortcut on the desktop."
+LangString DESC_DESKTOP ${LANG_SIMPCHINESE} "在桌面创建一个快捷方式。"
+LangString UNINST_NAME ${LANG_ENGLISH} "Uninstall ${APP_NAME}"
+LangString UNINST_NAME ${LANG_SIMPCHINESE} "卸载 ${APP_NAME}"
+
 ; ---- 安装 -------------------------------------------------------------------
-Section "Aria(必需)" SEC_MAIN
+Section "$(SEC_MAIN)" SEC_MAIN
   SectionIn RO
 
   ; 覆盖安装前先结束正在运行的实例,否则 exe 被占用写不进去。
@@ -90,7 +114,9 @@ Section "Aria(必需)" SEC_MAIN
 
   CreateDirectory "$SMPROGRAMS\${APP_NAME}"
   CreateShortCut "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}"
-  CreateShortCut "$SMPROGRAMS\${APP_NAME}\卸载 ${APP_NAME}.lnk" "$INSTDIR\uninstall.exe"
+  CreateShortCut "$SMPROGRAMS\${APP_NAME}\$(UNINST_NAME).lnk" "$INSTDIR\uninstall.exe"
+
+  Call WriteInstallLanguage
 
   ; 卸载信息(控制面板 / 设置-应用 里能看到)
   WriteRegStr HKCU "Software\Aria" "InstallDir" "$INSTDIR"
@@ -110,13 +136,13 @@ Section "Aria(必需)" SEC_MAIN
   WriteRegDWORD HKCU "${UNINST_KEY}" "EstimatedSize" "$0"
 SectionEnd
 
-Section "桌面快捷方式" SEC_DESKTOP
+Section "$(SEC_DESKTOP)" SEC_DESKTOP
   CreateShortCut "$DESKTOP\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}"
 SectionEnd
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
-  !insertmacro MUI_DESCRIPTION_TEXT ${SEC_MAIN} "Aria 主程序(约 34 MB)和说明文档。"
-  !insertmacro MUI_DESCRIPTION_TEXT ${SEC_DESKTOP} "在桌面创建一个快捷方式。"
+  !insertmacro MUI_DESCRIPTION_TEXT ${SEC_MAIN} "$(DESC_MAIN)"
+  !insertmacro MUI_DESCRIPTION_TEXT ${SEC_DESKTOP} "$(DESC_DESKTOP)"
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 ; ---- 卸载 -------------------------------------------------------------------
@@ -132,9 +158,11 @@ Section "Uninstall"
   RMDir "$INSTDIR"
 
   Delete "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk"
+  Delete "$SMPROGRAMS\${APP_NAME}\Uninstall ${APP_NAME}.lnk"
   Delete "$SMPROGRAMS\${APP_NAME}\卸载 ${APP_NAME}.lnk"
   RMDir "$SMPROGRAMS\${APP_NAME}"
   Delete "$DESKTOP\${APP_NAME}.lnk"
+  Delete "$APPDATA\com.ohdmire.aria\install-language"
 
   ; 开机自启(程序自己写的 HKCU\...\Run 值)和安装记录
   DeleteRegValue HKCU "${RUN_KEY}" "${APP_NAME}"
@@ -144,11 +172,58 @@ Section "Uninstall"
   ; 用户数据(曲库缓存/设置)在 %APPDATA%\com.ohdmire.aria,卸载不删
 SectionEnd
 
+; 把安装时选的语言写成 ASCII 文件。Unicode NSIS 的 FileWrite 会写成 UTF-16,
+; 程序认 UTF-8 / UTF-16,但字节写最稳。
+Function WriteInstallLanguage
+  CreateDirectory "$APPDATA\com.ohdmire.aria"
+  FileOpen $R1 "$APPDATA\com.ohdmire.aria\install-language" w
+  ${If} $LANGUAGE = ${LANG_ENGLISH}
+    FileWriteByte $R1 101 ; e
+    FileWriteByte $R1 110 ; n
+  ${Else}
+    FileWriteByte $R1 122 ; z
+    FileWriteByte $R1 104 ; h
+    FileWriteByte $R1 45  ; -
+    FileWriteByte $R1 67  ; C
+    FileWriteByte $R1 78  ; N
+  ${EndIf}
+  FileClose $R1
+FunctionEnd
+
+Function FinishShow
+  ${If} $LANGUAGE = ${LANG_ENGLISH}
+    SendMessage $mui.FinishPage.Run ${WM_SETTEXT} 0 "STR:Launch ${APP_NAME}"
+  ${Else}
+    SendMessage $mui.FinishPage.Run ${WM_SETTEXT} 0 "STR:立即启动 ${APP_NAME}"
+  ${EndIf}
+FunctionEnd
+
+; 弹出语言列表。LangDLL 按系统 UI 语言预选;对不上时回落到第一种(English)。
+Function SelectLanguage
+  ${IfNot} ${Silent}
+    LangDLL::LangDialog "Language / 语言" "请选择语言。$\r$\nSelect a language." A "English" ${LANG_ENGLISH} "简体中文" ${LANG_SIMPCHINESE} ""
+    Pop $LANGUAGE
+    StrCmp $LANGUAGE "cancel" 0 +2
+      Abort
+  ${EndIf}
+FunctionEnd
+
 Function .onInit
   ; 64 位系统照常安装到 32 位进程可见的 LOCALAPPDATA,无需重定向
   SetShellVarContext current
+  Call SelectLanguage
 FunctionEnd
 
 Function un.onInit
   SetShellVarContext current
+  Call un.SelectLanguage
+FunctionEnd
+
+Function un.SelectLanguage
+  ${IfNot} ${Silent}
+    LangDLL::LangDialog "Language / 语言" "请选择语言。$\r$\nSelect a language." A "English" ${LANG_ENGLISH} "简体中文" ${LANG_SIMPCHINESE} ""
+    Pop $LANGUAGE
+    StrCmp $LANGUAGE "cancel" 0 +2
+      Abort
+  ${EndIf}
 FunctionEnd

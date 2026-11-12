@@ -14,6 +14,7 @@ mod kde;
 mod dmabuf;
 mod gpui_ui;
 mod hotkeys;
+mod i18n;
 mod lazer;
 mod loader;
 mod logging;

@@ -39,16 +39,27 @@ pub fn init(cx: &mut App) {
 }
 
 /// 菜单:显示窗口 / 上一首 / 播放暂停 / 下一首 / 退出。
+/// 打开菜单时按当前语言现组,语言切换后要 `refresh`。
 fn menu_items() -> Vec<MenuItem> {
     vec![
-        MenuItem::action("显示窗口", ShowWindow),
+        MenuItem::action(crate::t!("tray.show"), ShowWindow),
         MenuItem::Separator,
-        MenuItem::action("上一首", PrevTrack),
-        MenuItem::action("播放 / 暂停", TogglePlay),
-        MenuItem::action("下一首", NextTrack),
+        MenuItem::action(crate::t!("action.prev"), PrevTrack),
+        MenuItem::action(crate::t!("action.toggle"), TogglePlay),
+        MenuItem::action(crate::t!("action.next"), NextTrack),
         MenuItem::Separator,
-        MenuItem::action("退出", QuitApp),
+        MenuItem::action(crate::t!("action.quit"), QuitApp),
     ]
+}
+
+/// 语言改了之后重画托盘菜单。
+pub fn refresh(cx: &mut gpui::App) {
+    let Some(tray) = cx.try_global::<TrayHandle>().map(|h| h.0.clone()) else {
+        return;
+    };
+    if let Err(e) = tray.refresh_menu(cx) {
+        log::warn!("[tray] 刷新菜单失败: {e}");
+    }
 }
 
 /// 托盘图标:和窗口图标同一张 32×32 PNG。

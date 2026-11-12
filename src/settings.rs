@@ -204,6 +204,10 @@ pub struct Settings {
     /// 强调色:blue(默认)/ purple / green / pink / orange。
     #[serde(default = "default_accent")]
     pub accent: String,
+    /// 界面语言:`zh-CN`(简体中文)或 `en`(English)。
+    /// 缺字段时按系统语言;安装包写入的 `install-language` 在下次启动时覆盖一次。
+    #[serde(default = "default_language")]
+    pub language: String,
     /// 关闭主窗口的行为:None = 每次询问;"min" = 最小化到任务栏;
     /// "tray" = 收到托盘;"exit" = 退出程序。
     #[serde(default)]
@@ -301,6 +305,10 @@ fn default_theme() -> String {
 
 fn default_accent() -> String {
     "blue".into()
+}
+
+fn default_language() -> String {
+    crate::i18n::system_language_code().to_string()
 }
 
 /// 默认始终渲染(与设置页「渲染模式」默认项「始终渲染」一致;
@@ -402,6 +410,7 @@ impl Default for Settings {
             lazer_diff: None,
             theme_mode: default_theme(),
             accent: default_accent(),
+            language: default_language(),
             close_action: None,
             window_w: None,
             window_h: None,
@@ -489,6 +498,16 @@ pub fn load_from(dir: &std::path::Path) -> Settings {
             .target_star
             .filter(|t| *t > 0.0)
             .or_else(|| s.quick_star.map(f64::from));
+    }
+    // 安装包选定的语言优先于已保存的值(用过一次就删掉标记文件)。
+    // 没有标记、存档里也没有合法语言时,跟系统界面语言。
+    if let Some(code) = crate::i18n::take_install_file(dir) {
+        s.language = code.to_string();
+        save_to(dir, &s);
+    } else if let Some(code) = crate::i18n::canonical_language(&s.language) {
+        s.language = code.to_string();
+    } else {
+        s.language = crate::i18n::system_language_code().to_string();
     }
     s
 }

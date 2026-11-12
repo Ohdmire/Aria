@@ -59,6 +59,7 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dwm",
     "Win32_System_Threading",
     "Win32_System_Com",
+    "Win32_Globalization",
 ] }
 winreg = "0.56"
 # 原生文件/目录选择:IFileDialog(走 COM,不需要 GTK);common-controls-v6 让
